@@ -51,10 +51,66 @@ sys.path.insert(0, str(ROOT))
 
 from orchestrator import state as S  # noqa: E402
 
+# 通知（可选）。Windows 侧只往 NAS 的 spool 写纯文本事件文件，零凭据；
+# 发信由 NAS 上的 notify-spool.sh 读 DSM 自己的 SMTP 配置完成（见 notify.py）。
+# ★ 用 try 包住：notify.py 缺失/损坏也不该让跑批起不来 —— 通知是附属功能。
+try:
+    import notify as _notify  # noqa: E402
+except Exception:  # noqa: BLE001
+    _notify = None
+
 LOG = logging.getLogger("drive-loop")
 
 # sidecar 状态库默认位置（与 reseed-state.py 的 DEFAULT_DB 保持一致）
 DEFAULT_DB = os.environ.get("RESEED_STATE_DB", str(ROOT / "hlink" / "state.db"))
+
+
+# --------------------------------------------------------------------------- #
+# 通知出口（可选）
+# --------------------------------------------------------------------------- #
+# 事件分两档，由 notify.Event.level 决定 NAS 侧怎么处理：
+#
+#   alert       → **立刻发信**（自检报警 / 连续失败 / 整批异常）
+#   batch, info → 只归档，进**每日摘要**（本批新增做种数、全部干完等）
+#
+# ★ 这正是「坏消息 + 每日摘要」的分工：好消息不该半夜吵醒人，
+#   但也不能只躺在几万行日志里 —— 摘要就是它的去向。
+#
+# ★ 为什么用模块级单例，而不是给每个函数加参数：
+#   这些自检散落在 check_indexers / update_abort_streak / once_round 里，
+#   签名各不相同，层层传参会污染每一个调用点。通知是**旁路**，
+#   和 LOG 同性质 —— 用同样的方式持有最省事（测试里可直接赋值 _NOTIFIER）。
+_NOTIFIER = None
+
+
+def init_notifier(args):
+    """按命令行参数建 Notifier。可重复调用（重建）。"""
+    global _NOTIFIER
+    if _notify is None:
+        return None
+    _NOTIFIER = _notify.notifier_from_args(args)
+    return _NOTIFIER
+
+
+def emit(kind: str, title: str, body: str = "", *,
+         key: str | None = None, metrics: dict | None = None) -> bool:
+    """投递一个通知事件。未启用/写失败 → False。**绝不抛异常**（见 notify.Notifier）。"""
+    if _NOTIFIER is None:
+        return False
+    return _NOTIFIER.emit(kind, title, body=body, key=key, metrics=metrics)
+
+
+def describe_notifier() -> str:
+    """给启动日志用的一句话，让人一眼看出通知到底通没通。"""
+    if _notify is None:
+        return "✗ 未启用（找不到 notify.py）"
+    if _NOTIFIER is None:
+        return "✗ 未启用"
+    if not _NOTIFIER.enabled:
+        return "✗ 已禁用（--no-notify 或 NOTIFY_DISABLE）"
+    if _NOTIFIER.dry_run:
+        return "试运行（只打印，不写文件）"
+    return f"✓ 启用 → {_NOTIFIER.spool}"
 
 
 # --------------------------------------------------------------------------- #
@@ -116,6 +172,17 @@ def update_abort_streak(prev: int, stats: S.DriveStats | None, *,
     LOG.warning("   ② .env 改了但没 force-recreate（容器里还是旧配置，见 SUMMARY §13.6）")
     LOG.warning("  请人工看一眼 cross-seed 日志与 Prowlarr。")
     LOG.warning("!" * 62)
+    # 推给对方。★ 固定 key + 12 小时冷却 = 问题不修每天最多提醒 2 次：
+    #   连续失败第 4、5、6… 批都命中同一个 key，不会变成每 30 分钟一封。
+    emit("alert",
+         f"连续 {n} 批失败（{reason}）",
+         body=(f"最近一次失败：{reason}\n连续失败批数：{n}\n\n"
+               "无人值守下通常意味着：\n"
+               "  ① 站点持续 502 / 限流（看 Prowlarr 里各站状态）\n"
+               "  ② .env 改了但容器没 force-recreate（见 SUMMARY §13.6）\n\n"
+               "请人工看一眼 cross-seed 日志与 Prowlarr。\n"
+               "（本条同 key 12 小时内不重复发；修好后自然消失。）"),
+         key="consec-abort", metrics={"streak": n})
     return n
 
 
@@ -134,6 +201,14 @@ def alert_if_all_done(packs: list[str], db: str) -> bool:
     LOG.warning("   计划任务可保留（新片/新站接入后会自动变回待搜），")
     LOG.warning("   或手动停掉：schtasks /Delete /TN \"reseed-drive-loop\" /F")
     LOG.warning("=" * 62)
+    # ★ 归到 batch（进每日摘要），不归 alert：这是**里程碑**，不是故障。
+    #   按「坏消息立刻发 + 每日摘要」的分工，它应该出现在日报里而不是半夜的告警里。
+    #   固定 key + 冷却：全干完之后每次唤醒都会走到这里，不冷却会刷屏。
+    emit("batch", f"全部包已无待搜项（{len(packs)} 个包）",
+         body=("所有包的片子都已经搜过/做种，自动循环已无事可做。\n\n"
+               "  计划任务可以保留 —— 接入新站或新增片子后会自动变回待搜；\n"
+               "  也可以停掉：schtasks /Delete /TN \"reseed-drive-loop\" /F\n"),
+         key="all-done", metrics={"packs": len(packs)})
     return True
 
 
@@ -184,15 +259,41 @@ def check_indexers(args) -> None:
                     len(unnamed), ", ".join(unnamed))
         LOG.warning("  编号是 `TORZNAB_URLS` 里的那个（`#N` = `/N/api`），不是 Prowlarr 界面序号。")
         LOG.warning("  常见原因：`.env` 里删了站但容器没重建，或该站被 Prowlarr 禁用。")
+        for lbl in unnamed:
+            emit("alert", f"索引器拉不到名字：{lbl}",
+                 body=(f"cross-seed 里有个 active 索引器取不回 caps：{lbl}\n\n"
+                       "  ★ 编号 N 是 TORZNAB_URLS 里的那个（#N = /N/api），\n"
+                       "    **不是** Prowlarr 界面里的索引器序号 —— 别找错站。\n\n"
+                       "  常见原因：\n"
+                       "   ① .env 里删了这个站，但容器没重建（容器里还留着它）\n"
+                       "   ② 该站被 Prowlarr 禁用了\n"
+                       "   ③ 站点返回 410/403 或卡 Cloudflare\n\n"
+                       "  查证：docker inspect reseed-cross-seed | grep TORZNAB_URLS\n"),
+                 key=f"indexer-unnamed:{lbl}", metrics={"indexer": lbl})
     if missing:
         LOG.warning("⚠ cross-seed 实际会搜 %s，但 --indexers 没列 ——"
                     " 这些站的搜索结果会被状态机**漏记**（→ 重复搜 / 永不重搜）。",
                     ", ".join(missing))
         LOG.warning("  建议把 --indexers 改成：--indexers %s", ",".join(named))
+        emit("alert", f"--indexers 漏了 {len(missing)} 个站：{', '.join(missing)}",
+             body=(f"cross-seed 实际会搜：{', '.join(named)}\n"
+                   f"但 --indexers 只列了：{', '.join(sorted(mine))}\n\n"
+                   f"漏掉的：{', '.join(missing)}\n\n"
+                   "后果：这些站搜到的结果会被状态机**漏记** ——\n"
+                   "  要么反复重搜（浪费站点额度），要么永远不重搜。而且**不报错**，只是数算错。\n\n"
+                   f"修法：把 --indexers 改成  {','.join(named)}\n"
+                   "     （Windows 计划任务的 /TR 参数里也有一份，两处都要改）\n"),
+             key=f"indexer-missing:{','.join(missing)}", metrics={"missing": len(missing)})
     if extra:
         LOG.warning("⚠ --indexers 列了 %s，但 cross-seed 根本不会搜 ——"
                     " 状态机会把它们记成'搜过'，实际是假的（→ 永远不会去搜）。",
                     ", ".join(extra))
+        emit("alert", f"--indexers 多了 {len(extra)} 个站：{', '.join(extra)}",
+             body=(f"--indexers 列了：{', '.join(extra)}\n"
+                   f"但 cross-seed 根本不会搜它们（不在它的 TORZNAB_URLS 里）。\n\n"
+                   "后果：状态机会把这些站记成「搜过」，实际是假的 —— 片子永远不会被搜。\n\n"
+                   "修法：从 --indexers 里删掉（计划任务的 /TR 参数里也有一份，两处都要改）。\n"),
+             key=f"indexer-extra:{','.join(extra)}", metrics={"extra": len(extra)})
     if not (unnamed or missing or extra):
         LOG.info("索引器自检通过：cross-seed 实际会搜 %s，与 --indexers 一致。",
                  ", ".join(named))
@@ -222,6 +323,21 @@ _RE_UNREACHABLE = (
     ),
 )
 
+#: **只有这几种码**算「配置没生效」。
+#:   410 = 索引器在 Prowlarr 里已经没了；401 = apikey 对不上；403 = 该站被禁用。
+#:   三者都是「改了 .env 但容器没重建」的表现 —— 正是本自检要抓的东西。
+#:
+#: ★ 429 **必须排除**。它是限流，实测长这样（注意是**站名**不是 URL，还带原因说明）：
+#:
+#:     warn: [webhook] Failed to reach HDFans: request failed with code 429
+#:           due to rate limiting, snoozing until 2026-09-11 21:00:53
+#:
+#:   限流是**周期性的正常现象**，退避逻辑自己会处理，跟 .env 毫无关系。
+#:   上面那个宽泛的正则会把 429 一起捞进来（`\S+?` 连站名也匹配），
+#:   于是推出一封「.env 未生效：HDFans 返回 429」——**把人骗去白重建一次容器**。
+#:   日志里它只是条误导性警告，一旦接上邮件就成了真骚扰。
+STALE_ENV_CODES = frozenset({"410", "401", "403"})
+
 
 def _tail_lines(path: Path, nbytes: int) -> list[str]:
     """读文件**尾部** nbytes 字节（SMB 上是范围读，不会把 2.6 MB 全拉过来）。"""
@@ -250,6 +366,8 @@ def check_env_applied(args) -> None:
     410 = 这个索引器在 Prowlarr 里**已经没了**，但容器的 `TORZNAB_URLS` 还留着它
     （删站忘了重建）；401 = apikey 对不上；403 = 该站被禁用。三者多半是同一件事。
 
+    ★ 429 **不算** —— 那是限流，正常现象，退避逻辑自己会处理（见 `STALE_ENV_CODES`）。
+
     这里**只报警、不自动修** —— 重建容器必须由人执行（会打断正在跑的批次）。
     """
     if not args.log:
@@ -270,6 +388,10 @@ def check_env_applied(args) -> None:
                 if m:
                     break
             if not m:
+                continue
+            if m["code"] not in STALE_ENV_CODES:
+                # 429 之类的限流 —— 退避逻辑自己会处理，不是配置问题（见 STALE_ENV_CODES）
+                LOG.debug("忽略非配置类错误：%s → HTTP %s", m["url"], m["code"])
                 continue
             try:
                 ts = datetime.strptime(m["ts"], "%Y-%m-%d %H:%M:%S").timestamp()
@@ -303,6 +425,26 @@ def check_env_applied(args) -> None:
     LOG.warning("        && sudo docker compose up -d --no-deps --force-recreate cross-seed")
     LOG.warning("    验证：本条警告消失（上面的「索引器自检」也会跟着变绿）。")
     LOG.warning("!" * 62)
+
+    # 推给对方。**逐 (url, code) 一条** —— 每个都是独立可修的问题，
+    # 分开去重才能在「修好一个、还剩一个」时继续提醒。
+    for (url, code), n in sorted(hits.items(), key=lambda kv: -kv[1]):
+        emit("alert", f".env 未生效：{url} 返回 {code} ×{n}",
+             body=(f"cross-seed 最近 {STALE_ENV_WINDOW_SEC / 3600:.0f} 小时内"
+                   f"**一直够不着**这个索引器。\n\n"
+                   f"  地址: {url}\n"
+                   f"  HTTP: {code}\n"
+                   f"  次数: {n}\n"
+                   f"  最近一次: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(newest))}\n\n"
+                   "★ 本项目的头号复发坑：**改了 .env，但容器没重建**。\n"
+                   "  410 = 该索引器在 Prowlarr 里已经没了，容器里的 TORZNAB_URLS 还留着它；\n"
+                   "  401 = apikey 对不上；403 = 该站被禁用。三者多半是同一件事。\n\n"
+                   "  ⚠ `docker compose restart` **不重新注入环境变量**，必须：\n\n"
+                   "  cd /volume2/docker_ssd/prowlarr_cross-seed_autohardlink \\\n"
+                   "    && sudo docker compose up -d --no-deps --force-recreate cross-seed\n\n"
+                   "  修好后本条自动消失（同 key 12 小时内不重复发）。\n"),
+             key=f"env-stale:{url}/{code}",
+             metrics={"url": url, "code": code, "n": n})
 
 
 # --------------------------------------------------------------------------- #
@@ -392,6 +534,22 @@ def run_round(pack: str, args, api_key: str) -> S.DriveStats | None:
     LOG.info("[%s] 回灌：搜过 %s / 匹配 %s / 新增做种 %d / 仍 SKIPPED %d",
              pack, rep.from_db + rep.from_log, rep.matched,
              stats.newly_seeding, stats.still_skipped)
+    # 批次事件 → 只进每日摘要（不立刻发信）。好消息不该半夜吵醒人，
+    # 但也不能只躺在几万行日志里 —— 摘要就是它的去向。
+    # ★ key 不含时间戳，且 batch 不冷却（见 notify._cooled），所以每批都会进摘要；
+    #   摘要正是靠这些行统计「最近两次运行窗口的批次数」。
+    emit("batch", f"{pack} 本批完成",
+         body=(f"包: {pack}\n"
+               f"发送: 成功 {stats.ok} / 失败 {stats.failed}\n"
+               f"新增做种: {stats.newly_seeding} 部\n"
+               f"仍 SKIPPED: {stats.still_skipped}\n"
+               f"退避: {stats.backoff_hits} 次（等待 {stats.waited_sec / 60:.1f} 分钟）\n"
+               f"回灌: 搜过 {rep.from_db + rep.from_log} / 匹配 {rep.matched}\n"),
+         key=f"batch:{pack}",
+         metrics={"pack": pack, "ok": stats.ok, "failed": stats.failed,
+                  "newly_seeding": stats.newly_seeding,
+                  "still_skipped": stats.still_skipped,
+                  "backoff_hits": stats.backoff_hits})
     return stats
 
 
@@ -582,6 +740,14 @@ def once_round(packs: list[str], args, api_key: str, min_sleep: float) -> int:
     except Exception:  # noqa: BLE001 —— 单批异常也要正确收尾状态
         LOG.exception("[%s] 本批异常", pack)
         failed, rc = True, 1
+        emit("alert", f"{pack} 本批异常",
+             body=(f"跑包 {pack} 时抛出异常（详见 drive-loop.log 的 traceback）。\n\n"
+                   "常见原因：\n"
+                   "  · cross-seed 没起来 / API 连不上\n"
+                   "  · state.db 被占用（另一批还在跑？）\n"
+                   "  · NAS 掉线（SMB 路径读不到）\n\n"
+                   "★ 连续异常会自动累计：到 3 批会再发一条「连续批失败」告警。\n"),
+             key=f"batch-exception:{pack}", metrics={"pack": pack})
     finally:
         # 连续失败计数跨进程持久化（无人值守下没人盯着，只能靠日志喊）
         streak = update_abort_streak(int(st.get("consec_abort") or 0), stats, failed=failed)
@@ -624,6 +790,15 @@ def main() -> int:
     ap.add_argument("--cadence-days", type=int, default=S.DEFAULT_CADENCE_DAYS)
     ap.add_argument("--cadence", default=None)
     ap.add_argument("--dry-run", action="store_true", help="只打印计划，不发请求")
+    # --- 通知 ---
+    ap.add_argument("--notify-spool", dest="notify_spool", default=None,
+                    help="通知事件文件写到哪（默认 NAS 上的 notify/spool，见 notify.py；"
+                         "也可用环境变量 NOTIFY_SPOOL）")
+    ap.add_argument("--no-notify", action="store_true",
+                    help="本次不写任何通知事件（也可用环境变量 NOTIFY_DISABLE=1）")
+    ap.add_argument("--notify-cooldown-hours", dest="notify_cooldown_hours",
+                    type=float, default=12.0,
+                    help="同一个告警 key 多久内不重复发（默认 12 小时；0=不冷却，慎用）")
     args = ap.parse_args()
 
     logging.basicConfig(
@@ -657,6 +832,16 @@ def main() -> int:
 
     LOG.info("=== drive-loop 启动：packs=%s indexers=%s limit=%d ===",
              packs, args.indexers, args.limit)
+
+    # 通知：必须在 check_indexers / check_env_applied **之前**建好 ——
+    # 那两个自检本身就会发告警（这恰恰是最需要有人看到的两个）。
+    init_notifier(args)
+    LOG.info("通知: %s", describe_notifier())
+    if _NOTIFIER is not None and _NOTIFIER.enabled and not _NOTIFIER.dry_run:
+        if not _NOTIFIER.spool.parent.is_dir():
+            LOG.warning("  ⚠ 通知目录的上级不存在：%s", _NOTIFIER.spool.parent)
+            LOG.warning("    NAS 没挂上？事件会写失败（不影响跑批），先跑一次 "
+                        "notify-spool.sh 或在 NAS 上建好该目录。")
 
     # 自检：cross-seed 真实搜索范围 vs --indexers（不一致会静默错记，务必先喊出来）
     check_indexers(args)
@@ -713,6 +898,12 @@ def main() -> int:
             stats = run_round(pack, args, api_key)
         except Exception as e:  # noqa: BLE001 —— 循环不能因单批异常而死
             LOG.exception("[%s] 本批异常（继续循环）", pack)
+            emit("alert", f"{pack} 本批异常",
+                 body=(f"跑包 {pack} 时抛出异常（详见 drive-loop.log 的 traceback）。\n\n"
+                       f"{type(e).__name__}: {e}\n\n"
+                       "常见原因：cross-seed 没起来 / state.db 被占用 / NAS 掉线。\n"
+                       "★ 连续异常会自动累计：到 3 批会再发一条「连续批失败」告警。\n"),
+                 key=f"batch-exception:{pack}", metrics={"pack": pack})
             consec_abort = update_abort_streak(consec_abort, None, failed=True)
             if args.once:
                 return 1

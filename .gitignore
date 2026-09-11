@@ -29,6 +29,12 @@ scripts/*.tsv
 scripts/drive-loop.log
 scripts/.drive-loop.state
 
+# notify.py 的告警冷却状态（运行时产物：记住「哪个 key 最近什么时候发过」）
+scripts/.notify.state
+# notify-spool.sh 的**真实**配置（含收件人邮箱 —— 属个人信息，不入库）。
+# 模板 notify.conf.example 要提交，供别人照着填。
+scripts/notify.conf
+
 # 由 gen-nas-env-update.py 生成的 NAS 更新脚本（内容 = 本机 .env 的 DATA_DIRS，
 # 属派生数据；.env 一变就过期，别提交，用生成器现生成）
 scripts/nas-update-env.sh

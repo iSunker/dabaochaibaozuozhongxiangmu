@@ -32,6 +32,7 @@
 | 跑起来 / 继续跑 | **当前状态与下一步** ← 最常用，先看这个 |
 | 我卡住了（报错 / 搜不到 / 不动了） | **常见问题** + **交接必读的坑** |
 | 加站 / 换站 | **多站点** → SUMMARY §13.3（完整流程，可复用） |
+| 让它出事了主动通知我 | **通知 / 告警（NAS 侧发信）** |
 | 接手这个项目 | **当前状态与下一步** → **SUMMARY §13**（全过程 + 坑单）→ **§13.11**（最新进度与唯一待办） |
 
 > **两份文档怎么分工**（照日志分级来）：
@@ -454,6 +455,102 @@ sh build-farm.sh --verify           # 只校验农场 vs 源
 
 ---
 
+## 通知 / 告警（NAS 侧发信）
+
+无人值守最怕的不是出错，是**出错了没人知道**。这套东西负责在出问题时主动发邮件。
+
+### 分工：Windows 只写文件，NAS 才发信
+
+```
+drive-loop.py ──写纯文本事件──▶ //NAS/…/notify/spool/*.txt ──▶ notify-spool.sh ──▶ 你的邮箱
+   (Windows，零凭据)                 (SMB 共享目录)                (NAS，读 DSM 自己的 SMTP 配置)
+```
+
+**Windows 侧一行凭据都没有**（不 import smtplib、不读密码）—— 邮件配置只在 DSM 里，
+发信在 NAS 上完成。代价是推送有延迟（NAS 侧定时轮询），收益是**凭据从没离开过 NAS**。
+
+### 两条通道：坏消息立刻发，好消息进日报
+
+| 事件 | 何时发 | 例子 |
+|---|---|---|
+| `alert` | **立刻发信** | `.env` 未生效（410/401/403）、索引器拉不到名字、连续 3 批失败、整批异常 |
+| `batch` / `info` | **只进每日摘要** | 本批新增做种 11 部、全部包已无待搜项 |
+
+同一个告警 key **12 小时冷却**（问题不修每天最多提醒 2 次，不会变成每 15 分钟一封骚扰）；
+`batch` **不冷却** —— 每批都是新信息，冷却它只会让摘要数错。
+
+### 每日摘要 = 心跳（死人来信开关）
+
+**该来而没来的日报，本身就是 NAS / 任务计划出事的信号。**
+摘要里写明「最近一次批次记录是几小时前」，用来区分「NAS 挂了」和「主机没开机」，
+末尾还报告**通知链路自己的健康状况**：
+
+```
+── 通知链路 ──
+发信方式  : python
+spool 积压: 0 条告警
+```
+
+积压持续 >0 = 发信链路坏了（而那些告警你根本没收到）—— 这是唯一一个"只能靠摘要告诉你"的故障，
+所以发不出去的告警**一直留在 spool 里重试，绝不归档**（归档 = 静默丢弃）。
+
+### NAS 侧一次性配置
+
+1. **DSM → 控制面板 → 通知 → 电子邮件**：必须是「**自定义 SMTP 服务器 + 应用专用密码**」。
+   ⚠ 用 Gmail「登录(OAuth)」方式配的拿不到可用凭据，脚本这条路**不通**，先改过来。
+2. 把 NAS 侧脚本同步过去 —— **已在 `deploy.sh` 白名单里**，一条命令：
+   ```bash
+   DST=//YOUR-NAS/docker_ssd/prowlarr_cross-seed_autohardlink bash deploy.sh          # 先看 diff
+   DST=//YOUR-NAS/docker_ssd/prowlarr_cross-seed_autohardlink bash deploy.sh --apply   # 写入
+   ```
+   然后在 NAS 上填配置：
+   ```bash
+   cd /volume2/docker_ssd/prowlarr_cross-seed_autohardlink/notify
+   cp notify.conf.example notify.conf && vi notify.conf     # 至少填 MAIL_TO
+   ```
+   ★ `notify.conf`（含你的收件人邮箱）**不在白名单里**，`deploy.sh` 永远动不到它 ——
+   和白名单"绝不覆盖生产独有内容"的原则一致（`.env` / `prowlarr/` 同理）。
+   （不想用 `deploy.sh` 就手工拷这两个文件。）
+3. **先验证，再挂任务**：
+   ```bash
+   sh notify-spool.sh --selftest     # 探测到什么、缺什么（不打密码，只打键名）
+   sh notify-spool.sh --test-mail    # 真发一封
+   ```
+4. **DSM 任务计划**建两个任务，**用户都选 `root`**（`/etc/ssmtp/ssmtp.conf` 通常只有 root 能读），
+   且**都勾上「发送运行详情」**：
+
+   | 任务 | 计划 | 脚本 |
+   |---|---|---|
+   | 排空 spool | 每 5 分钟 | `sh <路径>/notify-spool.sh` |
+   | 每日摘要 | 每天 21:00 | `sh <路径>/notify-spool.sh --digest` |
+
+> 「发送运行详情」会把脚本的 stdout/stderr 寄给你 —— **SSH 关着时，这是我们唯一能看见
+> NAS 上报错的通道**（实测 SSH 22 端口 Connection refused）。
+
+> ★ 实测这台 NAS（DSM 7.2 / 423+）**一个发信程序都没有**（ssmtp/sendmail/msmtp/mail 全 MISS），
+> 但 `/usr/bin/python3` 在 —— 所以脚本走 `python3 + smtplib` 读同一个 `/etc/ssmtp/ssmtp.conf`。
+> 你的 NAS 未必一样：`--selftest` 会打印实际探测结果。
+
+### Windows 侧开关
+
+```bash
+python scripts/drive-loop.py --once --no-notify                  # 本次不发任何通知
+python scripts/drive-loop.py --once --notify-cooldown-hours 1    # 临时缩短冷却（调试用）
+python scripts/drive-loop.py --once --notify-spool "D:/tmp/x"    # 换个 spool
+```
+
+启动日志第四行会打 `通知: ✓ 启用 → <spool 路径>` / `✗ 已禁用` / `试运行（只打印，不写文件）`
+—— 一眼看出通知通没通。环境变量 `NOTIFY_DISABLE=1` 等价于 `--no-notify`。
+
+> ⚠ 从 git-bash 传 `--notify-spool` 时**别用 POSIX 路径**（如 `/tmp/x`）：
+> MINGW 会把它改写成 `\tmp\x`，Python 按当前盘解析成 `D:\tmp\x`。
+> 用 `D:/tmp/x` 或 UNC。**默认值（UNC 指向 NAS）不受影响**，计划任务走的就是默认值。
+
+> 通知坏了**不会拖垮跑批**：`notify.py` 吞掉所有异常，只是打一行
+> `投递通知失败（忽略，不影响跑批）`。NAS 没挂上时批次照跑，只是没有通知。
+
+---
+
 ## 安全
 
 - `.env`、`cross-seed/`（含 cross-seed 自建的 db）、`prowlarr/`（Prowlarr 配置）**不要提交/外传**——含 cookie/passkey/apikey。
@@ -473,7 +570,8 @@ sh build-farm.sh --verify           # 只校验农场 vs 源
 两者都只差**一次 `--force-recreate`**（见下面「收尾命令」）。
 索引器 HDFans ✅ / NanyangPT ✅ · 状态机 `hlink/state.db` ✅ 605 部 ·
 农场 `/volume1/video/download/reseed_farm` ✅ **已建好 475/475**（本地 `.env` 已切，生产未切）·
-新脚本 `add-indexers.py`（加站）、`drive-loop.py`（自动续跑）、`build-farm.sh`（建农场）。
+新脚本 `add-indexers.py`（加站）、`drive-loop.py`（自动续跑）、`build-farm.sh`（建农场）·
+**通知**：Windows 侧 ✅ 已接好（`notify.py`），NAS 侧 ⬜ **脚本已写好并本地验证，还没部署**。见下面「通知」。
 
 > ★ **磁盘 vs 容器**是本项目头号复发坑：`.env` 改了不会自动生效，
 > 必须 `up -d --force-recreate`（`restart` **不重新注入环境变量**）。
@@ -562,6 +660,11 @@ python scripts/reseed-state.py drive --pack dc-collection --indexers HDFans,Nany
    （1888 = 1888，双向 0 差异）。见 SUMMARY §10.5.7 / §10.5.9。
    ⬜ 只差把 `DATA_DIRS` 切过去 —— **与第 1 条同一次重建**。
 5. 编排器 `status` 子命令（见 SUMMARY §11.9）；IYUU 扩散（本范围外）。
+6. **通知：NAS 侧还没部署** —— Windows 侧已接好，NAS 侧脚本已写好并**本地全路径验证通过**
+   （含真发信路径、发不出去时的保留与积压上报、重复排空不重复记账）。
+   剩的是**必须在 NAS 上做**的三步，见上面「通知 / 告警」的「NAS 侧一次性配置」：
+   ① DSM 里配好自定义 SMTP ② 拷 `notify-spool.sh` + `notify.conf` ③ 建两个任务计划（root + 发送运行详情）。
+   ⬜ 在此之前**一封邮件都不会发出去**（Windows 侧写的文件会堆在 spool 里，不会丢）。
 
 #### 收尾命令（一次重建同时办完两件事）
 

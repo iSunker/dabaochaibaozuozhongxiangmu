@@ -48,6 +48,11 @@ FILES=(
   "orchestrator/matcher.py::orchestrator/matcher.py"
   "orchestrator/qbit_client.py::orchestrator/qbit_client.py"
   "orchestrator/safety.py::orchestrator/safety.py"
+  # 通知：NAS 侧脚本 + 配置模板（跑在 NAS 宿主机上，不在容器里，但放 compose 目录下）。
+  # ★ 只同步 .example 模板 —— 真正的 notify.conf（含收件人邮箱）是生产独有的，
+  #   和白名单原则第 2 条一样，**动不到**，需要时在 NAS 上从模板拷一份。
+  "scripts/notify-spool.sh::notify/notify-spool.sh"
+  "scripts/notify.conf.example::notify/notify.conf.example"
 )
 
 MODE="${1:---dry-run}"
