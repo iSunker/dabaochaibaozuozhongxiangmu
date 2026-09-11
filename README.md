@@ -391,9 +391,14 @@ FRDS/MBF 行为完全不变）。
 > searchee **逐条相同**。★ 这是**构造上**的等价 —— 同一个函数作用在同一批首层条目上，
 > 不依赖我们对 depth 规则的建模是否精确（实测 475 条、**零重名**）。
 
-**怎么用**（NAS 上跑，硬链接只能在 NAS 本机建 —— SMB/Windows 建不了）：
+**怎么用**（NAS 上跑，硬链接只能在 NAS 本机建 —— SMB/Windows 建不了）。
+`deploy.sh` 只管容器文件，**不含** `scripts/`，所以先把它拷上去（纯 LF，`sh` 可直接跑）：
 
 ```bash
+# 本地：拷到 NAS 的 compose 目录
+cp scripts/build-farm.sh "//iSunker-DS423/docker_ssd/prowlarr_cross-seed_autohardlink/"
+
+# NAS 上：
 cd /volume2/docker_ssd/prowlarr_cross-seed_autohardlink
 sh build-farm.sh                    # 默认 dry-run：只统计预演，一个文件都不建
 sh build-farm.sh --apply            # 真建（增量，已存在的跳过）
