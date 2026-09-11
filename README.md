@@ -530,18 +530,38 @@ python scripts/reseed-state.py drive --pack dc-collection --indexers HDFans,Nany
 
 ### 还没做
 
-1. **从 `TORZNAB_URLS` 移除 BTSCHOOL `/3/api`** + 重建 cross-seed（消除每次搜索吃 410 的空耗）。
-   ⚠ 重建会打断正在跑的 drive，务必等当前批次跑完；方法见 SUMMARY §13.3。
-   **建议与第 4 条合并成一次重建**，省一次中断。
+★ **下面第 1、4 条现在合并成同一次容器重建** —— 已全部准备好，见本节的「收尾命令」。
+
+1. ~~从 `TORZNAB_URLS` 移除 BTSCHOOL `/3/api`~~ ✅ **文件侧早已完成** ——
+   查下来生产 `.env` 里**只有 2 条**（`/2`、`/4`），`/3/api` 早就不在文件里了。
+   那些 410 **纯粹是容器没重建**（磁盘上的 `.env` 是对的，跑着的容器用的是旧环境变量）。
+   所以不用跑 `add-indexers.py --remove`，**只差 `--force-recreate`**。
+   ⚠ 重建会打断正在跑的 drive，务必等当前批次跑完。
 2. ~~挂 Windows 计划任务~~ ✅ **已完成**（`reseed-drive-loop`，每 15 分钟 `drive-loop.py --once`）。
 3. **换一个站替换 BTSCHOOL**（已在计划中）——加站流程见 SUMMARY §13.3。
-4. v3 **硬链接农场**：**农场已建好（475/475）**，但 `.env` 还没切过去 ——
-   **农场建好 ≠ 已生效**，容器不重建 cross-seed 就看不见它。
-   ✅ 构建（从 Windows 经 SMB，`--map` 翻译路径）已完成并通过独立复核：
-   475/475 名字对齐、零重名、抽样 160 个文件全部同 inode 同尺寸（**零数据复制**）；
-   ✅ 原先"Windows/SMB 建不了硬链接"的说法**已实测推翻**（见 SUMMARY §10.5.7）。
-   ⬜ **待你在 NAS 上**把 `DATA_DIRS` 从 49 条切成农场这一条 + `--force-recreate` 容器
-   —— **与第 1 条合并成一次重建**。
+4. v3 **硬链接农场**：**农场已建好（475/475）并通过独立复核**，
+   切换前的**等价性也已在真实数据上验过**：按 cross-seed 真正用的指纹
+   （名字 + 每个文件的相对路径与尺寸）比，49 条 dataDir 与农场**逐条完全相同**
+   （1888 = 1888，双向 0 差异）。见 SUMMARY §10.5.7 / §10.5.9。
+   ⬜ 只差把 `DATA_DIRS` 切过去 —— **与第 1 条同一次重建**。
+
+#### 收尾命令（一次重建同时办完两件事）
+
+本地已把 `.env` 的 `DATA_DIRS` 切成农场那一条，并生成/拷好了更新脚本。
+**在 NAS 上**（SSH 或 Container Manager「终端」）：
+
+```bash
+cd /volume2/docker_ssd/prowlarr_cross-seed_autohardlink
+sh nas-update-env.sh --dry-run     # 先看会改什么：DATA_DIRS 49 条 → 1 条
+sh nas-update-env.sh               # 改 + --force-recreate + 闭环回读校验
+```
+
+脚本自带：备份 `.env.bak.<时间戳>`、安全闸（**除 `DATA_DIRS`/`LINK_DIR` 外的行必须
+逐字节不变** —— 防止本地脱敏占位符污染生产密钥）、改完回读容器内 `DATA_DIRS` 条数
+做闭环验证。回滚：`cp -p .env.bak.<时间戳> .env` 后重建。
+
+**重建后请确认**：`drive-loop` 日志里「索引器自检」变绿、`/3/api` 的 410 警告消失、
+searchee 数与切换前**一致（1888）**。
 5. 编排器 `status` 子命令（见 SUMMARY §11.9）；IYUU 扩散（本范围外）。
 
 详细的过程记录、踩坑与决策都在 **SUMMARY.md**

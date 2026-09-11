@@ -3,6 +3,9 @@
 
 # .env 含 NAS IP / cross-seed apikey / (经 TORZNAB 携带的) PT passkey
 .env
+# ★ .env 的备份是**完整副本**（同样含密钥）。规则 `.env` 是精确匹配，
+#   不会拦住 `.env.bak.20260911-204109` —— 必须单独一条，否则备份会裸露在仓库里。
+.env.bak.*
 
 # Prowlarr 配置目录含各站 cookie/passkey/apikey —— 忽略全部内容，只保留占位 .gitkeep
 prowlarr/*
