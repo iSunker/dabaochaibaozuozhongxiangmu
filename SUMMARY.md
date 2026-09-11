@@ -9,7 +9,8 @@
 > **§11.7.1 `--limit` 分批**、**§10.5 A/B 方案对比**、**§11.11 全量能否排除已做种**、
 > **§11.12 生产 `.env` 一键更新（含"怎么确认真的落地了"）**、
 > **§10.6.4 `init --roots-from-env`（DC 47 组参数 → 一条命令）**、
-> **§11.13 429 退避与 SKIPPED 的真相**）
+> **§11.13 429 退避与 SKIPPED 的真相**、
+> **§11.14 三个包 init 完成与 drive 分批策略**）
 > 本文件是给「下一次接手的人（或下一个会话）」看的。读完这一篇应当能直接接着干，
 > 不需要回翻聊天记录。
 
@@ -319,6 +320,7 @@ bash deploy.sh --rollback   # 回滚到最近一次备份
 | v2-d | **生产 `.env` 一键更新脚本**（`gen-nas-env-update.py` → `nas-update-env.sh`） | ✅ **已完成并实测**（备份 / 三道安全闸 / 重启 / 闭环回读 / 不留中间文件），见 §11.12 |
 | v2-e | **`init --roots-from-env`**：根的清单直接从 cross-seed 的 `.env` 派生 | ✅ **已完成并实测**（DC 47 组参数 → 一条命令），见 §10.6.4 |
 | v2-f | **429 退避与 SKIPPED 的真相** —— 文档化 cross-seed 的"退避后跳过"机制 | ✅ **已文档化**，见 §11.13 |
+| v2-g | **三个包全部 init 完成**：FRDS 486 + MBF 4 + DC 115 = 605 部 | ✅ **已完成**（状态机数据库本地管理） |
 | v3 | **硬链接农场**（1 条 dataDir 取代 49 条，顺带闭合状态机的嵌套包缺口） | ⬜ **未做** —— 设计已完成，见 §10.5 |
 
 ### 5.1 Phase 2 验收结果
@@ -1639,3 +1641,62 @@ sqlite3 cross-seed.db "select count(*) from timestamp"
 python scripts/reseed-state.py todo --pack frds-top250-2024 --indexers SiteA,SiteB
 # → SKIPPED 会排在最前面，且被计入待办
 ```
+
+---
+
+### 11.14 三个包 init 完成与 drive 分批策略（2026-09-11 新增）
+
+> 回答："三个包都 init 完了，怎么分批 drive 最合理？"
+
+**当前状态**（2026-09-11 16:24）：
+
+| 包 | 单片数 | 待搜 | 阶段分布 |
+|---|---|---|---|
+| FRDS | 486 | 390 | PENDING 108 / SKIPPED 282 / UNMATCHED 48 / SEEDING 48 |
+| MBF | 4 | 4 | PENDING 4 |
+| DC | 115 | 115 | PENDING 115 |
+| **总计** | **605** | **509** | |
+
+**分批策略**：
+
+```bash
+# 1. MBF 先跑（4 部，2 分钟，快速验证通路）
+python scripts/reseed-state.py drive --pack mbf --indexers HDFans --limit 50 \
+  --url http://NAS_IP:2468 --api-key <CROSSSEED_API_KEY> --apply
+
+# 2. DC 第 1 批（50 部，约 24 分钟）
+python scripts/reseed-state.py drive --pack dc-collection --indexers HDFans --limit 50 \
+  --url http://NAS_IP:2468 --api-key <CROSSSEED_API_KEY> --apply
+
+# 3. FRDS 第 1 批（50 部 SKIPPED，约 24 分钟）
+python scripts/reseed-state.py drive --pack frds-top250-2024 --indexers HDFans --limit 50 \
+  --url http://NAS_IP:2468 --api-key <CROSSSEED_API_KEY> --apply
+```
+
+**一批做完重跑同一条命令就自动推进**（todo 按优先级排序，已完成的不会重复）。
+
+**时间估算**：
+- MBF：1 批 × 2 分钟 = 2 分钟
+- DC：3 批 × 24 分钟 = 72 分钟
+- FRDS：8 批 × 24 分钟 = 192 分钟
+- **总计：约 4.5 小时**（纯发送时间，不含匹配等待）
+
+**建议节奏**：
+- 每批之间至少隔 1 小时（让 cross-seed 有时间匹配和注入）
+- 不要连续猛发（容易触发 429）
+- 每天跑 2~3 批比较安全
+
+**关键参数**：
+
+```bash
+--interval 30          # 两条 webhook 之间隔 30s（对齐 cross-seed 的 delay）
+--check-every 10       # 每发 10 条检查一次退避
+--max-wait 1800        # 单次退避最多等 30 分钟
+--apply                # 真发请求（默认 dry-run，一定要先 --plan 确认）
+```
+
+**注意事项**：
+- `--plan` 先确认计划，再加 `--apply` 执行
+- `drive` 默认 dry-run，**不加 `--apply` 不会发任何请求**
+- 打完自动 `sync` 回灌，直接告诉你 `newly_seeding`（这轮真赚到几部）
+- 状态机数据库 `hlink/state.db` 已 gitignore，**不要提交到 GitHub**
