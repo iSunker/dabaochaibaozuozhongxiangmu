@@ -290,7 +290,28 @@ python scripts/gen-datadirs.py "//YOUR-NAS/video/download/movies/DC相关剧集�
 完整分析与 cross-seed 的 searchee 生成规则见 SUMMARY §10.2。
 
 > 已知缺口：状态机（`reseed-state.py`）目前**单根、只扫一层**，所以 DC 能被 cross-seed 搜到，
-> 但状态机还看不到它（会报 `unresolved`）。修法见 SUMMARY §10.4。
+> 但状态机还看不到它（会报 `unresolved`）。修法见 SUMMARY §10.4 / §10.5。
+
+#### 生产 `.env` 怎么更新（本地改完要同步到 NAS）
+
+`deploy.sh` 的白名单**故意不含 `.env`**（怕覆盖生产上的真实密钥），所以 `DATA_DIRS` 得单独上 NAS 改。
+这条值长约 3.5 KB、含中文与全角括号、还有带空格的路径 —— **别手敲**。用生成器：
+
+```bash
+python scripts/gen-nas-env-update.py          # 由本地 .env 生成 scripts/nas-update-env.sh
+```
+
+把生成的 `scripts/nas-update-env.sh` 传到 NAS（和 `compose.yaml` 同目录），然后：
+
+```bash
+sh nas-update-env.sh --dry-run       # 先看：备份 + 新旧条数 + 逐条校验 49 个路径是否存在
+sh nas-update-env.sh                 # 改 .env + 重启 cross-seed + 回读容器内条数做闭环验证
+sh nas-update-env.sh --no-restart    # 只改不重启
+```
+
+脚本会：① 备份 `.env` → `.env.bak.<时间戳>`；② 用 `awk` 就地替换 `DATA_DIRS=` 那一行
+（不走 `sed`，避开分隔符与 `&` 转义坑）；③ 逐条 `[ -d ]` 校验；④ 重启后 `docker inspect`
+回读容器内的 `DATA_DIRS` 条数并比对。回滚：`cp -p .env.bak.<时间戳> .env`。
 
 #### 其它要点
 
@@ -305,6 +326,8 @@ python scripts/gen-datadirs.py "//YOUR-NAS/video/download/movies/DC相关剧集�
    但**硬链接侧依旧零开销** —— 这正是本项目能在快满的卷上跑起来的原因。
 5. **站点压力**：接入 DC 后 searchee 总数从 ~405 涨到 **~1000+**，一轮全量搜索的耗时和 API 次数
    都会成倍增长。**按包分时段跑、务必带 `--limit`**，别同时开多个全量任务。
+6. **日常重搜别打大包根的 webhook** —— 它不会排除已做种的片子。走
+   `reseed-state.py drive`（已排除 `SEEDING`/`MATCHED`），详见 SUMMARY §11.11。
 
 ### IYUU 扩散（本次不实现）
 

@@ -4,7 +4,8 @@
 > §6.1 SiteB 已恢复；§6.5 429 真因是站点 502；§6.6 indexerId 会变；
 > **§11 单片状态机已实现**，含 **§11.6 按站重搜周期（默认每站 7 天）** 与
 > **§11.8 `drive` 控速 + 退避闭环**；§11.10 说明 `orchestrator/main.py`；
-> **§10 多包支持已落地**，含 **§10.2 嵌套结构陷阱（DC 案例）**）
+> **§10 多包支持已落地**，含 **§10.2 嵌套结构陷阱（DC 案例）**；
+> **§11.7.1 `--limit` 分批**、**§10.5 A/B 方案对比**、**§11.11 全量能否排除已做种**）
 > 本文件是给「下一次接手的人（或下一个会话）」看的。读完这一篇应当能直接接着干，
 > 不需要回翻聊天记录。
 
@@ -311,6 +312,8 @@ bash deploy.sh --rollback   # 回滚到最近一次备份
 | v2-a | **多包接入**：MBF（剧集，每季）+ DC（嵌套，47 个 dataDir） | ✅ **配置已落地**，见 §10.1 / §10.2 |
 | v2-b | 状态机支持嵌套包（多根 + 深度） | ⬜ **未做** —— DC 目前 cross-seed 会搜、但状态机看不到，见 §10.4 |
 | v2-c | **`--limit` 分批 + 优先级排序**（`--batch` / `--plan`） | ✅ **已完成并实测**，见 §11.7.1 |
+| v2-d | **生产 `.env` 一键更新脚本**（`gen-nas-env-update.py` → `nas-update-env.sh`） | ✅ **已完成并实测**（含备份/校验/重启/闭环回读），见 README「生产 .env 怎么更新」 |
+| v3 | **硬链接农场**（1 条 dataDir 取代 49 条，顺带闭合状态机的嵌套包缺口） | ⬜ **未做** —— 设计已完成，见 §10.5 |
 
 ### 5.1 Phase 2 验收结果
 
@@ -833,19 +836,125 @@ python scripts/gen-datadirs.py "//YOUR-NAS/video/download/movies/DC相关剧集�
 - `sync --pack dc` 会把 DC 的 searchee 名**对不上任何目录**，报 `unresolved` 并跳过；
 - 也就是说 **cross-seed 会正常搜 DC，但状态机暂时看不到 DC**。
 
-两种修法（都还没做）：
+两种修法（都还没做，**详细优劣见 §10.5**）：
 
 - **A. 多根 + 深度**：`init` 支持重复 `--root`/`--local-root` + `--depth N`，
   枚举时套用 §10.2 那条 cross-seed 规则（含视频即叶子）。改动约 60 行，FRDS 流程不受影响。
-- **B. 硬链接农场**：建 `/volume1/video/download/reseed_farm/`，
+- **B. 硬链接农场**：建 `/volume1/video/download/reseed_farm/`（**不要**放进 `reseed_singles/`，原因见 §10.5.4），
   里面按发布名建硬链接目录指向真实数据。这样 `dataDirs` 只 1 条、
-  `maxDataDepth: 1`、状态机也只要 1 个根 —— 三者全部归一。零磁盘开销，但要动 NAS 上的目录。
+  `maxDataDepth` 保持默认、状态机也只要 1 个根 —— 三者全部归一。零磁盘开销，但要动 NAS 上的目录。
 
 > 附带的待定策略：**未匹配的片子怎么处置**。
 > 现状是写进 `scripts/unmatched.tsv` 就不再管。建议用 cross-seed 的
 > `searchCadence`（多久重扫一遍 dataDirs）+ `excludeRecentSearch`（多久内不重复搜同一部）
 > 做**低频自动重扫**，靠"等站点有人上传"自然补上；
 > 而不是手动反复重打 webhook —— cross-seed 有搜索缓存，短期重复打基本是白打，还可能撞上 Prowlarr 退避。
+
+### 10.5 ★「多根 + 深度」(A) vs「硬链接农场」(B)（2026-09-11 决策记录）
+
+两种做法都能让 cross-seed 看见嵌套包里的每一部单片，但代价完全不同。
+
+#### 10.5.1 先看清 DC 的真实形状（实测，2026-09-11）
+
+三层嵌套，而且**同一包里混着三种形状**：
+
+```text
+DC相关剧集全系列大合集/
+├── DC系列剧集/01.绿箭侠（2012.10-2019.10）/
+│   └── Arrow.S01-S08.2012-2020.Bluray.1080p.MNHD-FRDS/     ← ① 容器层（不含视频，会被穿透）
+│       ├── Arrow.S01.Bluray.1080p.MNHD-FRDS/*.mkv          ← ② 季层（直接含视频 = 叶子）
+│       └── … 到 S08
+├── DC系列剧集/17.守望者（2019.10.20）/
+│   └── 守望者S01.Watchmen…@FRDS/*.mkv                       ← ①=② 直接含视频，只有一层
+├── DC系列电影/01.蝙蝠侠1：侠影之谜 (2005)/
+│   └── Batman Begins 2005 …-CHD/Batman Begins ….mkv         ← ① 单体文件
+└── …（共 22 部电影 + 26 部剧集 = 47 个标签目录）
+```
+
+**关键实测结论**：47 个"标签目录"（`01.绿箭侠…`）的**直接子目录恰好就是真·发布名**。
+这就是方案 B（47 条 dataDir）能跑出"0 垃圾"的原因 —— 不是运气，是这条包的结构决定的。
+
+#### 10.5.2 方案 A：多根 + 深度
+
+```yaml
+# cross-seed/config.js
+dataDirs: [ …包根… ]            # 1 条
+maxDataDepth: 3                 # ★ 必须调大，官方警告"会产生更多 searchee + 更多 indexer 请求"
+```
+状态机侧：`init` 要支持重复 `--root`/`--local-root` + `--depth N`，约 60 行改动。
+
+| | |
+|---|---|
+| ✅ | **不动 NAS 上的目录**，纯配置 |
+| ✅ | 配置是**声明式**的：包变了改一行路径即可，无中间状态要维护 |
+| ❌ | **必须调大全局 `maxDataDepth`** —— 这是全局开关，会连带影响 FRDS/MBF 的枚举行为 |
+| ❌ | 包根的直接子目录（`DC系列剧集`、`DC系列电影`）**无条件成为 searchee** → 2 条必然搜不到的垃圾 |
+| ❌ | 中文标签目录（`01.绿箭侠…`）也会成为 searchee → 又一批垃圾（实测 47 条） |
+| ❌ | 状态机要改代码，且"多根"是个持续维护的负担 |
+| ❌ | 包结构一变（有人往包里塞新剧），路径配置和枚举规则都要重算 |
+
+#### 10.5.3 方案 B：硬链接农场
+
+建一个**扁平**的农场目录，里面每个子目录 = 一部单片（硬链接指向真实数据）：
+
+```text
+/volume1/video/download/reseed_farm/          ← 唯一的 dataDir
+├── Arrow.S01-S08.2012-2020.Bluray.1080p.MNHD-FRDS/   ← 硬链接副本（含季层）
+├── 守望者S01.Watchmen…@FRDS/
+├── Batman Begins 2005 …-CHD/
+└── …（≈1000 个）
+```
+
+```yaml
+dataDirs: ["/volume1/video/download/reseed_farm"]
+maxDataDepth: 2                 # 默认值，不动全局
+```
+
+| | |
+|---|---|
+| ✅ | `dataDirs` **永远只有 1 条**，包再多也不用改配置 |
+| ✅ | **不动全局 `maxDataDepth`** → FRDS/MBF 行为完全不变 |
+| ✅ | **0 垃圾 searchee**：农场子目录名 = 真·发布名，不会混进中文标签 |
+| ✅ | **状态机零改动**：1 个根、1 层 → `reseed-state.py init --root /volume1/video/download/reseed_farm` 直接能用，§10.4 的缺口自动闭合 |
+| ✅ | 硬链接**不占数据块**（同卷），只多 inode + 目录项 |
+| ✅ | 农场是**统一命名空间**：跨包、跨类型（电影/剧集）一视同仁 |
+| ❌ | **要新写一个"农场构建器"**（走 SSH/容器跑 `ln`，Windows SMB 建不了硬链接），并负责增量同步 |
+| ❌ | 多一层间接：农场坏了/没同步 → cross-seed 看不见片子（A 没有这个失效点） |
+| ❌ | 必须与源同物理卷（`/volume1`）—— 和 `LINK_DIR` 同样的约束 |
+| ❌ | **重名冲突**要定策略：两个包含同名发布时，农场里只能有一个（或加前缀，但前缀会破坏"目录名=发布名"的匹配） |
+| ❌ | 多一次全量遍历（≈1000 目录）才能把农场建起来 |
+
+#### 10.5.4 农场该放哪：**不要**放 `reseed_singles/` 里面
+
+`/volume1/video/download/reseed_singles` 就是 `LINK_DIR`，cross-seed 往里写
+`LINK_DIR/<Tracker>/<发布名>/…`，所以它的**直接子目录是"站点名"**（现在只有 `SiteA/`）。
+
+把 `reseed_farm` 塞进去会变成"一个假站点名"，三个坏处：
+
+1. **视觉污染**：`reseed_singles/` 里分不清哪些是站点、哪些是农场；
+2. **随时会炸**：只要哪天把 `reseed_singles`（或其父目录）加进 `dataDirs`，
+   `reseed_farm` 和 `SiteA` 会**双双变成 searchee**，白白烧查询额度；
+3. **输入输出同树**：`reseed_singles` 是 cross-seed 的**输出**，农场是它的**输入** ——
+   混在一起迟早出事故。
+
+**放哪都行，唯一硬要求是"和源大包同一个物理卷"**（`/volume1`）。所以用**兄弟目录**：
+
+```text
+/volume1/video/download/reseed_singles/     ← 输出（LINK_DIR），不动
+/volume1/video/download/reseed_farm/        ← 输入（dataDir），新建
+```
+
+> 注意：硬链接**不占数据块**，所以 `/volume1` 只剩 ~20 GB 不影响农场；
+> 占的是 inode + 目录项（≈1000 个目录、几千个文件，可忽略）。
+
+#### 10.5.5 结论
+
+- **现在（已落地）**：方案 A 的变体 —— 49 条 `dataDir`（FRDS + MBF + 47 个 DC 标签目录），
+  `maxDataDepth` 保持默认 2。**这是最短路径，已经能跑，且不产生垃圾 searchee**（因为标签目录的直接子目录就是真发布名）。
+- **建议下一步（v3）**：上方案 B。它的真正价值**不是省几条配置**，而是
+  **把"N 个异构大包"归一成"一个扁平的、状态机原生支持的 searchee 集合"** ——
+  §10.4 的缺口、每次加包都要改 `.env`、包内结构变化要重算枚举规则，这三个问题一起消失。
+- **两者不冲突**：A 可以继续跑着，农场构建器做好后，把 `dataDirs` 从 49 条切成 1 条即可。
 
 ---
 
@@ -1246,3 +1355,39 @@ DEFAULT_CONFIG = os.environ.get("RESEED_CONFIG", "/config/config.yml")
 `main.py` **还没有** `state` 子命令，所以想用状态机得直接跑 `scripts/reseed-state.py`。
 未来要么给 `main.py` 加 `state` 子命令，要么把状态机逻辑收进 `orchestrator/state.py`
 后被 `main.py` import —— 现在 `state.py` 已经是个独立模块，import 是现成的。
+
+### 11.11 「一轮全量能不能把已做种的排除在外？」
+
+> 回答："一轮全量能不能做到已做种的不在这次全量范围内？"
+
+**要分两条路看，结论相反。**
+
+| 走哪条路 | 能排除已做种的吗 |
+|---|---|
+| **状态机 `reseed-state.py drive` / `todo`** | ✅ **能，而且这是它的默认行为** |
+| **直接给大包根打 cross-seed webhook**（老做法） | ❌ **不能** —— cross-seed 不查我们的状态 |
+
+**为什么状态机能**：`todo_detail()` 第一件事就是
+
+```python
+if r["stage"] in DONE_STAGES:      # DONE_STAGES = {SEEDING, MATCHED}
+    continue
+```
+
+`SEEDING`（qB 里真有这个 info_hash）和 `MATCHED`（已注入、等 qB 确认）**永不进待办**，
+连 `--include-cooldown` 都不放行（那个开关只影响"还没到重搜周期的 `UNMATCHED`"）。
+所以 `drive --limit N` 每一批都只花在**还没做种**的片子上，已做种的一分钱额度都不占。
+
+**为什么 cross-seed 原生不行**：`dataDirs` 的扫描是**无状态**的 —— 它每次把
+所有 searchee 枚举出来，逐个 × 逐个索引器去搜。它确实有"已注入过就不重复注入"的记录，
+但**搜索照发**。所以对大包根打一次 webhook，就是几百条查询一次性轰出去，
+已做种的也在里面。
+
+**实践建议**：
+
+1. 日常重搜一律走 `reseed-state.py drive`（见 §11.7.1 分批），**不要**再对大包根打 webhook；
+2. 若确实要让 cross-seed 自己跑一轮全量（比如刚加了新索引器、想全网重扫），
+   那就接受"已做种的重搜一遍"，或者用 `blockList` 的 `folder:` 规则把已命中的目录名排除掉
+   —— 但那是**静态清单**，每命中一部就要手工加一条，不划算，**不如直接用状态机**。
+3. 需要"只补没搜过的站"时，`--indexers` 传当前生效的站名，`due_indexers()` 会算出
+   `indexer_seen` 里缺的那些站，只对这些站发 —— 这比全量重扫精准得多。
