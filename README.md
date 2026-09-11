@@ -32,7 +32,7 @@
 | 跑起来 / 继续跑 | **当前状态与下一步** ← 最常用，先看这个 |
 | 我卡住了（报错 / 搜不到 / 不动了） | **常见问题** + **交接必读的坑** |
 | 加站 / 换站 | **多站点** → SUMMARY §13.3（完整流程，可复用） |
-| 接手这个项目 | **当前状态与下一步** → **SUMMARY §13**（本会话全过程 + 7 条坑） |
+| 接手这个项目 | **当前状态与下一步** → **SUMMARY §13**（全过程 + 坑单）→ **§13.11**（最新进度与唯一待办） |
 
 > **两份文档怎么分工**（照日志分级来）：
 > **README = INFO 层**（操作手册：命令、步骤、症状→解法）；
@@ -463,9 +463,16 @@ sh build-farm.sh --verify           # 只校验农场 vs 源
 
 ### 系统现状（一句话）
 
-NAS `.env` `DATA_DIRS` ✅ 49 条 · `TORZNAB_URLS` ⚠ **3 条**（BTSCHOOL 待移除）·
-索引器 HDFans ✅ / NanyangPT ✅ / BTSCHOOL ❌ · 状态机 `hlink/state.db` ✅ 605 部 ·
-新脚本 `add-indexers.py`（加站）、`drive-loop.py`（自动续跑）。逐项快照见 **SUMMARY §13.7**。
+**生产 NAS 磁盘上的 `.env`**：`DATA_DIRS` ✅ 49 条 · `TORZNAB_URLS` ✅ **2 条**（HDFans `/2` + NanyangPT `/4`）·
+**跑着的容器**：⚠ `DATA_DIRS` 仍是 49 条、`TORZNAB_URLS` 里还留着已删的 `/3`（BTSCHOOL）——
+两者都只差**一次 `--force-recreate`**（见下面「收尾命令」）。
+索引器 HDFans ✅ / NanyangPT ✅ · 状态机 `hlink/state.db` ✅ 605 部 ·
+农场 `/volume1/video/download/reseed_farm` ✅ **已建好 475/475**（本地 `.env` 已切，生产未切）·
+新脚本 `add-indexers.py`（加站）、`drive-loop.py`（自动续跑）、`build-farm.sh`（建农场）。
+
+> ★ **磁盘 vs 容器**是本项目头号复发坑：`.env` 改了不会自动生效，
+> 必须 `up -d --force-recreate`（`restart` **不重新注入环境变量**）。
+> `drive-loop.py` 的「索引器自检」（⑧）会在启动时扫日志自动喊出来，见 SUMMARY §13.10。
 
 ### 三个包
 
@@ -491,7 +498,12 @@ python scripts/drive-loop.py --indexers HDFans,NanyangPT
 ```
 
 > `drive-loop` 已内置 `--db-path` / `--qbit-url` 默认值（指向 NAS），**回灌不会漏参数**。
-> 挂 Windows 计划任务每 15 分钟 `--once` 即可无人值守推进。
+> 挂 Windows 计划任务每 15 分钟 `--once` 即可无人值守推进 —— 计划任务指向的是包装器
+> **`scripts/drive-loop-once.cmd`**，不是直接指向 `python.exe`：
+> python 路径里有**非 ASCII 用户名**，经 `schtasks` / MINGW 传递会被搞坏；
+> 包装器用 `%USERPROFILE%` 让 cmd.exe 在**运行时**展开，任务定义本身保持纯 ASCII。
+> `--once` 靠 `scripts/.drive-loop.state` 自我节流（有人在跑 / 距上批结束不足 30 分钟 → 直接退出），
+> 所以 15 分钟一次**不会**和 24 分钟一批重叠。
 > 真实进度一律以 `scripts/drive-loop.log` 为准，**别看终端**（输出会被块缓冲吞掉，SUMMARY §13.8）。
 
 **方式 B：手动单批（原来的做法）**
@@ -544,6 +556,7 @@ python scripts/reseed-state.py drive --pack dc-collection --indexers HDFans,Nany
    （名字 + 每个文件的相对路径与尺寸）比，49 条 dataDir 与农场**逐条完全相同**
    （1888 = 1888，双向 0 差异）。见 SUMMARY §10.5.7 / §10.5.9。
    ⬜ 只差把 `DATA_DIRS` 切过去 —— **与第 1 条同一次重建**。
+5. 编排器 `status` 子命令（见 SUMMARY §11.9）；IYUU 扩散（本范围外）。
 
 #### 收尾命令（一次重建同时办完两件事）
 
@@ -562,7 +575,10 @@ sh nas-update-env.sh               # 改 + --force-recreate + 闭环回读校验
 
 **重建后请确认**：`drive-loop` 日志里「索引器自检」变绿、`/3/api` 的 410 警告消失、
 searchee 数与切换前**一致（1888）**。
-5. 编排器 `status` 子命令（见 SUMMARY §11.9）；IYUU 扩散（本范围外）。
+
+> ⚠ **备份文件同样含密钥** —— `.gitignore` 里 `.env` 是**精确匹配**，
+> 拦不住 `.env.bak.20260911-204109`。已补 `.env.bak.*` 规则；
+> 若你在 NAS 上另存备份，别把任何一份拷进仓库。
 
 详细的过程记录、踩坑与决策都在 **SUMMARY.md**
 （老会话见 §11.12 / §11.13 / §11.14 / §12，**本会话见 §13**）。
