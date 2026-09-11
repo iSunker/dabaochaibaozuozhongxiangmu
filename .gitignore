@@ -22,8 +22,9 @@ scripts/todo.txt
 # 由状态机导出的派生数据（含真实片名/站点名，属运行时产物）
 scripts/*.tsv
 
-# drive-loop.py 的运行日志（含真实片名，属运行时产物）
+# drive-loop.py 的运行日志与状态文件（含真实片名/时间，属运行时产物）
 scripts/drive-loop.log
+scripts/.drive-loop.state
 
 # 由 gen-nas-env-update.py 生成的 NAS 更新脚本（内容 = 本机 .env 的 DATA_DIRS，
 # 属派生数据；.env 一变就过期，别提交，用生成器现生成）

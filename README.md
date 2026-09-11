@@ -23,6 +23,24 @@
 
 ---
 
+## 我要做什么 → 看哪节
+
+| 我想… | 看哪节 |
+|---|---|
+| 搞清这东西干嘛的 | 上面这段 + **目录结构** |
+| 从零部署一台 | **部署步骤**（Phase 0→3，每步可独立验证）+ **验证清单** |
+| 跑起来 / 继续跑 | **当前状态与下一步** ← 最常用，先看这个 |
+| 我卡住了（报错 / 搜不到 / 不动了） | **常见问题** + **交接必读的坑** |
+| 加站 / 换站 | **多站点** → SUMMARY §13.3（完整流程，可复用） |
+| 接手这个项目 | **当前状态与下一步** → **SUMMARY §13**（本会话全过程 + 7 条坑） |
+
+> **两份文档怎么分工**（照日志分级来）：
+> **README = INFO 层**（操作手册：命令、步骤、症状→解法）；
+> **SUMMARY = DEBUG 层**（完整过程、踩坑、决策理由）。
+> 同一事实**只在一处维护**，跨层用「详见 SUMMARY §N」单向指路 —— 防止两边漂移。
+
+---
+
 > **占位符约定**：为便于公开分享，文档与脚本里的真实主机名 / 内网 IP / 私有站名
 > 已替换为 `YOUR-NAS`、`NAS_IP`、`SiteA`、`SiteB`。照着做时请换成你自己的。
 > 脚本没有硬编码这些值 —— `scripts/run-batch.sh` 与 `deploy.sh` 读环境变量，
@@ -50,7 +68,7 @@ prowlarr_cross-seed_autohardlink/   # NAS 部署目录（compose 就放这里，
 ```
 
 > 开发仓库里另有 `scripts/`（`run-batch.sh` 抽样脚本、`reseed-state.py` 状态机 CLI、
-> `gen-datadirs.py` 生成嵌套包的 `DATA_DIRS` 片段）。
+> `drive-loop.py` 自动续跑、`add-indexers.py` 加站、`gen-datadirs.py` 生成嵌套包的 `DATA_DIRS` 片段）。
 > 它们是**在 Windows 上跑**的工具，不必进容器。由状态机导出的 `unmatched.tsv` /
 > `todo.txt` 属运行时产物，已 gitignore。
 
@@ -124,7 +142,7 @@ docker compose run --rm reseed-orchestrator status                          # �
 
 - **中文站搜不到 / 结果为空**：Prowlarr 里该站是否需要 FlareSolverr？passkey/cookie 是否过期？先在 Prowlarr 手动搜确认；再考虑放宽 `MATCH_MODE`。
 - **命中率低、有些片子搜不到**：正常。**单站（sitea）已搜部分实测命中率约 50%**
-  （87 部里 44 部；详见 SUMMARY §5.3）。想提高就**加索引器**，见下方[扩展 → 多站点](#多站点--提高命中率的唯一手段)。
+  （87 部里 44 部；详见 SUMMARY §5.3）。想提高就**加索引器**，见下方「多站点」。
   当前匹配/未匹配的完整清单见 `scripts/unmatched.tsv`。
 - **跑完一轮但感觉"漏了很多"**：先看进度条是不是 `(N/总数)` **一次性从某个数跳到总数** ——
   那不是跑完了，是**索引器被退避、剩下的条目被秒跳**了（cross-seed 跳过不排队）。
@@ -157,19 +175,23 @@ docker compose run --rm reseed-orchestrator status                          # �
    >   | python -c "import sys,json;[print(i['id'], i['name']) for i in json.load(sys.stdin)]"
    > ```
    > 详见 SUMMARY §6.6。
-3. 把它的 Torznab 地址追加进 `.env` 的 `TORZNAB_URLS`，**逗号分隔、单行**：
+3. 把它的 Torznab 地址追加进 `.env` 的 `TORZNAB_URLS`，**逗号分隔、单行**（`scripts/add-indexers.py` 已自动化这步，会自动补 `/api`、只改一行、自动备份）：
    ```
    TORZNAB_URLS=http://prowlarr:9696/2/api?apikey=<Prowlarr API key>,http://prowlarr:9696/3/api?apikey=<同一个 key>
    ```
    > 用的是 **Prowlarr 自己的 API key**（所有条目共用同一个），不是各站的 passkey。
-4. `docker compose restart cross-seed`。**不要**用 `up -d --force-recreate`（见上文警告）。
+4. 重建 cross-seed 让新 env 生效 —— **必须 `--force-recreate`，`restart` 不够**（见下）。
 5. 在 Prowlarr 里对一部电影手动搜一下，确认新站能出结果。
 6. **加完站要重跑一轮全量**：对 `DATA_DIRS` 的**根目录**打一次 webhook（见 SUMMARY §6.4），
    cross-seed 会把整包重新遍历一遍。已经命中的会被跳过，只有没命中的才有机会被新站捞到。
 
-> **现成的一个站：SiteB**。它 2026-09-11 上午一度 500/520/522（站点侧故障，与 FlareSolverr 无关），
-> 当天中午已自行恢复（实测 matrix 50 条、Se7en 15 条）。
-> 它的 Torznab 端点是 `http://prowlarr:9696/1/api`，**直接加回 `TORZNAB_URLS` 即可**。
+> ⚠ **`docker compose restart` 不重新注入环境变量** —— 改了 `TORZNAB_URLS` / `DATA_DIRS` 后
+> 必须 `sudo docker compose up -d --no-deps --force-recreate cross-seed`
+> （`--no-deps` 防连带重建 Prowlarr）。完整加站流程见 **SUMMARY §13.3**。
+>
+> ⚠ **只在 Prowlarr 里禁用索引器 ≠ cross-seed 不搜它** —— cross-seed 只认自己的
+> `TORZNAB_URLS`，会继续请求已禁用的站，每搜一次吃一个 `HTTP 410` 并 snooze。
+> **彻底停用某站必须把它从 `TORZNAB_URLS` 移除**再重建（SUMMARY §13.6 坑 5）。
 
 **对站点友好**：`delay` 保持 30~45；Prowlarr 每个站的 **Query Limit 只当保险丝**（设成明显高于实际用量的值，如 1000/天），
 不要拿它当节流阀。加站**不会**增加单个站的查询量 —— 一次搜索由 Prowlarr 分发到各站各一次。
@@ -203,34 +225,25 @@ python scripts/reseed-state.py sync --pack $PACK \
 python scripts/reseed-state.py report --pack $PACK
 python scripts/reseed-state.py todo  --pack $PACK --indexers SiteA,SiteB --out scripts/todo.txt
 python scripts/reseed-state.py drive --pack $PACK --indexers SiteA,SiteB --limit 50 --apply \
-  --url http://NAS_IP:2468 --api-key <CROSSSEED_API_KEY>
+  --url http://NAS_IP:2468 --api-key <CROSSSEED_API_KEY> --db-path "$N/cross-seed/cross-seed.db" \
+  --qbit-url http://NAS_IP:3060
 ```
 
-**`init` 的根怎么给**（两种方式，二选一）：
+**`init` 的根怎么给** —— 推荐**从 `.env` 派生**（`--roots-from-env .env --match "<路径关键词>"`）：
+`.env` 的 `DATA_DIRS` 就是 cross-seed 实际会扫的清单，从它派生 ⇒ 状态机与 cross-seed **永不漂移**，
+DC 那种 47 个根的包也一行搞定。另有显式 `--root/--local-root`（可重复、**必须按序一一对应**）用于单根包。
+`--match` 可重复（OR），`--unc-host //YOUR-NAS` 把 NAS 路径翻成 UNC（不给则试着从
+`scripts/.nasrc` 的 `NAS_NAME` 推断），`--nas-prefix` 默认 `/volume1`。
+完整参数与多根用法见 SUMMARY §10.6。
 
-| 方式 | 写法 | 什么时候用 |
-|---|---|---|
-| ★从 `.env` 派生 | `--roots-from-env .env --match "<路径关键词>"` | **推荐**。`.env` 的 `DATA_DIRS` 就是 cross-seed 实际会扫的清单，从它派生 ⇒ 状态机与 cross-seed **永不漂移**。多根包（DC 47 根）就靠它一行搞定 |
-| 显式列出 | `--root <NAS路径> --local-root <本机路径>`（均可重复传） | 单根包、或想手工挑根时。**多根必须按序一一对应**（第 i 个 `--local-root` 就是第 i 个 `--root` 的 UNC） |
+> ⚠ **`--depth` 必须与 cross-seed 的 `maxDataDepth` 完全一致**（本项目未显式配置 ⇒ 默认 2）。
+> 它是"从 dataDir 往下数几层"，第 1..N 层的**目录和视频文件**都算 searchee。
+> 对不上就会出现"状态机有、cross-seed 没有"的幽灵条目，或漏掉真在搜的片子。详见 SUMMARY §10.6.1。
 
-- `--match` 可重复（OR 关系），只取路径里含关键词的 `DATA_DIRS` 条目；不给则全取。
-- `--unc-host //YOUR-NAS` 用来把 NAS 路径翻成 UNC；不给则尝试从 `scripts/.nasrc` 的 `NAS_NAME` 推断。
-- `--nas-prefix` 默认 `/volume1`，是 NAS 上的卷前缀。
-- ⚠ **`--depth` 必须与 cross-seed 的 `maxDataDepth` 完全一致**（本项目未显式配置 ⇒ 用默认值 2）。
-  它是"从 dataDir 往下数几层"，第 1..N 层的**目录和视频文件**都算一个 searchee ——
-  详见 SUMMARY §10.6。对不上就会出现"状态机有、cross-seed 没有"的幽灵条目。
-
-DC 那种 47 个根的包，一条命令就是全部参数：
-
-```bash
-python scripts/reseed-state.py init --pack dc-collection --depth 2 \
-  --roots-from-env .env --match "DC相关剧集全系列大合集" --dry-run   # 先核对
-```
-
-**分批**：`--limit N` 每批 N 条，`--batch K` 指定第几批（默认第 1 批），
-`--plan` 只打印计划不发请求。因为待办清单**已排除已做种的片**、且按
-`SKIPPED → ERROR → PENDING → UNMATCHED` 排序，所以 **一批做完重跑同一条命令就自动推进**
-（不用记批次号）。`todo` 的路径走 stdout、分批说明走 stderr，管道不会被打扰。
+**分批**：`--limit N` 每批 N 条，`--batch K` 指定第几批，`--plan` 只打印计划不发请求。
+因为待办清单**已排除已做种的片**、且按 `SKIPPED → ERROR → PENDING → UNMATCHED` 排序，
+所以 **一批做完重跑同一条命令就自动推进**（不用记批次号）。
+`todo` 的路径走 stdout、分批说明走 stderr，管道不会被打扰。
 
 阶段（**由事实推导，不是手工填的**）：
 
@@ -247,23 +260,14 @@ python scripts/reseed-state.py init --pack dc-collection --depth 2 \
 
 **重搜周期（每站一周一次）**：粒度是 **(片 × 站)**，来自 cross-seed 自己的
 `timestamp(searchee_id, indexer_id, last_searched)` 表。默认每站 7 天，可按站覆盖：
-
-```bash
-python scripts/reseed-state.py report --pack $PACK --cadence "SiteA=7,SiteB=30"
-python scripts/reseed-state.py todo   --pack $PACK --include-cooldown   # 忽略周期，强制全量重扫
-```
-
-`report` 会打印按站周期表（搜过几部 / 到周期几部 / 下次最早可重搜是哪天）。
-详见 SUMMARY §11.6。
+`--cadence "SiteA=7,SiteB=30"`；`todo --include-cooldown` 忽略周期强制全量重扫。
+`report` 会打印按站周期表（搜过几部 / 到周期几部 / 下次最早可重搜是哪天）。详见 SUMMARY §11.6。
 
 **`drive` 已经会控速、会等退避、会回灌**（SUMMARY §11.8）：
-
-- `--interval 30` —— 两条 webhook 之间隔 30s，对齐 cross-seed 的 `delay`；
-- 每 `--check-every 10` 条读一次 cross-seed.db 的 `indexer` 表，撞上 `RATE_LIMITED`
-  就**睡到解禁**（超过 `--max-wait 1800` 秒则中止，不硬刚）；
-- 打完自动 `sync` 回灌，直接告诉你 `newly_seeding`（这轮真赚到几部）和
-  `still_skipped`（这轮又被退了几部）；
-- **默认 dry-run**，不加 `--apply` 不会发任何请求。
+`--interval 30` 对齐 cross-seed 的 `delay`；每 `--check-every 10` 条读一次 cross-seed.db 的
+`indexer` 表，撞上 `RATE_LIMITED` 就**睡到解禁**（超过 `--max-wait 1800` 秒则中止，不硬刚）；
+打完自动 `sync` 回灌，直接告诉你 `newly_seeding`（这轮真赚到几部）和 `still_skipped`（又被退了几部）。
+**默认 dry-run**，不加 `--apply` 不会发任何请求。
 
 > 为什么退避只能读库、不能用 API：cross-seed v6.13 的 HTTP 接口只暴露
 > `/api/ping` 与 `/api/status`，`/api/indexerstatus` 是 **404**（见 SUMMARY §11.9）。
@@ -271,7 +275,7 @@ python scripts/reseed-state.py todo   --pack $PACK --include-cooldown   # 忽略
 - 状态库是 `hlink/state.db`（**运行时数据，已 gitignore**）。它**只读** cross-seed 的库/日志与 qB，
   唯一被写的就是自己。为什么不直接给 cross-seed 的库加字段？见 SUMMARY §11.1。
 - 读 cross-seed.db 走**直读 UNC**（`PRAGMA query_only=1`，实测 0.17s 且能看到 WAL 数据），
-  拷 `.db/-wal/-shm` 只是兜底。
+  拷 `.db/-wal/-shm` 只是兜底。⚠ **诊断脚本一律直读，别 `cp`** —— `cp` 丢 WAL，会误判（SUMMARY §13.6 坑 2）。
 - ⚠ `--root` 是 **cross-seed 视角的 NAS 路径**（webhook 要用它）；Windows 上列目录另外传 `--local-root`。
 - 想跑"一次性批量作业"而不是长期增量维护，用 `python -m orchestrator.main`
   （`preflight` / `run` / `status` / `prestage`，见 SUMMARY §11.10）。
@@ -310,14 +314,8 @@ python scripts/gen-datadirs.py "//YOUR-NAS/video/download/movies/DC相关剧集�
 而中文标签照样进池子。实测两种接法的垃圾名数量：包根方案 **47 个**，本方案 **0 个**。
 完整分析与 cross-seed 的 searchee 生成规则见 SUMMARY §10.2 / §10.6。
 
-> ⚠ **`--depth` 必须与 cross-seed 的 `maxDataDepth` 完全一致**。两者不一致时，
-> 状态机会登记出 cross-seed 根本不搜的**幽灵条目**（永远 PENDING），
-> 或者漏掉 cross-seed 真在搜的片子。规则是**纯按深度**的（第 1..N 层的目录和视频文件
-> 全是 searchee），不是"含视频才算"—— 详见 SUMMARY §10.6.1。
-
-> 状态机**已支持嵌套包**（2026-09-11）：`init --root` / `--local-root` 可重复传、
-> 新增 `--depth`（= cross-seed 的 `maxDataDepth`，**必须与它一致**）。
-> DC 47 根 → 115 单片已能正常登记，详见 SUMMARY §10.4 / §10.6。
+> 状态机**已支持嵌套包**：`init --root` / `--local-root` 可重复传、`--depth` 必须与
+> `maxDataDepth` 一致。DC 47 根 → 115 单片已能正常登记（SUMMARY §10.4 / §10.6）。
 
 #### 生产 `.env` 怎么更新（本地改完要同步到 NAS）
 
@@ -329,7 +327,6 @@ python scripts/gen-nas-env-update.py          # 由本地 .env 生成 scripts/na
 ```
 
 把生成的 `scripts/nas-update-env.sh` 传到 NAS（和 `compose.yaml` 同目录），然后：
-
 ```bash
 sh nas-update-env.sh --dry-run       # 先看：备份 + 新旧条数 + 逐条校验 49 个路径是否存在
 sh nas-update-env.sh                 # 改 .env + 重启 cross-seed + 回读容器内条数做闭环验证
@@ -340,15 +337,13 @@ sh nas-update-env.sh --no-restart    # 只改不重启
 两行（不走 `sed`，避开分隔符与 `&` 转义坑）；③ 逐条 `[ -d ]` 校验（缺失只告警）；
 ④ 重启后 `docker inspect` 回读容器内的 `DATA_DIRS` 条数并比对。回滚：`cp -p .env.bak.<时间戳> .env`。
 
-**它只动 `DATA_DIRS` / `LINK_DIR` 两行，其余键逐字节保留** —— 因为本地 `.env` 里的
-`TORZNAB_URLS` 是脱敏占位符（`apikey=xxxx…`），生产上是真实密钥，串了就是全线 401。
-写盘前有一道硬闸：把两边除这两键外的所有行各导一份做 `cmp -s`，不一致就打印 `diff` 并拒绝写入。
-中间文件全放 compose 目录里（相对路径 + `trap` 兜底），跑完一个都不留。
+**它只动这两行，其余键逐字节保留** —— 因为本地 `.env` 的 `TORZNAB_URLS` 是脱敏占位符
+（`apikey=xxxx…`）、生产上是真实密钥，串了就是全线 401（写盘前有 `cmp -s` 硬闸把关）。
+原理与实测见 SUMMARY §11.12。
 
 > ⚠ **怎么确认它真的生效了**：`.env.new` 存在 ≠ `.env` 已更新。判断一律看这两处 ——
-> `sudo docker inspect reseed-cross-seed --format '{{range .Config.Env}}{{println .}}{{end}}' | grep '^DATA_DIRS='`
-> 的条数，或 `cross-seed.db` 的 `data` 表里有没有新包的路径。
-> 详见 SUMMARY §11.12。
+> ① `docker inspect reseed-cross-seed` 的 `DATA_DIRS` 条数 ② `cross-seed.db` 的 `data` 表
+> 里有没有新包的路径。别看 `ls`。详见 SUMMARY §11.12。
 
 #### 其它要点
 
@@ -375,6 +370,8 @@ sh nas-update-env.sh --no-restart    # 只改不重启
 `orchestrator/matcher.py` 的 `Matcher(ABC)` 是接口落点；`hlink/config.yml` 的 `matcher.engine` / `jobs[].matcher_engine`
 预留 `iyuu`/`custom`（当前会明确报"未实现"）。
 
+---
+
 ## 安全
 
 - `.env`、`cross-seed/`（含 cross-seed 自建的 db）、`prowlarr/`（Prowlarr 配置）**不要提交/外传**——含 cookie/passkey/apikey。
@@ -382,21 +379,16 @@ sh nas-update-env.sh --no-restart    # 只改不重启
 
 ---
 
-## 当前状态与下一步（2026-09-11 晚 · 接手会话后）
+## 当前状态与下一步（2026-09-11 晚）
 
-> 本会话把系统又跑了起来：接了新站、修了跨包 bug、写了自动续跑循环。
-> 详细过程见 **SUMMARY §13**。
+> 本节是**操作入口**：怎么继续跑 / 卡住了看哪。
+> 完整状态数据与逐项快照只维护在 **SUMMARY §13.7**，避免两处漂移。
 
-### 系统现状
+### 系统现状（一句话）
 
-| 项目 | 状态 |
-|---|---|
-| NAS `.env` `DATA_DIRS` | ✅ **49 条**，真实密钥保留 |
-| NAS `.env` `TORZNAB_URLS` | ⚠ **3 条**：HDFans `/2/api`、BTSCHOOL `/3/api`、NanyangPT `/4/api`（BTSCHOOL 待移除，见下） |
-| cross-seed 索引器 | HDFans ✅ / NanyangPT ✅ / BTSCHOOL ❌（Prowlarr 已禁用，但 URL 还在 → 每搜一次吃 410） |
-| cross-seed API / qBittorrent | ✅ 可达（`:2468` OK / qB v4.6.5） |
-| 状态机 `hlink/state.db` | ✅ 605 部（gitignored，勿提交） |
-| 新脚本 | `scripts/add-indexers.py`（加站）、`scripts/drive-loop.py`（自动续跑） |
+NAS `.env` `DATA_DIRS` ✅ 49 条 · `TORZNAB_URLS` ⚠ **3 条**（BTSCHOOL 待移除）·
+索引器 HDFans ✅ / NanyangPT ✅ / BTSCHOOL ❌ · 状态机 `hlink/state.db` ✅ 605 部 ·
+新脚本 `add-indexers.py`（加站）、`drive-loop.py`（自动续跑）。逐项快照见 **SUMMARY §13.7**。
 
 ### 三个包
 
@@ -404,10 +396,10 @@ sh nas-update-env.sh --no-restart    # 只改不重启
 |---|---|---|---|
 | FRDS | 486 | **~410** | PENDING 331 / UNMATCHED 79 / **SEEDING 76** |
 | DC | 115 | **~96** | PENDING 45 / UNMATCHED 51 / **SEEDING 19** |
-| MBF | 4 | 0 | ⚠ UNMATCHED 4 —— HDFans 0 匹配，等换站 |
+| MBF | 4 | 0 | ⚠ UNMATCHED 4 |
 
 > **⚠ MBF 已实测：HDFans 上 0 匹配**（4 个季包全 `Found 0 torrents`）。
-> 单站条件下做不了种；加新站后会自动解锁（状态机已是 `UNMATCHED`，不重复浪费额度）。
+> 状态已是 `UNMATCHED`，加新站后会自动解锁、**不会重复浪费额度**。
 
 ### 怎么继续跑（两种方式）
 
@@ -423,6 +415,7 @@ python scripts/drive-loop.py --indexers HDFans,NanyangPT
 
 > `drive-loop` 已内置 `--db-path` / `--qbit-url` 默认值（指向 NAS），**回灌不会漏参数**。
 > 挂 Windows 计划任务每 15 分钟 `--once` 即可无人值守推进。
+> 真实进度一律以 `scripts/drive-loop.log` 为准，**别看终端**（输出会被块缓冲吞掉，SUMMARY §13.8）。
 
 **方式 B：手动单批（原来的做法）**
 
@@ -441,29 +434,21 @@ python scripts/reseed-state.py drive --pack dc-collection --indexers HDFans,Nany
 ### ⚠ 交接必读的坑
 
 1. **`drive` 忘给 `--qbit-url` → `SEEDING` 被误降级成 `MATCHED`。**
-   现象：回灌打出 `已在 qB 里: 0` / `本次新增做种: -51`（负数）。
-   `stage` 是推导的纯函数，缺 qB 数据就推不出"在做种"。补跑带 `--qbit-url` 的 `sync` 即恢复。详见 SUMMARY §13.6。
+   现象：回灌打出 `已在 qB 里: 0` / `本次新增做种: -51`（**负数**）。
+   根因：`stage` 是推导的纯函数，缺 qB 数据就推不出"在做种"。
+   补救：补跑一次带 `--qbit-url` 的 `sync` 即完全恢复（幂等）。详见 SUMMARY §13.6 坑 1。
 2. **`drive` 忘给 `--db-path` → 回灌被跳过，状态不更新。**
    现象：webhook 全发成功（204），但结尾打
    `[!!] 回灌需要 --db-path（cross-seed.db 路径），已跳过`，退出码 3。
    补救：补上 `--db-path` 重跑，或单独跑 `sync` 回灌（都不发新请求，幂等）。
-
-### ⚠ 本次踩到的坑（交接必读）
-
-1. **`drive` 忘给 `--db-path` → 回灌被跳过，状态不更新。**
-   现象：webhook 全发成功（204），但结尾打
-   `[!!] 回灌需要 --db-path（cross-seed.db 路径），已跳过`，退出码 3。
-   补救：补上 `--db-path` 重跑，或单独跑 `sync` 回灌（都不发新请求，幂等）。
-
-   ⚠ 附带一个**假象**：补 `--db-path` 重跑时终端可能返回**空输出**，看着像"没执行"，
-   但 cross-seed 日志里其实有 `Searching for` 记录 —— 它跑完了，只是输出被吞了。
-   **判断 drive 是否真跑，查 cross-seed 日志，别看终端。**
-2. **`.env.new` 存在 ≠ `.env` 已更新。** 判断是否生效一律看
+   ⚠ 附带的**假象**：重跑时终端可能返回**空输出**，看着像"没执行"，其实跑完了 ——
+   **判断 drive 是否真跑，查 cross-seed 日志 / `drive-loop.log`，别看终端**（SUMMARY §12.5）。
+3. **`.env.new` 存在 ≠ `.env` 已更新。** 判断是否生效一律看
    ① 容器内 `DATA_DIRS` 条数 ② `cross-seed.db` 的 `data` 表，别看 `ls`。
-3. **别对大包根打 webhook。** cross-seed 的 webhook 是单线程顺序处理，
+4. **别对大包根打 webhook。** cross-seed 的 webhook 是单线程顺序处理，
    中途撞一次 429 → 后面几百条全部 `Skipped searching (filtered by temporarily
    disabled indexers)`。已实测：一次 429 废掉 295 条。改用 `drive --limit N` 分批。
-4. **`--depth` 必须等于 cross-seed 的 `maxDataDepth`**（本项目默认 2），
+5. **`--depth` 必须等于 cross-seed 的 `maxDataDepth`**（本项目默认 2），
    对不上就会出现"状态机有、cross-seed 没有"的幽灵条目。
 
 ### 还没做

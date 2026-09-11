@@ -33,6 +33,7 @@
 `--once` 模式下每次唤醒只跑一批；`--min-sleep` 保证不会连续猛打。
 """
 import argparse
+import json
 import logging
 import os
 import subprocess
@@ -225,6 +226,100 @@ def run_round(pack: str, args, api_key: str) -> S.DriveStats | None:
 # --------------------------------------------------------------------------- #
 # 主循环
 # --------------------------------------------------------------------------- #
+# --------------------------------------------------------------------------- #
+# --once 的跨进程节流 + 包轮换（计划任务每 15 分钟唤醒时靠这个防重叠）
+# --------------------------------------------------------------------------- #
+STATE_FILE = HERE / ".drive-loop.state"
+
+
+def read_state() -> dict:
+    try:
+        return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 —— 没有 / 损坏都当空状态
+        return {}
+
+
+def write_state(d: dict) -> None:
+    try:
+        STATE_FILE.write_text(json.dumps(d, ensure_ascii=False), encoding="utf-8")
+    except OSError as e:
+        LOG.warning("写状态文件失败（忽略）: %s", e)
+
+
+def pid_alive(pid) -> bool:
+    """判断 pid 是否还在跑。Windows 上用 tasklist（os.kill(pid,0) 在 Windows 会杀进程！）。"""
+    if not pid:
+        return False
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if os.name == "nt":
+        try:
+            out = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+                capture_output=True, text=True, errors="replace", timeout=15,
+            ).stdout
+            return str(pid) in (out or "")
+        except Exception:  # noqa: BLE001
+            return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def log_result(pack: str, stats: S.DriveStats | None) -> None:
+    if stats is None:
+        LOG.info("[%s] 本批无动作（没待搜或计划为空）", pack)
+        return
+    sleep_sec, reason = next_sleep(stats)
+    LOG.info("[%s] %s | 原因：%s | 下次间隔 %.0f 分钟", pack,
+             stats.render().splitlines()[0], reason, sleep_sec / 60)
+    if stats.newly_seeding:
+        LOG.info("  → 本轮新增做种 %d 部 🎉", stats.newly_seeding)
+    if stats.still_skipped:
+        LOG.warning("  → 仍有 %d 部被退避（站点侧 502/限流？见 SUMMARY §6.5）",
+                    stats.still_skipped)
+
+
+def once_round(packs: list[str], args, api_key: str, min_sleep: float) -> int:
+    """`--once` 单批模式：跨进程节流（防计划任务唤醒重叠）+ 包轮换持久化。
+
+    - 上一批还在跑（pid 活着）→ 直接退出
+    - 距上次批次结束不足 min_sleep → 直接退出（防猛打）
+    - 否则跑「轮到的那个包」一批，并把 {结束时间, 包序号} 写回状态文件
+    """
+    st = read_state()
+    if pid_alive(st.get("running_pid")):
+        LOG.info("上一批（pid %s）仍在运行，跳过本轮", st.get("running_pid"))
+        return 0
+    last_end = float(st.get("last_end_ts") or 0)
+    gap = time.time() - last_end
+    if last_end and gap < min_sleep:
+        LOG.info("距上次批次结束仅 %.1f 分钟（< %.0f 分钟），跳过本轮",
+                 gap / 60, min_sleep / 60)
+        return 0
+
+    idx = (int(st.get("last_pack_idx", -1)) + 1) % len(packs)
+    pack = packs[idx]
+    write_state({**st, "running_pid": os.getpid()})
+    LOG.info("[--once] 跑包 %s（第 %d/%d 个）", pack, idx + 1, len(packs))
+    try:
+        stats = run_round(pack, args, api_key)
+        log_result(pack, stats)
+    except Exception as e:  # noqa: BLE001 —— 单批异常也要正确收尾状态
+        LOG.exception("[%s] 本批异常", pack)
+        return 1
+    finally:
+        write_state({"running_pid": None, "last_end_ts": time.time(), "last_pack_idx": idx})
+    LOG.info("--once 完成。")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="反馈驱动循环：自动续跑 cross-seed 搜索")
     ap.add_argument("--packs", default="dc-collection,frds-top250-2024",
@@ -298,8 +393,12 @@ def main() -> int:
             LOG.error("找不到 CROSSSEED_API_KEY（--api-key 或 --env 的 .env）")
             return 2
 
-    # 计划任务每 15 分钟唤醒 --once：连续唤醒时保证最短间隔
+    # 批次之间的最小间隔（常驻模式用它 sleep；--once 模式用它拦掉过密的唤醒）
     min_sleep = args.min_sleep or MIN_SLEEP
+
+    # --once：单批模式（配合 Windows 计划任务）。跨进程节流 + 包轮换见 once_round()。
+    if args.once and not args.dry_run:
+        return once_round(packs, args, api_key, min_sleep)
 
     round_no = 0
     # 包轮流：记录上次跑到哪个包，下次从下一个开始

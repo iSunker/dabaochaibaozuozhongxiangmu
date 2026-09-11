@@ -1,12 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-把新索引器追加进 NAS .env 的 TORZNAB_URLS（安全闸模式，仿 nas-update-env.sh）。
+增删 NAS .env 的 TORZNAB_URLS（安全闸模式，仿 nas-update-env.sh）。
 
 只改 TORZNAB_URLS 一行；其余行逐字节校验不变（防真实密钥被占位符串掉）。
 用法:
   python add-indexers.py --env <NAS .env 路径> \
-      --add prowlarr:9696/3,prowlarr:9696/4   # 逗号分隔的 "host:port/id"，按序追加
+      --add prowlarr:9696/3,prowlarr:9696/4      # 逗号分隔的 "host:port/id"，按序追加
+  python add-indexers.py --env <NAS .env 路径> \
+      --remove prowlarr:9696/3                    # 按 "host:port/id" 前缀移除
+  # 可同时给：先移除、后追加（一次重建搞定换站）
+  python add-indexers.py --env <...> --remove prowlarr:9696/3 --add prowlarr:9696/5
+
+安全：写入前备份；只动 TORZNAB_URLS 一行；其余行逐字节校验；
+     拒绝把 TORZNAB_URLS 清空（至少保留 1 条）。
 """
 import argparse
 import shutil
@@ -14,13 +21,31 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+
+def norm_entry(spec: str) -> str:
+    """'prowlarr:9696/3' → 'http://prowlarr:9696/3/api'（自动补协议与 /api 段）。"""
+    s = spec.strip()
+    if not s.startswith("http"):
+        s = "http://" + s
+    # Torznab 端点形如 http://prowlarr:9696/<id>/api（README §3.4），自动补 /api
+    if not s.rstrip("/").endswith("/api"):
+        s = s.rstrip("/") + "/api"
+    return s
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--env", required=True, help="NAS 上的 .env 路径（UNC 亦可）")
-    ap.add_argument("--add", required=True,
+    ap.add_argument("--add", default=None,
                     help="逗号分隔的追加条目，如 'prowlarr:9696/3,prowlarr:9696/4'")
+    ap.add_argument("--remove", default=None,
+                    help="逗号分隔的移除条目（按 host:port/id 前缀匹配），如 'prowlarr:9696/3'")
     ap.add_argument("--no-backup", action="store_true")
     args = ap.parse_args()
+
+    if not args.add and not args.remove:
+        print("[!!] 至少给一个 --add 或 --remove", file=sys.stderr)
+        return 2
 
     env_path = Path(args.env)
     if not env_path.is_file():
@@ -56,27 +81,35 @@ def main() -> int:
         print("[!!] 现有 TORZNAB_URLS 里找不到 apikey", file=sys.stderr)
         return 1
 
-    # ---- 3) 构造新条目（同一把 Prowlarr key）----
-    adds = [a.strip() for a in args.add.split(",") if a.strip()]
+    # ---- 3a) 先移除（按 host:port/id 前缀精确匹配）----
     new_items = list(existing)
-    for a in adds:
-        if not a.startswith("http"):
-            a = "http://" + a
-        # Torznab 端点形如 http://prowlarr:9696/<id>/api（README §3.4），自动补 /api
-        if not a.rstrip("/").endswith("/api"):
-            a = a.rstrip("/") + "/api"
-        sep = "&" if "?" in a else "?"
-        entry = f"{a}{sep}apikey={apikey}"
-        # 幂等：按 "http://host:port/id" 前缀精确匹配，别用裸数字（会撞上 apikey 里的字符）
-        prefix = a.split("?", 1)[0]
-        if any(u.split("?", 1)[0] == prefix for u in existing):
-            print(f"  [skip] 已存在: {a}")
-            continue
-        new_items.append(entry)
-        print(f"  [add ] {a}")
+    if args.remove:
+        rem = {norm_entry(r) for r in args.remove.split(",") if r.strip()}
+        kept = [u for u in new_items if u.split("?", 1)[0] not in rem]
+        if not kept:
+            print("[!!] 移除后 TORZNAB_URLS 会变空，拒绝（至少保留 1 条）", file=sys.stderr)
+            return 1
+        for u in new_items:                       # 确认安全闸后才打印，顺序才不乱
+            if u.split("?", 1)[0] in rem:
+                print(f"  [del ] {u.split('?', 1)[0]}")
+        new_items = kept
 
-    if len(new_items) == len(existing):
-        print("[ok] 没有需要追加的条目。")
+    # ---- 3b) 再追加（同一把 Prowlarr key）----
+    if args.add:
+        for a in [x.strip() for x in args.add.split(",") if x.strip()]:
+            a = norm_entry(a)
+            sep = "&" if "?" in a else "?"
+            entry = f"{a}{sep}apikey={apikey}"
+            # 幂等：按 "http://host:port/id" 前缀精确匹配，别用裸数字（会撞上 apikey 里的字符）
+            prefix = a.split("?", 1)[0]
+            if any(u.split("?", 1)[0] == prefix for u in new_items):
+                print(f"  [skip] 已存在: {a}")
+                continue
+            new_items.append(entry)
+            print(f"  [add ] {a}")
+
+    if new_items == existing:
+        print("[ok] TORZNAB_URLS 无变化。")
         return 0
 
     new_val = ",".join(new_items)
