@@ -382,56 +382,71 @@ sh nas-update-env.sh --no-restart    # 只改不重启
 
 ---
 
-## 当前状态与下一步（2026-09-11 收尾归档）
+## 当前状态与下一步（2026-09-11 晚 · 接手会话后）
 
-> 本节点已停止所有自动动作（不再发 webhook、不再 drive）。下面是交接快照。
+> 本会话把系统又跑了起来：接了新站、修了跨包 bug、写了自动续跑循环。
+> 详细过程见 **SUMMARY §13**。
 
 ### 系统现状
 
 | 项目 | 状态 |
 |---|---|
-| NAS `.env` | ✅ `DATA_DIRS` = **49 条**，真实密钥保留 |
-| cross-seed 容器 | ✅ 已重启（16:00），`Validated 1888 entries from dataDirs` |
-| cross-seed.db `data` 表 | ✅ **1963 行**（FRDS 932 / DC ~993 / MBF 38） |
-| 状态机 `hlink/state.db` | ✅ **605 部**（gitignored，本地管理，勿提交） |
+| NAS `.env` `DATA_DIRS` | ✅ **49 条**，真实密钥保留 |
+| NAS `.env` `TORZNAB_URLS` | ⚠ **3 条**：HDFans `/2/api`、BTSCHOOL `/3/api`、NanyangPT `/4/api`（BTSCHOOL 待移除，见下） |
+| cross-seed 索引器 | HDFans ✅ / NanyangPT ✅ / BTSCHOOL ❌（Prowlarr 已禁用，但 URL 还在 → 每搜一次吃 410） |
 | cross-seed API / qBittorrent | ✅ 可达（`:2468` OK / qB v4.6.5） |
+| 状态机 `hlink/state.db` | ✅ 605 部（gitignored，勿提交） |
+| 新脚本 | `scripts/add-indexers.py`（加站）、`scripts/drive-loop.py`（自动续跑） |
 
 ### 三个包
 
 | 包 | 单片 | 待搜 | 阶段分布 |
 |---|---|---|---|
-| FRDS | 486 | **390** | PENDING 108 / SKIPPED 282 / UNMATCHED 48 / SEEDING 48 |
-| MBF | 4 | **0** | ⚠ **UNMATCHED 4** —— 实测 HDFans 上 0 匹配，见下 |
-| DC | 115 | **115** | PENDING 115 |
+| FRDS | 486 | **~410** | PENDING 331 / UNMATCHED 79 / **SEEDING 76** |
+| DC | 115 | **~96** | PENDING 45 / UNMATCHED 51 / **SEEDING 19** |
+| MBF | 4 | 0 | ⚠ UNMATCHED 4 —— HDFans 0 匹配，等换站 |
 
-> **⚠ MBF 已实测：HDFans 上 0 匹配。**
-> 4 个季包各搜一次，cross-seed 全部 `Found 0 torrents`，`searchee` 表里始终没有记录。
-> 当前单站条件下**做不了种**。出路：给 Prowlarr 加别的站再搜，或暂时放弃把额度留给 DC/FRDS。
-> 状态机已回灌为 `UNMATCHED`（不会重复浪费额度），加站后会自动解锁。详见 SUMMARY §12.3.1。
+> **⚠ MBF 已实测：HDFans 上 0 匹配**（4 个季包全 `Found 0 torrents`）。
+> 单站条件下做不了种；加新站后会自动解锁（状态机已是 `UNMATCHED`，不重复浪费额度）。
 
-### 恢复执行时的命令（**先 `--plan`，确认后再加 `--apply`**）
+### 怎么继续跑（两种方式）
 
-完整命令必须带 `--db-path`，否则回灌会被跳过（这是个坑，见下）：
+**方式 A：自动续跑（推荐）**
 
 ```bash
-# 通用参数
+# 真跑一轮（当前包下一批，约 24 分钟）
+python scripts/drive-loop.py --once --indexers HDFans,NanyangPT --limit 50
+
+# 循环跑：DC↔FRDS 自动轮流，间隔按站点反馈动态调整（45min~4h）
+python scripts/drive-loop.py --indexers HDFans,NanyangPT
+```
+
+> `drive-loop` 已内置 `--db-path` / `--qbit-url` 默认值（指向 NAS），**回灌不会漏参数**。
+> 挂 Windows 计划任务每 15 分钟 `--once` 即可无人值守推进。
+
+**方式 B：手动单批（原来的做法）**
+
+```bash
 URL=http://192.168.0.7:2468
 KEY=<CROSSSEED_API_KEY>
 DB="//iSunker-DS423/docker_ssd/prowlarr_cross-seed_autohardlink/cross-seed/cross-seed.db"
+Q="http://192.168.0.7:3060"          # ★必须带 --qbit-url，否则 SEEDING 被误降级！
 
-# ⚠ MBF 不用再跑了 —— 已实测 HDFans 0 匹配（UNMATCHED），见上文。
-#    除非你已给 Prowlarr 加了新站；加站后它会自动解锁。
-
-# 1) DC（115 部，3 批，每批约 24 分钟）—— 从这里开始
-python scripts/reseed-state.py drive --pack dc-collection --indexers HDFans --limit 50 \
-  --url $URL --api-key $KEY --db-path "$DB" --apply
-
-# 2) FRDS（390 部，8 批，每批约 24 分钟）—— SKIPPED 优先，排在最前
-python scripts/reseed-state.py drive --pack frds-top250-2024 --indexers HDFans --limit 50 \
-  --url $URL --api-key $KEY --db-path "$DB" --apply
+python scripts/reseed-state.py drive --pack dc-collection --indexers HDFans,NanyangPT --limit 50 \
+  --url $URL --api-key $KEY --db-path "$DB" --qbit-url $Q --apply
 ```
 
-**一批做完重跑同一条命令就自动推进**，不用记批次号。
+**一批做完重跑同一条命令就自动推进**，不用记批次号。**先 `--plan` 确认再加 `--apply`**。
+
+### ⚠ 交接必读的坑
+
+1. **`drive` 忘给 `--qbit-url` → `SEEDING` 被误降级成 `MATCHED`。**
+   现象：回灌打出 `已在 qB 里: 0` / `本次新增做种: -51`（负数）。
+   `stage` 是推导的纯函数，缺 qB 数据就推不出"在做种"。补跑带 `--qbit-url` 的 `sync` 即恢复。详见 SUMMARY §13.6。
+2. **`drive` 忘给 `--db-path` → 回灌被跳过，状态不更新。**
+   现象：webhook 全发成功（204），但结尾打
+   `[!!] 回灌需要 --db-path（cross-seed.db 路径），已跳过`，退出码 3。
+   补救：补上 `--db-path` 重跑，或单独跑 `sync` 回灌（都不发新请求，幂等）。
 
 ### ⚠ 本次踩到的坑（交接必读）
 
@@ -453,8 +468,12 @@ python scripts/reseed-state.py drive --pack frds-top250-2024 --indexers HDFans -
 
 ### 还没做
 
-- v3 **硬链接农场**（1 条 dataDir 取代 49 条）—— 设计已完成，见 SUMMARY §10.5。
-- Phase 2.6 重跑全量（等合适时机）。
-- 编排器 `status` 子命令（见 SUMMARY §11.9）。
+1. **从 `TORZNAB_URLS` 移除 BTSCHOOL `/3/api`** + 重建 cross-seed（消除每次搜索吃 410 的空耗）。
+   ⚠ 重建会打断正在跑的 drive，务必等当前批次跑完；方法见 SUMMARY §13.3。
+2. **挂 Windows 计划任务**：每 15 分钟 `drive-loop.py --once`，无人值守推进剩余批次。
+3. **换一个站替换 BTSCHOOL**（已在计划中）——加站流程见 SUMMARY §13.3。
+4. v3 **硬链接农场**（1 条 dataDir 取代 49 条）—— 设计已完成，见 SUMMARY §10.5。
+5. 编排器 `status` 子命令（见 SUMMARY §11.9）；IYUU 扩散（本范围外）。
 
-详细的过程记录、踩坑与决策都在 **SUMMARY.md**（尤其 §11.12 / §11.13 / §11.14）。
+详细的过程记录、踩坑与决策都在 **SUMMARY.md**
+（老会话见 §11.12 / §11.13 / §11.14 / §12，**本会话见 §13**）。

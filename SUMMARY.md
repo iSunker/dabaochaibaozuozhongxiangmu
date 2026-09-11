@@ -1839,3 +1839,252 @@ python scripts/reseed-state.py drive --pack frds-top250-2024 --indexers HDFans -
 - **Phase 2.6 重跑全量**：等合适时机。
 - **编排器 `status` 子命令**：见 §11.9。
 - **IYUU 扩散**：本次范围外，接口已预留，见 §1。
+
+---
+
+## 13. 接手会话（2026-09-11 晚）—— 加站 / 修 bug / 自动化
+
+> 本章是 §12 交接快照之后**第二个会话**的记录。上一会话停在"所有自动动作已停止"，
+> 本会话把它继续跑了起来，并补了三样东西：**加站脚本、跨包过滤修复、自动续跑循环**。
+
+### 13.1 本会话做了什么（概览）
+
+| # | 事项 | 结果 |
+|---|---|---|
+| 1 | 健康检查 | ✅ cross-seed `OK` / qB `v4.6.5` / Prowlarr `200` / `DATA_DIRS`=49 |
+| 2 | **DC 批 1**（`drive --limit 50`） | ✅ +8 部做种（qB 48→65 中的 8 部属 DC） |
+| 3 | **接入新站 BTSCHOOL + NanyangPT** | ✅ 见 §13.3；BTSCHOOL 卡 CF 已禁用 |
+| 4 | **修跨包 searchee 误报 bug** | ✅ 122 对不上 → **0**，见 §13.4 |
+| 5 | **FRDS 批 1**（`drive --limit 50`） | ✅ **+14 部做种**（51→65） |
+| 6 | **写 `drive-loop.py`**（反馈驱动自动续跑） | ✅ 见 §13.5 |
+| 7 | 文档归档（本章 + README） | ✅ |
+
+### 13.2 新增文件与代码改动
+
+| 文件 | 类型 | 说明 |
+|---|---|---|
+| `scripts/add-indexers.py` | 🆕 | 给 NAS `.env` 的 `TORZNAB_URLS` **追加索引器**。安全闸模式（仿 `nas-update-env.sh`）：只改 `TORZNAB_URLS` 一行、其余逐字节校验、自动备份；**自动补 `/api` 段**；幂等（按 `http://host:port/id` 前缀精确去重）。key 从现有 URL 提取、不落命令行。 |
+| `scripts/drive-loop.py` | 🆕 | **反馈驱动循环**：跑一批 `drive` → 读 `newly_seeding` / `still_skipped` / `backoff_hits` → 动态定下次间隔 → DC↔FRDS 轮流。见 §13.5。 |
+| `orchestrator/state.py` | ✏️ | ① `CrossSeedSnapshot` 加 `searchee_paths`（`searchee.name → data.path`）② 新增 `_resolve_searchee_to_pack()`（路径前缀判定包归属）③ `_sync` 改用它，跨包 searchee 静默跳过。见 §13.4。 |
+
+### 13.3 接入新站的完整流程（可复用）
+
+> **背景**：用户在 Prowlarr 网页里加了两个站（BTSCHOOL、NanyangPT），问"代码有没有自动检测新站"。
+> **答案：没有全自动**。cross-seed **只认 `.env` 的 `TORZNAB_URLS`**，Prowlarr UI 加站不会自动同步过去。
+
+```
+Prowlarr UI 加站                        ← 用户手动
+        ↓  ❌ cross-seed 看不见，断在这
+改 .env 的 TORZNAB_URLS + 重建 cross-seed   ← 本流程
+        ↓  ✅ cross-seed 启动拉 caps → indexer 表注册（active=1）
+状态机 sync / drive --indexers <站名>        ← ✅ due_indexers() 自动解锁没搜过新站的片子
+```
+
+**实际操作**（2026-09-11 实测）：
+
+```bash
+# 1) 查 Prowlarr 里各站的 indexerId（★ID 会变，必须实时查，见 §6.6）
+curl -s -H "X-Api-Key: <Prowlarr key>" http://<NAS_IP>:9696/api/v1/indexer \
+  | python -c "import sys,json;[print(i['id'],i['name'],i['enable']) for i in json.load(sys.stdin)]"
+#   1 HDtime / 2 HDFans / 3 BTSCHOOL / 4 NanyangPT (南洋)
+
+# 2) 追加进 NAS .env（自动补 /api、只改一行、自动备份）
+python scripts/add-indexers.py \
+  --env "//YOUR-NAS/docker_ssd/prowlarr_cross-seed_autohardlink/.env" \
+  --add "prowlarr:9696/3,prowlarr:9696/4"
+
+# 3) 重建 cross-seed 让新 env 生效（★必须 force-recreate，restart 不行！）
+#    在 NAS 上执行：
+cd /volume2/docker_ssd/prowlarr_cross-seed_autohardlink \
+  && sudo docker compose up -d --no-deps --force-recreate cross-seed
+```
+
+**三个必须知道的点**：
+
+1. **`restart` 不够，必须 `--force-recreate`**。`docker compose restart` 只重启容器、**不重新注入环境变量**，新站的 `TORZNAB_URLS` 进不去。加 `--no-deps` 防止连带重建 Prowlarr（§4 的坑）。
+2. **验证要看容器内 env 条数**（最权威）：
+   ```bash
+   sudo docker inspect reseed-cross-seed --format '{{range .Config.Env}}{{println .}}{{end}}' \
+     | grep '^TORZNAB_URLS=' | tr ',' '\n' | grep -c '/api'      # 期望 = 站数
+   ```
+3. **cross-seed 的 indexer id ≠ Prowlarr 的 indexerId**。它是自己从 1 递增注册的（实测 NanyangPT=Prowlarr id4 → cross-seed id5），映射靠 URL 的 `/N/api` 保持。**别写死数字**。
+
+**禁用某个站的正确姿势（⚠ 本会话踩到）**：
+
+> 只在 Prowlarr 里 `enable=false` **不够** —— cross-seed 仍按 `TORZNAB_URLS` 去请求它，
+> 每搜一次就吃一个 **HTTP 410（Gone）** 并触发 snooze，白白浪费一次请求。
+> 见 §13.6 坑 5。**要彻底停用某站，必须把它从 `TORZNAB_URLS` 里移除**（或把 `enable`
+> 之外的 URL 也删掉）再重建 cross-seed。
+
+**判断某站要不要 FlareSolverr**（BTSCHOOL 就栽在这）：
+
+| Prowlarr 手动搜该站看到… | 说明 | 配 FlareSolverr 有用吗 |
+|---|---|---|
+| `403` + HTML 挑战页 / 日志 `Cloudflare`、`cf-mitigated` | 被 CF 挡在门外 | ✅ 有用 |
+| `500/502/520/522/timeout` | 请求**已穿过 CF**，站点后端挂了 | ❌ 没用 |
+| `429 + Retry-After` | 站点限流 | ❌ 没用（该降 `delay`） |
+
+BTSCHOOL 属第一行（Cloudflare）→ 用户决定**先禁用、后面换站**。
+
+### 13.4 ★ 修复：跨包 searchee 被误报「对不上目录」
+
+**症状**：`sync --pack dc-collection` 一直报 `⚠ 有 118~122 个 searchee 名对不上目录（已跳过）`。
+
+**误判排查**：一开始以为是 DC 嵌套路径的匹配逻辑（`dir_name_of` 最长前缀）有问题。
+**查完发现不是** —— 那 122 个名字（`V字仇杀队…`、`2001太空漫游…`、`低俗小说…`）**全是 FRDS 包的片子**。
+
+**根因**：`searchee` 表是 cross-seed **全库共享**的（FRDS+MBF+DC 都在这张表），
+而 `_sync` 拿**当前包（DC）**的目录名去匹配**全库**的 searchee 名 —— 别的包的片子自然对不上，
+却全被计进了当前包的 `unresolved`。**这是调用语义问题，不是匹配算法问题。**
+
+**修法**（`orchestrator/state.py`，3 处改动）：
+
+1. `CrossSeedSnapshot` 新增 `searchee_paths`（`searchee.name → data.path`）。
+   **关键实测**：`data` 表的 `title` 与 `searchee.name` **100% 对齐**（471/471），
+   于是每个 searchee 都能拿到**完整路径** —— 这是区分包的唯一可靠依据。
+2. 新增 `_resolve_searchee_to_pack()`：按 **dataDir 路径前缀**判定包归属，返回
+   `(单片名, 归属)`，`归属` ∈ `{"in_pack","other_pack","unresolved"}`。
+3. `_sync` 用它替换原来的 `resolve_dir_name(name, dirs)`：**跨包（other_pack）静默跳过、
+   不计数**；只有「路径在本包内、但归不到具体单片」才算 `unresolved`。
+
+**实测验证**（三个包全部归零）：
+
+| 包 | 修前 | 修后 | 搜过 / 匹配 / 做种 |
+|---|---|---|---|
+| DC | ⚠ 122 对不上 | ✅ **0** | 50 / 8 / 8 |
+| FRDS | ⚠ 118 对不上 | ✅ **0** | 140 / 65 / 65 |
+| MBF | — | ✅ **0** | 4 / 0 / 0（HDFans 0 匹配，正常） |
+
+> 顺带：修好后 FRDS 的 `SEEDING` 数（65）与文档 §10.6.3 的实测吻合，
+> 确认了「depth=2 多认 3 个真匹配」那条结论。
+
+### 13.5 ★ `drive-loop.py`：反馈驱动自动续跑
+
+**起因**：§12 交接时发现"种子停在 58 不动了"。查清真相是 ——
+**cross-seed 不会自动重搜**（`searchCadence` 没启用），**`drive` 是一次性命令**（跑完一批退出，
+不自动排下一批），所以 12:24 全量被打断后就没人再触发，直到本会话手动跑。
+
+**做法**：把"重跑同一条命令推进下一批"自动化，且**间隔按站点反馈动态调整**（不是固定时间表）。
+
+**反馈信号 → 下次间隔**：
+
+| 上一批的信号 | 含义 | 下次间隔 |
+|---|---|---|
+| `aborted`（退避等到超 `--max-wait`） | 站点严重异常 | 3 小时 |
+| `still_skipped > 0` | 这轮又被退避跳过 | 2 小时 |
+| `backoff_hits > 0` | 中途等过退避 | 2 小时 |
+| `newly_seeding > 0` 且无退避 | 站点健康 | 45 分钟 |
+| 无退避、无新增 | 正常 | 45 分钟 |
+
+上下限 30 分钟 ~ 4 小时（`MIN_SLEEP`/`MAX_SLEEP`），包间默认 **DC → FRDS 轮流**。
+
+**用法**：
+
+```bash
+# 真跑一轮（当前包下一批，约 24 分钟）
+python scripts/drive-loop.py --once --indexers HDFans,NanyangPT --limit 50
+
+# 循环跑（默认 DC↔FRDS 自动轮流，直到都没待搜）
+python scripts/drive-loop.py --indexers HDFans,NanyangPT
+
+# 看计划不发请求
+python scripts/drive-loop.py --once --dry-run
+```
+
+**为什么不是固定 cron**：这套系统的关键不确定项是**站点状态**（会 502/限流，见 §6.5）。
+固定时间表在站点抖动时照打不误（继续撞 429），在站点健康时又白白空等。
+反馈驱动能"撞了自动放慢、顺了自动收紧"。
+
+**`--once` 模式**：配合 Windows 计划任务每 15 分钟唤醒一次，
+脚本内部用 `min_sleep`（默认 30 分钟）保证连续唤醒时不会猛打。
+
+> ⚠ **`drive-loop` 的回灌必须带 qB**（`--qbit-url`，默认已填 `:3060`）。
+> 漏了会把 `SEEDING` 误降级 —— 见 §13.6 坑 1。
+
+### 13.6 本会话踩到的坑（按严重度）
+
+1. 🔴 **`drive` 忘带 `--qbit-url` → `SEEDING` 被误降级成 `MATCHED`。**
+   现象：FRDS 批 1 的回灌打出 `已在 qB 里: 0` / `SEEDING=0` / `本次新增做种: -51`（负数！）。
+   根因：`stage` 是**推导的纯函数**（§11.2），推导需要 qB 的做种哈希；漏 `--qbit-url`
+   时 `seeding_hashes` 为空 → 已有的 51 个 `SEEDING` 全部降级为 `MATCHED`。
+   **补救**：补跑一次带 `--qbit-url` 的 `sync` 即完全恢复（已是幂等的推导，不丢数据）。
+   → **`drive` 的自动回灌必须带 `--qbit-url`**（和 §12.5 的"必须带 `--db-path`"是姊妹坑）。
+
+2. 🔴 **`cp` 复制 cross-seed.db 会丢 WAL 数据 → 误判"新站没注册"。**
+   现象：`cp` 出来的副本里 `indexer` 表只有 id 1、2，看着像新站没注册；
+   **直读 UNC 的原库**（`PRAGMA query_only=1`）却能看到 id=4、5 —— 新站其实好着呢。
+   根因：`cp` 只拷主文件，`.db-wal` 里未 checkpoint 的数据丢了（§11.4 早已记录此坑，
+   这次是在**我们自己写的诊断脚本**里又踩了一遍）。
+   → **诊断一律直读 UNC 原库**（`sqlite3.connect(unc_path)` + `PRAGMA query_only=1`），
+   别 `cp`。`read_crossseed_db()` 已经是直读优先，但临时脚本要注意。
+
+3. 🟠 **`add-indexers.py` 幂等检查用了裸数字 → 误匹配 apikey 里的字符。**
+   现象：首次跑报 `[skip] 已存在: .../3`、`.../4`，实际 `.env` 里只有 `/2/api`。
+   根因：`key = a.split("/")[-1]` 得到裸 `"3"`，而 `"3" in url` 会撞上 apikey 字符串里的 `3`。
+   → 改成按 `u.split("?", 1)[0] == prefix`（`http://host:port/id` 前缀）精确比较。
+
+4. 🟠 **Torznab URL 必须带 `/api` 段。** 第一次写成 `http://prowlarr:9696/3?apikey=…`
+   （少了 `/api`），cross-seed 拉 caps 会 404。正确形式见 §3.4：
+   `http://prowlarr:9696/<indexerId>/api?apikey=<Prowlarr key>`。`add-indexers.py` 已自动补。
+
+5. 🟠 **只在 Prowlarr 禁用索引器 ≠ cross-seed 不搜它。**
+   现象：BTSCHOOL 在 Prowlarr `enable=false` 后，cross-seed 日志仍刷
+   `Failed to reach http://prowlarr:9696/3/api: code 410, snoozing`。
+   根因：cross-seed 只认自己的 `TORZNAB_URLS`，与 Prowlarr 的 enable 状态无关。
+   → 彻底停用某站必须**从 `TORZNAB_URLS` 移除**，光改 Prowlarr 不够。
+
+6. 🟡 **`drive --indexers` 只影响状态机记账，不限制 cross-seed 搜索范围。**
+   cross-seed 按 `TORZNAB_URLS` **全站搜索**；`--indexers` 只决定状态机把
+   "搜过"记到哪个站名下（`indexer_seen` / 周期计算）。两者别混。
+
+7. 🟡 **Prowlarr 的 indexerId 会变**（§6.6 老坑，本会话再次验证）：
+   文档快照里 id=1 是 SiteB，现在 id=1 是 **HDtime**。拼 `TORZNAB_URLS` 前**必须实时查 API**。
+
+### 13.7 本会话结束时的状态快照
+
+| 项目 | 状态 |
+|---|---|
+| NAS `.env` `DATA_DIRS` | ✅ 49 条（未动） |
+| NAS `.env` `TORZNAB_URLS` | ⚠ **3 条**（HDFans `/2/api`、BTSCHOOL `/3/api`、NanyangPT `/4/api`）——BTSCHOOL 待移除 |
+| cross-seed 索引器 | HDFans(active) / NanyangPT(active) / BTSCHOOL(已禁用，仍会被请求→410) |
+| DC 包 | SEEDING **19** / PENDING 45 / UNMATCHED 51（待搜 ~96） |
+| FRDS 包 | SEEDING **76** / PENDING 331 / UNMATCHED 79（待搜 ~410） |
+| MBF 包 | UNMATCHED 4（HDFans 0 匹配，等换站） |
+| `drive-loop.py` | ✅ 已写、语法通过、dry-run 通过、**真跑验证通过**（§13.8） |
+
+### 13.8 `drive-loop.py` 首次真跑验证（✅ 通过）
+
+```bash
+python scripts/drive-loop.py --once --indexers HDFans,NanyangPT --limit 50
+```
+
+**实测结果**（`scripts/drive-loop.log`）：
+
+```
+18:44:05  === drive-loop 启动：packs=['dc-collection','frds-top250-2024'] indexers=HDFans,NanyangPT limit=50
+18:44:05  [第 1 轮] 跑包 dc-collection ...
+19:08:37  [dc-collection] 发送完毕：成功 50 / 失败 0，退避等待 0.0 分钟（0 次）
+19:14:35  [dc-collection] 回灌：搜过 158 / 匹配 19 / 新增做种 11 / 仍 SKIPPED 0
+19:14:35  [第 1 轮] 计划 50 条，发出 50 条 | 原因：新增做种 11 部，站点健康 | 下次间隔 45 分钟
+19:14:35  --once 模式：本轮完成，退出
+```
+
+**结论**：
+- ✅ 一批 50 条发送正常，0 失败、0 退避
+- ✅ **回灌带 qB 正确**：`新增做种 11` / `仍 SKIPPED 0` 算得准（这正是 §13.6 坑 1 的修复点）
+- ✅ **反馈落到了决策**：`站点健康 → 下次间隔 45 分钟`（`next_sleep()` 正确）
+- ✅ **DC 批 2 实际新增 11 部做种**
+
+> ⚠ **另一个"别看终端"的实例**：后台运行时，任务输出文件只捕获到前 2 行
+> （Python 的 stdout 被块缓冲），但 `scripts/drive-loop.log` 是**完整**的。
+> 与 §12.5 那条"判断 drive 是否真跑，查日志别看终端"是同一类坑 ——
+> **`drive-loop` 的真实进度一律以 `scripts/drive-loop.log` 为准。**
+
+### 13.9 下一步（按优先级）
+
+1. **从 `TORZNAB_URLS` 移除 BTSCHOOL `/3/api`** + 重建 cross-seed（消除 410 空耗）。
+   ⚠ 重建会打断正在跑的 drive，**务必等当前批次跑完**。
+2. **挂 Windows 计划任务**：每 15 分钟 `drive-loop.py --once`，自动推进 DC/FRDS 剩余批次。
+3. **换一个站替换 BTSCHOOL**（用户计划中）——加站流程见 §13.3。
+4. v3 硬链接农场（§10.5，设计已完成）。
+5. 编排器 `status` 子命令（§11.9）；IYUU 扩散（本范围外）。

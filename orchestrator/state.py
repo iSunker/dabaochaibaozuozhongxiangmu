@@ -226,6 +226,10 @@ class CrossSeedSnapshot:
     searched: dict[str, dict[str, str]] = field(default_factory=dict)
     #: searchee.name -> [(info_hash, decision)]
     decisions: dict[str, list[tuple[str, str]]] = field(default_factory=dict)
+    #: searchee.name -> 完整路径（来自 data 表，title 与 name 对齐）。
+    #: ★有了路径才能按 dataDir 前缀把「当前包」和「别的包」的 searchee 分开，
+    #:   否则 sync 会对跨包名字误报 unresolved（FRDS 的片子被算进 DC 的对不上数）。
+    searchee_paths: dict[str, str] = field(default_factory=dict)
     #: 当前生效（active=1）的索引器名
     indexers: list[str] = field(default_factory=list)
     #: 索引器名 -> (status, retry_after 可读时间)
@@ -548,6 +552,12 @@ def read_crossseed_db(db_path: str | Path, *, keep_copy: str | None = None) -> C
                 snap.indexers.append(label)
 
         snap.searchee_total = con.execute("SELECT COUNT(*) FROM searchee").fetchone()[0]
+
+        # searchee 名 → 完整路径：data 表的 title 与 searchee.name 对齐（实测 100%）。
+        # 用它按 dataDir 前缀区分「这个包 vs 别的包」的 searchee。
+        for dpath, dtitle in con.execute("SELECT path, title FROM data"):
+            if dtitle:
+                snap.searchee_paths.setdefault(dtitle, _norm_path(dpath))
 
         # 已搜过：timestamp 表（按 searchee × indexer），带**毫秒级**时间戳
         for sname, iid, last_ms in con.execute(
@@ -1114,6 +1124,35 @@ def resolve_dir_name(name: str, dir_names: set[str]) -> str | None:
     return max(cands, key=len)
 
 
+def _resolve_searchee_to_pack(
+    name: str,
+    snap: CrossSeedSnapshot,
+    roots: list[str],
+    dirs: set[str],
+    dpaths: dict[str, str],
+) -> tuple[str | None, str]:
+    """把一个 cross-seed searchee 归到**当前包**的单片名。
+
+    返回 `(单片名, 归属)`，`归属` ∈ {"in_pack", "other_pack", "unresolved"}：
+      * "in_pack"     —— 路径落在当前包某个 dataDir 下，`单片名` 为归属的单片
+      * "other_pack"  —— 路径在别的包下（或查不到路径），**静默跳过、不计数**
+      * "unresolved"  —— 路径在当前包内、但归不到任何具体单片（真·对不上）
+    区分这两种"不是本包"的情况，是为了 sync 汇报时**不把跨包 searchee 误报成
+    当前包的对不上数**（FRDS/MBF 的片子不该算进 DC 的 unresolved）。
+    """
+    p = _norm_path(snap.searchee_paths.get(name, ""))
+    if p:
+        for r in roots:
+            r = _norm_path(r)
+            if p == r or p.startswith(r + "/"):
+                d = dir_name_of(p, roots, dpaths)
+                return (d if d else None, "in_pack" if d else "unresolved")
+        return (None, "other_pack")       # 路径在别的包下 → 不属于当前包
+    # 查不到路径（老库 / 罕见）：退回纯名字匹配；匹配不上算 unresolved
+    d = resolve_dir_name(name, dirs)
+    return (d, "in_pack" if d else "unresolved")
+
+
 # --------------------------------------------------------------------------- #
 # 索引器标签归一
 # --------------------------------------------------------------------------- #
@@ -1231,17 +1270,18 @@ def sync_pack(
         alias = {**snap.alias, **alias}      # 用户显式给的优先
         indexers_now = [_norm_one(i, alias) for i in (indexers_override or snap.indexers)]
         for name, idxmap in snap.searched.items():
-            d = resolve_dir_name(name, dirs)
+            d, belong = _resolve_searchee_to_pack(name, snap, roots, dirs, dpaths)
             if d is None:
-                rep.unresolved += 1
-                continue
+                if belong == "unresolved":
+                    rep.unresolved += 1
+                continue                      # other_pack：静默跳过，不计数
             tgt = db_searched.setdefault(d, {})
             for ix, ts in idxmap.items():
                 label = normalize_indexer(ix, alias)
                 if ts and (label not in tgt or ts > tgt[label]):
                     tgt[label] = ts
         for name, decs in snap.decisions.items():
-            d = resolve_dir_name(name, dirs)
+            d, belong = _resolve_searchee_to_pack(name, snap, roots, dirs, dpaths)
             if d is None:
                 continue
             for info_hash, _decision in decs:
