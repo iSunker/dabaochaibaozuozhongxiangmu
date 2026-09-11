@@ -83,8 +83,16 @@ TODO_PRIORITY: dict[str, int] = {
     STAGE_UNMATCHED: 3,
 }
 
-#: 未命中后，**每个站**默认多久重搜一次（用户要求：一周一次）
-DEFAULT_CADENCE_DAYS = 7
+#: 未命中后，**每个站**默认多久重搜一次。
+#:
+#: ★ 2026-09-11 由 7 天改为 14 天（账号安全 > 命中延迟）。
+#:   无人值守下这个周期决定了**长期查询量**：DC+FRDS+MBF ≈ 1000 部单片，
+#:   7 天 = 每天约 150 次查询/站，一年 5 万+ 次，且是**永不停止**的机器人流量。
+#:   delay=30 只解决"快不快"，解决不了"像不像人"——长期稳定的自动化抓取本身
+#:   就可能触发站点风控。翻倍到 14 天，查询量直接减半，代价只是未命中的片子
+#:   多等一周（反正命中的前提是"站上出现了这个单种"，那件事本来就不由我们控制）。
+#:   单个站想更保守：`--cadence "NanyangPT=30"`；想更激进：`--cadence-days 7`。
+DEFAULT_CADENCE_DAYS = 14
 #: 兼容旧名字
 DEFAULT_COOLDOWN_DAYS = DEFAULT_CADENCE_DAYS
 
@@ -118,7 +126,7 @@ def due_indexers(
 ) -> list[str]:
     """**这一部片子，现在该在哪些站上重搜？**
 
-    规则（这就是「每站一周搜一次」的落地）：
+    规则（这就是「每站按周期重搜」的落地）：
       * 从没在这个站搜过            → 该搜
       * 上次搜到现在 ≥ 该站的周期   → 该搜
       * 否则                        → 等
@@ -222,7 +230,7 @@ UNKNOWN_INDEXER = "(未记录)"
 class CrossSeedSnapshot:
     """从 cross-seed.db 读出来的事实（只读快照）。"""
     #: searchee.name -> {索引器标签: 最后一次搜索时间 "YYYY-MM-DD HH:MM:SS"}
-    #: ★这就是「每站一周搜一次」里那个"上次搜是什么时候"
+    #: ★这就是「每站按周期重搜」里那个"上次搜是什么时候"
     searched: dict[str, dict[str, str]] = field(default_factory=dict)
     #: searchee.name -> [(info_hash, decision)]
     decisions: dict[str, list[tuple[str, str]]] = field(default_factory=dict)
@@ -520,7 +528,7 @@ def read_crossseed_db(db_path: str | Path, *, keep_copy: str | None = None) -> C
     """只读 cross-seed.db，取出三样事实：
 
       * 每个 searchee 在**每个索引器**上最后一次搜索的时间（`timestamp` 表）
-        —— 这就是「每站一周搜一次」里那个"上次搜是什么时候"
+        —— 这就是「每站按周期重搜」里那个"上次搜是什么时候"
       * 匹配结论（`decision` 表，带 info_hash）
       * 索引器退避状态与解禁时间（`indexer` 表）
     """
@@ -914,7 +922,7 @@ class StateStore:
         """按事实重算这一行的 stage。返回新 stage。
 
         `attempts` / `next_retry_at` 是**我们自己的**簿记（cross-seed 不管这个）。
-        `indexer_seen` 记录"每个站最后一次搜它是什么时候"，是「每站一周一次」的依据。
+        `indexer_seen` 记录"每个站最后一次搜它是什么时候"，是「每站按周期重搜」的依据。
         """
         row = self.con.execute("SELECT * FROM movie WHERE id=?", (movie_id,)).fetchone()
         if row is None:
@@ -1017,7 +1025,7 @@ class StateStore:
           - PENDING            → 搜
           - SKIPPED            → **立刻**搜（上次根本没发出去）
           - ERROR              → 搜
-          - UNMATCHED          → 按**每站各自的周期**判断（默认 7 天）
+          - UNMATCHED          → 按**每站各自的周期**判断（默认见 DEFAULT_CADENCE_DAYS）
                                   —— 只要有一个站"从没搜过"或"够周期了"就该搜
         """
         now = now or datetime.now()

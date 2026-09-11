@@ -7,9 +7,10 @@ sidecar 状态库（默认 `hlink/state.db`，可用 --db 或 RESEED_STATE_DB �
 
 重搜周期
 --------
-「每站一周搜一次」是默认行为：cross-seed 的 `timestamp` 表里记着
+「每站按周期重搜」是默认行为（默认 14 天，见 orchestrator/state.py 的
+DEFAULT_CADENCE_DAYS 注释里的取舍理由）：cross-seed 的 `timestamp` 表里记着
 **每个 searchee 在每个索引器上最后一次搜索的时间**，`todo` 就按它逐站比周期。
-想改：`--cadence-days 14`，或 `--cadence "SiteA=7,SiteB=30"` 给单个站单独设。
+想改：`--cadence-days 7`，或 `--cadence "SiteA=14,NanyangPT=30"` 给单个站单独设。
 
 常用流程
 --------

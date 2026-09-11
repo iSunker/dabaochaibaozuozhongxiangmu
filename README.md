@@ -68,8 +68,9 @@ prowlarr_cross-seed_autohardlink/   # NAS 部署目录（compose 就放这里，
 ```
 
 > 开发仓库里另有 `scripts/`（`run-batch.sh` 抽样脚本、`reseed-state.py` 状态机 CLI、
-> `drive-loop.py` 自动续跑、`add-indexers.py` 加站、`gen-datadirs.py` 生成嵌套包的 `DATA_DIRS` 片段）。
-> 它们是**在 Windows 上跑**的工具，不必进容器。由状态机导出的 `unmatched.tsv` /
+> `drive-loop.py` 自动续跑、`add-indexers.py` 加站、`gen-datadirs.py` 生成嵌套包的 `DATA_DIRS` 片段、
+> `build-farm.sh` 构建硬链接农场〔**在 NAS 上跑**，见「扩展 → 硬链接农场」〕）。
+> 其余都是**在 Windows 上跑**的工具，不必进容器。由状态机导出的 `unmatched.tsv` /
 > `todo.txt` 属运行时产物，已 gitignore。
 
 三大服务的配置目录一一对应：`prowlarr/`→Prowlarr、`cross-seed/`→cross-seed、`hlink/`→编排器。
@@ -251,17 +252,22 @@ DC 那种 47 个根的包也一行搞定。另有显式 `--root/--local-root`（
 |---|---|---|
 | `SEEDING` | qB 里真有这个 info_hash | ❌ 永不 |
 | `MATCHED` | 匹配到、已注入，等 qB 确认 | ❌ 不 |
-| `UNMATCHED` | 真搜过、没匹配到 | ⏳ 仅当**出现没搜过的索引器**或过了重搜周期（默认 **7 天**） |
+| `UNMATCHED` | 真搜过、没匹配到 | ⏳ 仅当**出现没搜过的索引器**或过了重搜周期（默认 **14 天**） |
 | `SKIPPED` | ★被退避秒跳 | ✅ **立刻** |
 | `PENDING` / `ERROR` | 没搜过 / 异常 | ✅ 立刻 |
 
 > **加一个站，所有 `UNMATCHED` 自动变成待搜** —— 不需要人工挑片子。
 > 实测：只配 SiteA 时待搜 286 条；加上 SiteB 后那 48 个 `UNMATCHED` 全部解锁。
 
-**重搜周期（每站一周一次）**：粒度是 **(片 × 站)**，来自 cross-seed 自己的
-`timestamp(searchee_id, indexer_id, last_searched)` 表。默认每站 7 天，可按站覆盖：
-`--cadence "SiteA=7,SiteB=30"`；`todo --include-cooldown` 忽略周期强制全量重扫。
+**重搜周期（每站按周期重搜，默认 14 天）**：粒度是 **(片 × 站)**，来自 cross-seed 自己的
+`timestamp(searchee_id, indexer_id, last_searched)` 表。默认每站 14 天，可按站覆盖：
+`--cadence "SiteA=14,NanyangPT=30"`；`todo --include-cooldown` 忽略周期强制全量重扫。
 `report` 会打印按站周期表（搜过几部 / 到周期几部 / 下次最早可重搜是哪天）。详见 SUMMARY §11.6。
+
+> **为什么是 14 天而不是 7 天**：无人值守下这个周期直接决定长期查询量 ——
+> 约 1000 部单片，7 天 = 每天 ~150 次查询/站、一年 5 万+ 次，且是**永不停止**的机器人流量。
+> `delay=30` 解决的是"快不快"，解决不了"像不像人"。翻倍到 14 天查询量减半，
+> 代价只是未命中的片子多等一周。**账号比命中率重要** —— 站点查限额见 SUMMARY §11.6。
 
 **`drive` 已经会控速、会等退避、会回灌**（SUMMARY §11.8）：
 `--interval 30` 对齐 cross-seed 的 `delay`；每 `--check-every 10` 条读一次 cross-seed.db 的
@@ -361,6 +367,54 @@ sh nas-update-env.sh --no-restart    # 只改不重启
 6. **日常重搜别打大包根的 webhook** —— 它不会排除已做种的片子。走
    `reseed-state.py drive`（已排除 `SEEDING`/`MATCHED`），详见 SUMMARY §11.11。
 
+### 硬链接农场（v3，已实现待启用）—— 把 49 条 `dataDirs` 收成 1 条
+
+**它解决什么**：现在 `DATA_DIRS` 是 **49 条**（3 个大包 + DC 的 47 个标签目录），
+每加一个包就要重算一遍路径、同步 `.env`、重建容器。农场把这些归一成**一条**。
+
+**做法**：在源同一个物理卷上建一个**扁平**目录，每个子项 = 一个"单片"，用**硬链接**
+指向真实数据（不占数据块，只多 inode + 目录项）：
+
+```text
+/volume1/video/download/reseed_farm/          ← 唯一的 dataDir
+├── Arrow.S01-S08.2012-2020.Bluray.1080p.MNHD-FRDS/   ← 硬链接副本
+├── 守望者S01.Watchmen…@FRDS/
+└── …（实测 475 条）
+```
+
+`dataDirs` 从此只有这一条，`maxDataDepth` 保持默认 **2**（不用动全局开关 →
+FRDS/MBF 行为完全不变）。
+
+> **为什么"每个 dataDir 的直接子项"就是全部规则**：cross-seed 的枚举是
+> `dataDirs → 每个直接子项 → 按 depth 展开`。农场的子项**恰好等于**原来那 49 个
+> dataDir 的直接子项之并集，所以「农场 + depth=2」与「49 条 + depth=2」产出的
+> searchee **逐条相同**。★ 这是**构造上**的等价 —— 同一个函数作用在同一批首层条目上，
+> 不依赖我们对 depth 规则的建模是否精确（实测 475 条、**零重名**）。
+
+**怎么用**（NAS 上跑，硬链接只能在 NAS 本机建 —— SMB/Windows 建不了）：
+
+```bash
+cd /volume2/docker_ssd/prowlarr_cross-seed_autohardlink
+sh build-farm.sh                    # 默认 dry-run：只统计预演，一个文件都不建
+sh build-farm.sh --apply            # 真建（增量，已存在的跳过）
+sh build-farm.sh --apply --prune    # 顺带删掉"源已经没了"的条目
+sh build-farm.sh --verify           # 只校验农场 vs 源
+```
+
+确认无误后，切换（**与"移除 BTSCHOOL"合并成一次容器重建更省事**）：
+
+1. 本地 `.env` 把 `DATA_DIRS` 改成农场那一条路径；
+2. `python scripts/gen-nas-env-update.py` 生成新的 `nas-update-env.sh`；
+3. NAS 上 `sh nas-update-env.sh`（改 `.env` + `--force-recreate` 容器）；
+4. 验证：`drive-loop` 启动时的「索引器自检」与 searchee 数应与切换前**一致**。
+
+**安全边界**：脚本**只增不删**（除 `--prune`）；`--prune` 带安全闸 ——
+期望集为空时**拒绝**执行（否则 `.env` 一读错就会把整个农场删光）。
+★ 脚本**绝不** `chown -R`：硬链接文件与源文件是**同一个 inode**，
+对链接文件 chown 会改掉**源文件**的属主 —— 所以只对目录（新造的）改属主。
+
+设计取舍与 A/B 方案对比见 SUMMARY §10.5。
+
 ### IYUU 扩散（本次不实现）
 
 单种在 `:3060` 做种后，由 IYUU 读其 InfoHash 扩散到更多站点。`hlink/config.yml` 里 `jobs[].iyuu_handoff` 为其预留开关。
@@ -455,9 +509,13 @@ python scripts/reseed-state.py drive --pack dc-collection --indexers HDFans,Nany
 
 1. **从 `TORZNAB_URLS` 移除 BTSCHOOL `/3/api`** + 重建 cross-seed（消除每次搜索吃 410 的空耗）。
    ⚠ 重建会打断正在跑的 drive，务必等当前批次跑完；方法见 SUMMARY §13.3。
-2. **挂 Windows 计划任务**：每 15 分钟 `drive-loop.py --once`，无人值守推进剩余批次。
+   **建议与第 4 条合并成一次重建**，省一次中断。
+2. ~~挂 Windows 计划任务~~ ✅ **已完成**（`reseed-drive-loop`，每 15 分钟 `drive-loop.py --once`）。
 3. **换一个站替换 BTSCHOOL**（已在计划中）——加站流程见 SUMMARY §13.3。
-4. v3 **硬链接农场**（1 条 dataDir 取代 49 条）—— 设计已完成，见 SUMMARY §10.5。
+4. v3 **硬链接农场**：构建脚本 `scripts/build-farm.sh` 已写好并**在沙箱里验证通过**
+   （硬链接同 inode / 幂等 / prune 只删该删的 / 期望集为空时拒绝 prune），
+   见上面「扩展 → 硬链接农场」。
+   ⬜ **待你在 NAS 上执行** `sh build-farm.sh`（先 dry-run）→ 确认 → 切换 `DATA_DIRS`。
 5. 编排器 `status` 子命令（见 SUMMARY §11.9）；IYUU 扩散（本范围外）。
 
 详细的过程记录、踩坑与决策都在 **SUMMARY.md**

@@ -194,6 +194,113 @@ def check_indexers(args) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# .env 生效自检 —— cross-seed 日志里**最近**的 410/401/403
+# --------------------------------------------------------------------------- #
+#: 只看最近这么久内的日志。
+#: ★ 必须卡时间窗：容器重建成功后，历史 410 还在日志里躺着，不卡窗口就会
+#:   **永远报警**（狼来了），反而把真问题淹掉。
+STALE_ENV_WINDOW_SEC = 2 * 3600
+#: 只读日志**尾部**这么多字节（info.current.log 会长到几百 MB，全读不可接受）
+STALE_ENV_TAIL_BYTES = 512 * 1024
+
+#: cross-seed 够不着索引器的两种固定句式（v6.13.7 实测）：
+#:   ① 搜索中途：warn: [webhook] Failed to reach <url>: request failed with code 410, snoozing until …
+#:   ② 启动取 caps：error: <url> returned 401 Unauthorized when fetching caps, check your apikey
+_RE_UNREACHABLE = (
+    re.compile(
+        r"^(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\.\d+\s+warn:\s+.*?"
+        r"Failed to reach (?P<url>\S+?):\s+request failed with code (?P<code>\d+)"
+    ),
+    re.compile(
+        r"^(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\.\d+\s+error:\s+"
+        r"(?P<url>\S+?) returned (?P<code>\d+) \w+ when fetching caps"
+    ),
+)
+
+
+def _tail_lines(path: Path, nbytes: int) -> list[str]:
+    """读文件**尾部** nbytes 字节（SMB 上是范围读，不会把 2.6 MB 全拉过来）。"""
+    with open(path, "rb") as f:
+        f.seek(0, os.SEEK_END)
+        size = f.tell()
+        f.seek(max(0, size - nbytes))
+        data = f.read()
+    lines = data.decode("utf-8", errors="replace").splitlines()
+    if size > nbytes and lines:
+        lines = lines[1:]      # 第一行多半被切断在半路，丢掉
+    return lines
+
+
+def check_env_applied(args) -> None:
+    """★ 本项目的**头号复发坑**：改了 `.env`，但容器没重建。
+
+    `docker compose restart` **不会**重新注入环境变量，必须
+    `up -d --no-deps --force-recreate cross-seed`（见 SUMMARY §13.3 / §13.6）。
+
+    它的症状是 cross-seed 日志里不停出现：
+
+        warn: [webhook] Failed to reach http://prowlarr:9696/3/api:
+              request failed with code 410, snoozing until …
+
+    410 = 这个索引器在 Prowlarr 里**已经没了**，但容器的 `TORZNAB_URLS` 还留着它
+    （删站忘了重建）；401 = apikey 对不上；403 = 该站被禁用。三者多半是同一件事。
+
+    这里**只报警、不自动修** —— 重建容器必须由人执行（会打断正在跑的批次）。
+    """
+    if not args.log:
+        return
+    cutoff = time.time() - STALE_ENV_WINDOW_SEC
+    hits: dict[tuple[str, str], int] = {}
+    newest = 0.0
+    for p in args.log:
+        try:
+            lines = _tail_lines(Path(p), STALE_ENV_TAIL_BYTES)
+        except Exception as e:  # noqa: BLE001 —— 自检失败不该挡住正事
+            LOG.debug("读不到 cross-seed 日志 %s: %s", p, e)
+            continue
+        for ln in lines:
+            m = None
+            for rx in _RE_UNREACHABLE:
+                m = rx.match(ln)
+                if m:
+                    break
+            if not m:
+                continue
+            try:
+                ts = datetime.strptime(m["ts"], "%Y-%m-%d %H:%M:%S").timestamp()
+            except ValueError:
+                continue
+            if ts < cutoff:
+                continue
+            key = (m["url"], m["code"])
+            hits[key] = hits.get(key, 0) + 1
+            newest = max(newest, ts)
+
+    if not hits:
+        LOG.debug("`.env` 生效自检通过：最近 %.0f 小时内没有够不着索引器的记录。",
+                  STALE_ENV_WINDOW_SEC / 3600)
+        return
+
+    LOG.warning("!" * 62)
+    LOG.warning("⚠ cross-seed 最近 %.0f 小时内**一直够不着**这些索引器：",
+                STALE_ENV_WINDOW_SEC / 3600)
+    for (url, code), n in sorted(hits.items(), key=lambda kv: -kv[1]):
+        LOG.warning("    %-46s ← HTTP %s × %d", url, code, n)
+    LOG.warning("  最近一次：%s（%.0f 分钟前）",
+                time.strftime("%H:%M:%S", time.localtime(newest)),
+                (time.time() - newest) / 60)
+    LOG.warning("")
+    LOG.warning("  ★ 本项目的头号复发坑：**改了 .env，但容器没重建**。")
+    LOG.warning("    410 = 该索引器在 Prowlarr 里已经没了，容器里的 TORZNAB_URLS 还留着它；")
+    LOG.warning("    401 = apikey 对不上；403 = 该站被禁用。三者多半是同一件事。")
+    LOG.warning("    ⚠ `docker compose restart` **不重新注入环境变量**，必须：")
+    LOG.warning("      cd /volume2/docker_ssd/prowlarr_cross-seed_autohardlink \\")
+    LOG.warning("        && sudo docker compose up -d --no-deps --force-recreate cross-seed")
+    LOG.warning("    验证：本条警告消失（上面的「索引器自检」也会跟着变绿）。")
+    LOG.warning("!" * 62)
+
+
+# --------------------------------------------------------------------------- #
 # 读 .env 里的 CROSSSEED_API_KEY（避免 key 出现在命令行/聊天）
 # --------------------------------------------------------------------------- #
 def read_key_from_env(env_path: Path) -> str | None:
@@ -397,10 +504,20 @@ def batch_alive(st: dict) -> bool:
     pid = st.get("running_pid")
     if not pid_alive(pid):
         return False
-    hb = float(st.get("heartbeat_ts") or 0)
-    if not hb:
-        return False          # 早期版本留下的状态文件没有心跳字段 → 当残留处理
-    stale = time.time() - hb
+
+    # ★ 区分「字段不存在」和「字段过期」—— 这两者处理方式**相反**。
+    hb = st.get("heartbeat_ts")
+    if hb is None:
+        # 旧版（≤ 4f53425）写的状态文件没有心跳字段，**只在升级窗口出现一次**。
+        # 那时 pid 确实还活着、批次真的在跑。
+        # ★ 这里必须**保守当"在跑"**：抢先接管会让两批并发发 webhook，
+        #   一次 429 能废掉几百条（README 坑 4）。少跑一轮的代价小得多。
+        #   下一批用新代码写状态后就带上心跳了，此分支自然消失。
+        LOG.warning("状态文件是旧版格式（无 heartbeat_ts），但 pid %s 仍在 ——"
+                    " 保守当作「上一批还在跑」，本轮跳过。下批起恢复正常。", pid)
+        return True
+
+    stale = time.time() - float(hb or 0)
     if stale <= HEARTBEAT_STALE_SEC:
         return True
     LOG.warning("状态文件里的 pid %s 仍存在，但心跳已停 %.0f 分钟"
@@ -538,6 +655,9 @@ def main() -> int:
 
     # 自检：cross-seed 真实搜索范围 vs --indexers（不一致会静默错记，务必先喊出来）
     check_indexers(args)
+
+    # 自检：cross-seed 是否正够不着某些索引器（头号复发坑 = .env 没生效到容器）
+    check_env_applied(args)
 
     # key：--api-key 显式给优先，否则从 --env 读
     api_key = args.api_key

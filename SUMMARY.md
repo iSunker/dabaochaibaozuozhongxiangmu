@@ -2,7 +2,7 @@
 
 > 最后更新：2026-09-11（§5.3 已修正：全量**没跑完**，只搜了 87/382，真实命中率 ~50%；
 > §6.1 SiteB 已恢复；§6.5 429 真因是站点 502；§6.6 indexerId 会变；
-> **§11 单片状态机已实现**，含 **§11.6 按站重搜周期（默认每站 7 天）** 与
+> **§11 单片状态机已实现**，含 **§11.6 按站重搜周期（默认每站 14 天，2026-09-11 由 7 天改）** 与
 > **§11.8 `drive` 控速 + 退避闭环**；§11.10 说明 `orchestrator/main.py`；
 > **§10 多包支持已落地**，含 **§10.2 嵌套结构陷阱（DC 案例）**、
 > **§10.6 cross-seed 的 searchee 枚举规则（读源码定论）**；
@@ -352,7 +352,7 @@ bash deploy.sh --rollback   # 回滚到最近一次备份
 | Phase 2.5+ | 整包全量（一次根目录 webhook，见 §6.4） | ⚠ **未真正完成**：只搜了 87/382 就被站点 502→429 打断；已搜部分命中率 ~50%，见 §5.3 |
 | Phase 2.6 | **重跑一次完整全量**（先把 SiteB 加回去，见 §6.1） | ⬜ **待做** —— 清单已生成（`scripts/todo.txt`，334 条），等一个合适的时机执行 |
 | Phase 2.7 | **单片状态机**（sidecar `hlink/state.db`，见 §11） | ✅ **已实现并实测**：382 部 → SEEDING 48 / UNMATCHED 48 / SKIPPED 282 / PENDING 4 |
-| Phase 2.8 | **按站重搜周期**（默认每站 7 天，可 `--cadence "SiteA=7,SiteB=30"`，见 §11.6） | ✅ **已实现并验证** |
+| Phase 2.8 | **按站重搜周期**（默认每站 14 天，可 `--cadence "SiteA=14,NanyangPT=30"`，见 §11.6） | ✅ **已实现并验证** |
 | Phase 2.9 | **`drive` 控速 + 退避闭环**（`DriveSession`：`--interval` 节流、撞退避就等、打完自动 `sync` 回灌，见 §11.8） | ✅ **已实现**（默认 dry-run，`--apply` 才真发） |
 | Phase 3 | 编排器 build / preflight / run --dry-run / run / status | ⬜ 未开始（`run` 已非必要，见 §6.4；`status` 仍值得做；`main.py` 说明见 §11.10） |
 | v2-a | **多包接入**：MBF（剧集，每季）+ DC（嵌套，47 个 dataDir） | ✅ **配置已落地**，见 §10.1 / §10.2 |
@@ -362,7 +362,7 @@ bash deploy.sh --rollback   # 回滚到最近一次备份
 | v2-e | **`init --roots-from-env`**：根的清单直接从 cross-seed 的 `.env` 派生 | ✅ **已完成并实测**（DC 47 组参数 → 一条命令），见 §10.6.4 |
 | v2-f | **429 退避与 SKIPPED 的真相** —— 文档化 cross-seed 的"退避后跳过"机制 | ✅ **已文档化**，见 §11.13 |
 | v2-g | **三个包全部 init 完成**：FRDS 486 + MBF 4 + DC 115 = 605 部 | ✅ **已完成**（状态机数据库本地管理） |
-| v3 | **硬链接农场**（1 条 dataDir 取代 49 条，顺带闭合状态机的嵌套包缺口） | ⬜ **未做** —— 设计已完成，见 §10.5 |
+| v3 | **硬链接农场**（1 条 dataDir 取代 49 条，顺带闭合状态机的嵌套包缺口） | 🟡 **脚本已就绪并验证**（`scripts/build-farm.sh`，见 §10.5.6）—— 待 NAS 上执行 |
 
 ### 5.1 Phase 2 验收结果
 
@@ -1006,6 +1006,60 @@ maxDataDepth: 2                 # 默认值，不动全局
   每次加包都要改 `.env`、包内结构变化要重算枚举规则，这两个问题会一起消失。
 - **两者不冲突**：A 可以继续跑着，农场构建器做好后，把 `dataDirs` 从 49 条切成 1 条即可。
 
+#### 10.5.6 方案 B 实现记录（2026-09-11 晚）
+
+**产物**：`scripts/build-farm.sh`（**在 NAS 上跑** —— 硬链接只能 NAS 本机建，SMB 建不了）。
+
+**核心洞见 —— 规则只有一条，而且是构造上等价的**
+
+农场子项 = **每个 dataDir 的直接子项**。证据：cross-seed 的枚举是
+
+```text
+dataDirs.flatMap(dd => readdir(dd).flatMap(c => findNestedRoots(c, maxDataDepth)))
+```
+
+农场的子项恰好 = 原 49 个 dataDir 的直接子项之**并集**，
+于是「农场 + depth=2」与「49 条 + depth=2」把**同一个函数作用在同一批首层条目上** →
+逐条产出相同的 searchee。
+
+> ★ 这一点比"我们把 depth 规则复刻对了"更可靠：**它不依赖复刻是否正确**。
+> 前提只是农场条目必须**忠实镜像**源目录结构（同基名、同内部结构、同文件大小）——
+> 硬链接正好做到。
+
+**实测（真实 NAS，dry-run）**：
+
+| 项 | 值 |
+|---|---|
+| dataDir 直接子项合计 | **475**（474 目录 + 1 个散文件） |
+| 跨 dataDir 重名 | **0**（所以"重名策略"这个待定项实际不存在） |
+| 源目录读不到 | 0 |
+| 抽样外推文件数 | 约 2375 个文件 / 5.3 TB 数据 |
+| 农场额外占用 | **0 字节数据**（硬链接），仅 475 个目录 + 2375 个目录项 |
+
+> 475 这个数字由**两份独立实现**给出（Python 走 `os.listdir`、shell 走 `"$dd"/*`），
+> 互相印证。
+
+**安全设计（三条硬约束）**：
+
+1. **绝不 `chown -R`** —— 硬链接文件与源文件是**同一个 inode**，对其 chown 会
+   **改掉源文件的属主**。脚本只用 `find -type d -exec chown`（农场目录是新造的，不在 inode 上共享）。
+2. **`--prune` 有安全闸** —— 期望集为空却要 prune 时**拒绝执行**。否则 `.env` 一旦读坏，
+   就会把整个农场删光。这条是**测试中真踩到的**：见下。
+3. **默认 dry-run**，`--apply` 才动手（与 `reseed-state.py drive` 的习惯一致）。
+
+**一个被测试抓到的真 bug（值得记）**：初版清单只记录**新建**的条目，且只在
+`--prune` 时才落盘 → 于是 prune 时 `grep` 一个都匹配不上 → **把 4 条全删了**（源文件无恙）。
+修法：无论新建还是已存在都记入"期望集"，且每次 `--apply` 都落盘；prune 比对新期望集
+（用 `grep -qxF` 精确匹配名字，避免前缀误匹配）。
+
+**沙箱验证清单（本地 NTFS 上跑真脚本）**：硬链接同 inode（含嵌套目录与散文件）✓ /
+幂等重跑 0 新建 ✓ / `--verify` 计数一致 ✓ / dry-run 不建任何东西 ✓ /
+源删掉一条后 prune **只**删那一条 ✓ / prune 后再跑 0 删除 ✓ / 期望集为空时拒绝删除 ✓ /
+prune 之后源文件内容毫发无损 ✓
+
+**尚未启用**：还要在 NAS 上 `sh build-farm.sh --apply`，再把 `.env` 的 `DATA_DIRS`
+切成农场那一条并重建容器。**建议与"移除 BTSCHOOL"合并成一次重建**。
+
 ### 10.6 ★ cross-seed 的 searchee 枚举规则（读源码定论）+ 多根已落地
 
 #### 10.6.1 规则（逐字读 cross-seed v6.13.7 `src/dataFiles.ts`）
@@ -1188,7 +1242,7 @@ PENDING ──搜索──▶ UNMATCHED ──(新增索引器 / 过冷却期)�
 |---|---|---|
 | `SEEDING` | qB 里真有这个 info_hash | ❌ 永不 |
 | `MATCHED` | 匹配到、已注入，等 qB 确认 | ❌ 不 |
-| `UNMATCHED` | 真搜过、没匹配到 | ⏳ 仅当 **出现没搜过的索引器** 或 **过了冷却期**（默认 7 天） |
+| `UNMATCHED` | 真搜过、没匹配到 | ⏳ 仅当 **出现没搜过的索引器** 或 **过了冷却期**（默认 14 天） |
 | `SKIPPED` | ★被退避秒跳 | ✅ **立刻** |
 | `PENDING` | 还没搜过 | ✅ 立刻 |
 | `ERROR` | 异常 | ✅ 立刻 |
@@ -1267,7 +1321,19 @@ $ python scripts/reseed-state.py sync --pack frds-top250-2024 ...
 
 **需求**："没搜到的种子重复搜的频率是多少？我要能调到**每个站一周搜一次**。"
 
-**结论：现在就是每站每周一次（默认 7 天），且可按站分别设。**
+**结论：每站按周期重搜（默认 7 天，**2026-09-11 晚改为 14 天**），且可按站分别设。**
+
+> **为什么从 7 天改成 14 天（账号安全，2026-09-11 晚）**
+> `drive-loop` 挂上计划任务后系统进入**无人值守**，这个周期就从"调试参数"变成了
+> **长期查询量的总闸门**：约 1000 部单片 × 7 天 = 每天 ~150 次查询/站、一年 5 万+ 次，
+> 而且是**永不停止**的机器人流量。`delay=30` 只解决"快不快"，解决不了"像不像人" ——
+> 长期稳定运行的自动化抓取**本身**就可能触发站点风控。
+> 翻倍到 14 天，查询量直接减半；代价是未命中的片子多等一周，而"站上出现这个单种"
+> 本来就不由我们控制。**账号 > 命中延迟。**
+> 单个站想更保守：`--cadence "NanyangPT=30"`。
+>
+> 配套动作：定期看 Prowlarr 里各站的 **Query Limit 消耗**与账号状态（有无警告/降级），
+> 这比看本地命中率更能提前发现风险。
 
 数据源不是我们自己的 `attempt` 表，而是 **cross-seed 自己的 `timestamp` 表**：
 
@@ -1283,24 +1349,28 @@ sidecar 的 `movie.indexer_seen` 把它**快照**成
 **判定规则**（`orchestrator/state.py`）：
 
 ```python
-def due_indexers(indexer_seen, indexers_now, *, cadence_days=7,
+def due_indexers(indexer_seen, indexers_now, *, cadence_days=DEFAULT_CADENCE_DAYS,
                  cadence_by_indexer=None, now=None) -> list[str]:
     # 1) 从没搜过这个站              → due（立刻搜）
     # 2) now - last_searched >= 周期 → due
     # 3) 否则                        → 不 due，等
 ```
 
-- `cadence_for(indexer, cadence_days=7, cadence_by_indexer=None)`：站级覆盖，站名命中就用站级值。
+- `cadence_for(indexer, cadence_days=…, cadence_by_indexer=None)`：站级覆盖，站名命中就用站级值。
 - `next_due_at(...)`：算出"最早什么时候可以再搜"，写进 `movie.next_retry_at`。
+- **默认值只写在一处**：`orchestrator/state.py` 的 `DEFAULT_CADENCE_DAYS`（改 7↔14 改这一行）。
 
 **CLI**：
 
 ```bash
-# 全站统一 7 天
+# 全站统一（默认值，见 DEFAULT_CADENCE_DAYS）
+python scripts/reseed-state.py todo --pack $PACK --indexers SiteA,SiteB
+
+# 显式指定：全站 7 天
 python scripts/reseed-state.py todo --pack $PACK --indexers SiteA,SiteB --cadence-days 7
 
-# 按站覆盖：SiteA 7 天、SiteB 30 天
-python scripts/reseed-state.py report --pack $PACK --cadence "SiteA=7,SiteB=30"
+# 按站覆盖：SiteA 14 天、SiteB 30 天
+python scripts/reseed-state.py report --pack $PACK --cadence "SiteA=14,SiteB=30"
 
 # 忽略周期，强制全量重扫
 python scripts/reseed-state.py todo --pack $PACK --include-cooldown
@@ -2123,8 +2193,48 @@ python scripts/drive-loop.py --once --indexers HDFans,NanyangPT --limit 50
 ### 13.9 下一步（按优先级）
 
 1. **从 `TORZNAB_URLS` 移除 BTSCHOOL `/3/api`** + 重建 cross-seed（消除 410 空耗）。
-   ⚠ 重建会打断正在跑的 drive，**务必等当前批次跑完**。
-2. **挂 Windows 计划任务**：每 15 分钟 `drive-loop.py --once`，自动推进 DC/FRDS 剩余批次。
+   ⚠ 重建会打断正在跑的 drive，**务必等当前批次跑完**（方法见 §13.3）。
+2. ~~挂 Windows 计划任务~~ ✅ **已完成**（`reseed-drive-loop`，每 15 分钟 `drive-loop.py --once`）。
 3. **换一个站替换 BTSCHOOL**（用户计划中）——加站流程见 §13.3。
-4. v3 硬链接农场（§10.5，设计已完成）。
+4. v3 硬链接农场：脚本 `scripts/build-farm.sh` **已就绪并在沙箱验证通过**（§10.5.6）。
+   ⬜ 待 NAS 上 `sh build-farm.sh`（先 dry-run）→ 确认 → 切 `DATA_DIRS`。
+   **建议与第 1 条合并成一次容器重建。**
 5. 编排器 `status` 子命令（§11.9）；IYUU 扩散（本范围外）。
+
+### 13.10 本会话末尾追加的三项改动（2026-09-11 深夜）
+
+用户提出 ⑥⑦⑧ 三件事，全部落地：
+
+**⑥ 账号安全：重搜周期 7 天 → 14 天**（`orchestrator/state.py` 的 `DEFAULT_CADENCE_DAYS`）
+
+无人值守 = **每 7 天对每站重搜一轮**；约 1000 部单片 ≈ 每天 150 次查询/站、一年 5 万+ 次，
+而且是**永不停止**的机器人流量。`delay=30` 只解决"快不快"，解决不了"像不像人"。
+翻倍到 14 天查询量减半，代价只是未命中的多等一周。**账号 > 命中延迟。**
+单个站想更保守：`--cadence "NanyangPT=30"`。详见 §11.6。
+
+> 配套的人工动作：**定期看 Prowlarr 里各站的 Query Limit 消耗与账号状态** ——
+> 这比看本地命中率更能提前发现风险。
+
+**⑦ 硬链接农场**：见 §10.5.6（脚本 + 度量 + 安全设计 + 沙箱验证清单）。
+
+**⑧ `.env` 生效自检**（`scripts/drive-loop.py` 的 `check_env_applied()`）
+
+"改了 `.env` 忘了 `--force-recreate`"是本项目**头号复发坑**。现改为**由程序自己喊**：
+`drive-loop` 启动时扫 cross-seed 日志**最近 2 小时**，命中下面两种句式就报警并打出修复命令：
+
+```text
+warn:  [webhook] Failed to reach <url>: request failed with code 410, snoozing until …
+error: <url> returned 401 Unauthorized when fetching caps, check your apikey
+```
+
+- 410 = 该索引器在 Prowlarr 已删、容器里 `TORZNAB_URLS` 还留着；401 = apikey 不对；403 = 被禁用。
+  三者多半是同一件事。
+- ★ **必须卡时间窗**：容器重建成功后，历史 410 还躺在日志里，不卡窗口就会**永远报警**
+  （狼来了），反而把真问题淹掉。窗口 2 小时 = 约 2~3 个批次。
+- 只读日志**尾部 512 KB**（`info.current.log` 会长到几百 MB，全读不可接受）。
+
+> ★ **同时修掉一个自己埋的隐患**：`batch_alive()` 原先把"状态文件没有心跳字段"
+> 一律当成**残留**。但升级窗口里（旧进程在跑、新代码已在盘上）这会让计划任务
+> **接管并并发再跑一批** → 双份 webhook → 撞 429 → 一次废掉几百条（§13.6 坑 4）。
+> 改成区分「字段不存在」（保守当在跑，只影响升级那一批）与「字段过期」（判残留）。
+> 这是**推理出来的、不是测出来的** —— 正好当时有个旧进程在跑，属于踩在线上修。
