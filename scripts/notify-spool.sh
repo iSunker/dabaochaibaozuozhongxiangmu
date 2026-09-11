@@ -108,6 +108,20 @@ done
 say()  { echo "$@"; }
 warn() { echo "[!] $*" >&2; }
 
+# ---------- 占位符防线 ----------
+# ★ notify.conf.example 里的 `MAIL_TO=you@example.com` 是**非空**的。
+#   照抄忘改的话，保留闸（下面按"MAIL_TO 是否为空"判断）**不会触发** ——
+#   告警被"成功"发往一个不存在的地址，然后归档。结果正是保留闸要防的那种
+#   **静默丢告警**：日志显示已发、spool 是空的、而邮箱里什么都没有。
+#   所以这里显式把明显的占位符当成"未配置"（宁可留在 spool，也不能假装发出去）。
+case "$MAIL_TO" in
+  *@example.com|*@example.org|*@example.net|*@example.cn|you@*|your@*|test@*|changeme*)
+    warn "MAIL_TO='$MAIL_TO' 看起来还是 notify.conf.example 里的占位符。"
+    warn "  → 当成**未配置**处理：告警会留在 spool，不会丢。请改成真实收件人。"
+    MAIL_TO=""
+    ;;
+esac
+
 # ---------- 探测发信方式 ----------
 # 按偏好排序：现成的 CLI 程序最省事；没有就退到 python3 + smtplib。
 detect_cli_mailer() {
