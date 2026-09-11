@@ -16,18 +16,31 @@
 #
 # 发信怎么发（本脚本自动探测，`--selftest` 可打印探测结果）
 # ---------------------------------------------------------
-#   ① 有现成的 sendmail/ssmtp/msmtp/mail → 走它（最省事）
-#   ② 没有，但有 python3            → 用 smtplib 直接说 SMTP，读同一个
-#                                      /etc/ssmtp/ssmtp.conf
+#   ① 有现成的 ssmtp/sendmail/msmtp/mail → 走它（本机就是这条）
+#   ② 没有，但有 python3                 → 用 smtplib 直接说 SMTP
+#                                          （读 $SSMTP_CONF，本机走不通，见下）
 #
-# ★ 实测（2026-09-11，DSM 7.2 / geminilake_423+）：
-#   这台 NAS 上**一个发信程序都没有**，但 /usr/bin/python3 (3.8.15) 在
-#   —— 所以走的是 ②。这是探针逼出来的结论，不是猜的。
+# ★ 实测（2026-09-12，DSM 7.2 / geminilake_423+）：本机走的是 ① ——
+#   /usr/bin/ssmtp 存在且**真的能发出去**。这是发信验出来的，不是查文件查出来的。
 #
-# ★ 前提：DSM 控制面板 → 通知 → 电子邮件 必须已配好
-#   （「自定义 SMTP 服务器 + 应用专用密码」；Gmail 的「登录(OAuth)」方式
-#     拿不到可用凭据，脚本这条路不通）。
-#   ★ 任务计划里**用户要选 root** —— /etc/ssmtp/ssmtp.conf 通常只有 root 能读。
+# ★★ 「DSM 的邮件配置到底在哪」—— 这个坑我踩进去了，务必看完再动这段代码：
+#   DSM **改过** ssmtp 的配置路径。它读的是
+#       /usr/syno/etc/synosmtp.conf   ← DSM「控制面板 → 通知 → 电子邮件」存的就是它
+#   而**不是** ssmtp 上游默认的
+#       /etc/ssmtp/ssmtp.conf         ← 本机这个文件是 **0 字节的遗留空壳**
+#   于是有个极反直觉的后果：
+#       **邮件天天正常送达的时候，/etc/ssmtp/ssmtp.conf 照样是 0 字节。**
+#   2026-09-11 深夜我读了那个空壳，推断出"DSM 的邮件通知还没配"并写进了 selftest
+#   —— 完全错了（用户当天就在收 DSM 的邮件）。当时那个 501 报错还被误读成
+#   "ssmtp 没有配置可用、退到了 localhost:25"，而本机 **25 端口根本没人监听**，
+#   ssmtp 其实一路直连 QQ 并认证通过了，唯一的问题是信封发件人对不上认证账号。
+#   另外 synosmtp.conf 里的密码是**加密**存的（键名 eventpasscrypted），
+#   脚本解不开 —— 所以「读 DSM 配置、自己发信」这条路压根不存在。
+#   ★ 教训：**本脚本不解析任何 DSM 配置文件**，读了只会得出错误结论。
+#     唯一的判据是**真发一封**：--test-mail。
+#
+# ★ 前提：DSM 控制面板 → 通知 → 电子邮件 里配好并勾「启用电子邮件通知」。
+#   ★ 任务计划里**用户要选 root** —— 本脚本要读 .env / spool，还要发信。
 #
 # 配置
 # ----
@@ -45,16 +58,24 @@
 #   sh notify-spool.sh              # 排空 spool：告警立刻发，其余归档（每 5 分钟跑）
 #   sh notify-spool.sh --digest     # 发每日摘要（每天固定时间跑一条）
 #   sh notify-spool.sh --test-mail  # 发一封测试信，验证通路
-#   sh notify-spool.sh --selftest   # 只打印诊断（不发信）；配合任务计划的
-#                                   # 「发送运行详情」把结果寄回来看 —— SSH 关着时
-#                                   # **这是我们唯一能看见 NAS 上报错的通道**
+#   sh notify-spool.sh --selftest   # 只打印诊断（不发信）。**装好后先跑这个** ——
+#                                   # 它会打印探测到的发信方式、notify.conf 在不在、
+#                                   # 各目录状态。
+#                                   # ★ 它**不判断**邮件配置对不对（DSM 的配置读不到，
+#                                   #   见下文那个坑）—— 要验证通路就 --test-mail。
 #   sh notify-spool.sh --dry-run    # 只打印会做什么，不动任何文件
 #
-# DSM 任务计划怎么建（两个任务，都用「用户定义的脚本」，用户选 root）
-# ------------------------------------------------------------------
-#   ① 排空：计划「每 5 分钟」，脚本 sh <路径>/notify-spool.sh
-#   ② 摘要：计划「每天 21:00」，脚本 sh <路径>/notify-spool.sh --digest
-#   ★ 都勾上「发送运行详情」——平时它就是个免费的诊断通道。
+# DSM 任务计划怎么建（都选「用户定义的脚本」，用户选 root）
+# ----------------------------------------------------------
+#   ① 排空：计划「每 5 分钟」  脚本 sh <路径>/notify-spool.sh
+#   ② 摘要：计划「每天 21:00」 脚本 sh <路径>/notify-spool.sh --digest
+#   ③ 驱动：计划「每 15 分钟」 脚本 sh <路径>/../drive-loop/run.sh
+#      （驱动那条不属于本脚本，列在这里只是让你一次把三个建完）
+#   ★ 三个都**不要勾**「发送运行详情」—— 原先是让勾的，那是错的：
+#     排空 5 分钟一趟 = 288 封/天、驱动 15 分钟一趟 = 96 封/天。
+#     那不是告警，是骚扰；结果一定是去建一条「来自 NAS 的邮件」过滤规则，
+#     连真正的告警一起过滤掉 —— 而「告警发得出来」正是这套东西存在的全部理由。
+#     要看结果就 SSH 上来跑一次，或直接看 notify/log/ 和 drive-loop/attempts.log。
 # =====================================================================
 set -eu
 
@@ -66,7 +87,9 @@ MAIL_TO="${MAIL_TO:-}"
 MAIL_FROM="${MAIL_FROM:-}"
 SUBJECT_PREFIX="${SUBJECT_PREFIX:-[reseed]}"
 MAX_MAILS_PER_RUN="${MAX_MAILS_PER_RUN:-5}"
-#: DSM 自己的邮件配置。脚本只读它，**从不打印其中的值**。
+#: ssmtp 上游默认的配置文件路径。★ 本机上它是 0 字节空壳，而且 **DSM 的 ssmtp
+#: 并不读它**（读的是 /usr/syno/etc/synosmtp.conf）。保留这个变量只是因为
+#: python3 + smtplib 那条后备路要用。脚本只读、**从不打印其中的值**。
 SSMTP_CONF="${SSMTP_CONF:-/etc/ssmtp/ssmtp.conf}"
 
 # notify.conf 用 `KEY=value`，忽略空行与 `#` 注释。★ 它**不含密码**（见上面说明）。
@@ -109,16 +132,36 @@ say()  { echo "$@"; }
 warn() { echo "[!] $*" >&2; }
 
 # ---------- 占位符防线 ----------
-# ★ notify.conf.example 里的 `MAIL_TO=you@example.com` 是**非空**的。
-#   照抄忘改的话，保留闸（下面按"MAIL_TO 是否为空"判断）**不会触发** ——
-#   告警被"成功"发往一个不存在的地址，然后归档。结果正是保留闸要防的那种
-#   **静默丢告警**：日志显示已发、spool 是空的、而邮箱里什么都没有。
-#   所以这里显式把明显的占位符当成"未配置"（宁可留在 spool，也不能假装发出去）。
+# ★ 两个都要防 —— .example 里的值都是**非空**的，照抄不改就一路放行，
+#   而且失败方式完全不同，都很隐蔽：
+#     MAIL_TO   → 告警被"成功"发往一个不存在的地址，然后归档。
+#                 日志显示已发、spool 是空的、邮箱里什么都没有。
+#                 **这正是保留闸要防的那种静默丢告警。**
+#     MAIL_FROM → SMTP 直接退信。多数服务（QQ/163/Gmail）要求
+#                 **信封发件人 == 认证账号**，照抄 reseed@example.com 会得到：
+#                     ssmtp: 501 Mail from address must be same as authorization user.
+#   ★ 实测踩过：MAIL_TO 改对了、测试信照样发不出去，就是栽在 MAIL_FROM 上
+#     （2026-09-11）。而那时的 --selftest 只把它原样打印出来、一声不吭，
+#     所以这里也补了自检的告警（见 do_selftest）。
+#   两者都当成**未配置**处理：MAIL_TO 空 → 事件留在 spool（不丢）；
+#   MAIL_FROM 空 → ssmtp 退回用它自己配置里的 root=。
+PLACEHOLDER_TO=""
+PLACEHOLDER_FROM=""
 case "$MAIL_TO" in
   *@example.com|*@example.org|*@example.net|*@example.cn|you@*|your@*|test@*|changeme*)
-    warn "MAIL_TO='$MAIL_TO' 看起来还是 notify.conf.example 里的占位符。"
-    warn "  → 当成**未配置**处理：告警会留在 spool，不会丢。请改成真实收件人。"
+    PLACEHOLDER_TO="$MAIL_TO"
     MAIL_TO=""
+    warn "MAIL_TO='$PLACEHOLDER_TO' 看起来还是 notify.conf.example 里的占位符。"
+    warn "  → 当成**未配置**处理：告警会留在 spool，不会丢。请改成真实收件人。"
+    ;;
+esac
+case "$MAIL_FROM" in
+  *@example.com|*@example.org|*@example.net|*@example.cn|you@*|your@*|test@*|changeme*)
+    PLACEHOLDER_FROM="$MAIL_FROM"
+    MAIL_FROM=""
+    warn "MAIL_FROM='$PLACEHOLDER_FROM' 看起来还是 notify.conf.example 里的占位符。"
+    warn "  → 当成**未配置**处理（清空）。多数 SMTP 要求**信封发件人 == 认证账号**，"
+    warn "    请把它设成与 DSM「控制面板 → 通知 → 电子邮件」里那个账号**完全相同**的地址。"
     ;;
 esac
 
@@ -316,7 +359,16 @@ do_selftest() {
   say "配置文件 : $CONF $( [ -f "$CONF" ] && echo '（存在）' || echo '（不存在 —— 见 notify.conf.example）')"
   say "NOTIFY_ROOT : $NOTIFY_ROOT"
   say "MAIL_TO  : ${MAIL_TO:-<未配置>}"
-  say "MAIL_FROM: ${MAIL_FROM:-<空，将退回 ssmtp.conf 的 root=>}"
+  if [ -n "$PLACEHOLDER_TO" ]; then
+    say "           ⚠ 配置里写的是占位符 '$PLACEHOLDER_TO' —— 已被忽略。"
+    say "             告警只会留在 spool（不丢），但一封都发不出去。"
+  fi
+  say "MAIL_FROM: ${MAIL_FROM:-<空 —— 交给 ssmtp 用它自己配置里的默认发件人>}"
+  if [ -n "$PLACEHOLDER_FROM" ]; then
+    say "           ⚠ 配置里写的是占位符 '$PLACEHOLDER_FROM' —— 已被忽略。"
+    say "             多数 SMTP 要求**信封发件人 == 认证账号**（否则报 501）；"
+    say "             请改成与 DSM 邮件设置里那个账号完全相同的地址。"
+  fi
   say ""
   say "--- 发信方式 ---"
   for c in /usr/sbin/ssmtp /usr/bin/ssmtp /usr/sbin/sendmail /usr/bin/sendmail \
@@ -327,29 +379,31 @@ do_selftest() {
   say "  python3 : ${PY:-<找不到>}"
   case "$METHOD" in
     cli)    say "  → 将使用: $MAILER" ;;
-    python) say "  → 将使用: $PY + smtplib（读 $SSMTP_CONF）" ;;
+    python) say "  → 将使用: $PY + smtplib（读 $SSMTP_CONF）"
+            say "     ⚠ 本机这条**走不通**：smtplib 要明文凭据，而那个文件是空壳；"
+            say "       DSM 真配置里的密码是加密的。好在 /usr/bin/ssmtp 本来就在，走 ①。" ;;
     "")     say "  → ✗ 无可用发信方式" ;;
   esac
   [ -n "${MAILER_CMD:-}" ] && say "  （MAILER_CMD 覆盖: $MAILER_CMD）"
   say ""
-  say "--- DSM 邮件配置 $SSMTP_CONF ---"
-  if [ ! -f "$SSMTP_CONF" ]; then
-    say "  [无] 文件不存在 —— DSM 的邮件通知还没配？"
-  elif [ ! -r "$SSMTP_CONF" ]; then
-    say "  [不可读] 当前 uid=$(id -u) 读不了 ——"
-    say "           ★ 去任务计划里把这个任务的「用户」改成 root"
-  else
-    say "  [可读] 以下只列**键名**，值不会打印："
-    sed -n 's/^[[:space:]]*\([A-Za-z_][A-Za-z0-9_]*\)[[:space:]]*=.*/    \1/p' "$SSMTP_CONF"
-    _hub=$(sed -n 's/^[[:space:]]*[Mm]ailhub[[:space:]]*=[[:space:]]*//p' "$SSMTP_CONF" | head -1)
-    # 只显示 host:port（服务器地址，不是凭据）
-    [ -n "$_hub" ] && say "  mailhub = $_hub"
-    if grep -qiE '^[[:space:]]*AuthUser[[:space:]]*=' "$SSMTP_CONF"; then
-      say "  ✓ 有 AuthUser/AuthPass（说明是「自定义 SMTP + 密码」方式 —— 脚本能直接用）"
-    else
-      say "  ⚠ 没有 AuthUser —— 可能是 Gmail「登录(OAuth)」方式配的，"
-      say "     那样脚本拿不到可用凭据。请改用「自定义 SMTP 服务器 + 应用专用密码」。"
-    fi
+  say "--- DSM 邮件配置 ---"
+  # ★ 2026-09-12 实测纠正 —— 这块**曾经写反过**，改之前先读脚本头部那一大段：
+  #   · /usr/bin/ssmtp 在这台 NAS 上是**被 DSM 改过配置路径**的版本，它读的是
+  #       /usr/syno/etc/synosmtp.conf     ← DSM「控制面板 → 通知 → 电子邮件」存这里
+  #     而**不是**上游默认的 /etc/ssmtp/ssmtp.conf。
+  #   · /etc/ssmtp/ssmtp.conf 是 **0 字节的遗留空壳**，于是反直觉的后果是：
+  #       **邮件天天正常送达时，它照样是 0 字节。**
+  #     我 2026-09-11 深夜读了它，写下"DSM 的邮件通知还没配"——错得离谱，
+  #     用户当天就在收 DSM 的邮件。这段错话当时也写进了本函数。
+  #   · synosmtp.conf 里密码是**加密**的（eventpasscrypted），脚本解不开，
+  #     也不该解 —— 「读 DSM 配置自己发信」这条路根本不存在。
+  #   ★ 所以这里**不再解析任何 DSM 配置文件**：读了只会误判。
+  #     唯一可信的判据是真发一封 —— 见下面「结论」段。
+  say "  不解析 DSM 配置文件（读了只会误判）："
+  say "    ssmtp 实际读 /usr/syno/etc/synosmtp.conf（DSM 改过路径）"
+  say "    /etc/ssmtp/ssmtp.conf 在本机是 0 字节空壳，**与邮件能不能发无关**"
+  if [ -r "$SSMTP_CONF" ] && [ ! -s "$SSMTP_CONF" ]; then
+    say "  （实测：$SSMTP_CONF 现在是 0 字节，而邮件是通的 —— 正常现象，别管它）"
   fi
   say ""
   say "--- 目录与待办 ---"
@@ -372,8 +426,9 @@ do_selftest() {
     say "  ⚠ 有发信方式，但 MAIL_TO 没配 → 现在只会归档，不发信。"
     say "    去改 $CONF"
   else
-    say "  ✓ 看起来可行：$METHOD → $MAIL_TO"
-    say "    真正确认请跑： sh $0 --test-mail"
+    say "  ✓ 发信方式就绪：$METHOD → $MAIL_TO"
+    say "    ★ 「就绪」≠「发得出去」 —— 配置对不对只能真发一封验证："
+    say "        sh $0 --test-mail"
   fi
   say "=== 自检结束 ==="
 }

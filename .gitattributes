@@ -1,3 +1,14 @@
 # 统一以 LF 存储/检出。本仓库要部署到 Linux/NAS 的 Docker，
 # 若被转成 CRLF 会导致 .env 值尾带 \r、shell/脚本解析出错。
 * text=auto eol=lf
+
+# ★ 例外：Windows 批处理必须是 CRLF（后写的规则优先，故放在 * 之后）。
+#   上面那条 * eol=lf 会把 .cmd 也改成 LF —— 那正是 2026-09-11 深夜
+#   drive-loop-once.cmd 失效的原因（见 SUMMARY §14.3）：
+#   cmd.exe 不是逐行读批处理，而是按字节块读取并回退重定位；LF-only 会让
+#   字节偏移记账错位，于是**从某一行中间开始执行** —— REM 注释里的英文单词
+#   被当成命令跑，前面的 set 全部丢失，整行退化成 `"" "" --once …`，
+#   留下 `exit=9009` + `'""' 不是内部或外部命令`，且**有 exit= 没有 start=**。
+#   ★ 别删这两行：删了下次检出 .cmd 就会变回 LF，任务又会静默失败。
+*.cmd text eol=crlf
+*.bat text eol=crlf

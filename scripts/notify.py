@@ -57,10 +57,31 @@ LOG = logging.getLogger("notify")
 #: 事件文件的扩展名。NAS 侧脚本只认这个，避免误读别的东西。
 SUFFIX = ".txt"
 
-#: spool 默认位置（NAS，经 SMB）。与 drive-loop.py 里日志/db 的写法一致，
-#: 可用 NOTIFY_SPOOL 环境变量覆盖。
-DEFAULT_SPOOL = ("//iSunker-DS423/docker_ssd/prowlarr_cross-seed_autohardlink"
-                 "/notify/spool")
+#: spool 的候选位置，按顺序取第一个**已存在**的。
+#: ★ 与 drive-loop.py 的 CROSSSEED_DIRS 同一个道理、同一个顺序：NAS 原生优先。
+#:   drive-loop 跑在 NAS 上时直接写本机路径（不绕 SMB 自连）；
+#:   跑在 Windows 上才落到 UNC。两边指向**同一个目录**，
+#:   所以 NAS 侧的 notify-spool.sh 看到的是同一批文件、同一份归档。
+SPOOL_CANDIDATES = (
+    "/volume2/docker_ssd/prowlarr_cross-seed_autohardlink/notify/spool",
+    "//iSunker-DS423/docker_ssd/prowlarr_cross-seed_autohardlink/notify/spool",
+)
+
+#: 兜底（一个都不存在时用这个）。保留旧名字 —— 文档/脚本里有引用。
+DEFAULT_SPOOL = SPOOL_CANDIDATES[0]
+
+
+def default_spool() -> Path:
+    """挑一个 spool 目录：优先返回**已存在**的那个。
+
+    ★ 一个都不存在时返回 NAS 原生路径：Notifier 自己会 `mkdir(parents=True)`，
+      而搬迁后它更可能跑在 NAS 上。（不过正常情况下 spool 应该由 NAS 上的
+      notify-spool.sh 先建好 —— 见该脚本注释。）
+    """
+    for c in SPOOL_CANDIDATES:
+        if Path(c).is_dir():
+            return Path(c)
+    return Path(DEFAULT_SPOOL)
 
 #: 冷却状态文件（gitignore）。同一 key 在冷却期内只发一次。
 STATE_FILE = Path(__file__).resolve().parent / ".notify.state"
@@ -117,7 +138,7 @@ class Notifier:
                  cooldown_sec: float = DEFAULT_COOLDOWN_SEC,
                  state_path: Path | None = None,
                  dry_run: bool = False):
-        self.spool = Path(spool or os.environ.get("NOTIFY_SPOOL") or DEFAULT_SPOOL)
+        self.spool = Path(spool or os.environ.get("NOTIFY_SPOOL") or default_spool())
         self.enabled = enabled and os.environ.get("NOTIFY_DISABLE", "") not in ("1", "true", "yes")
         self.cooldown_sec = cooldown_sec
         self.state_path = Path(state_path) if state_path else STATE_FILE

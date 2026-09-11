@@ -25,13 +25,33 @@
   --limit 50                    每批条数
   --interval / --check-every / --max-wait / --settle 透传
 
-调度
-----
-建议挂 Windows 计划任务，每 15 分钟唤醒一次：
-  schtasks /Create /TN "reseed-drive-loop" /TR "python D:\\...\\drive-loop.py --once" \
-          /SC MINUTE /MO 15
+调度（2026-09-11 起跑在 NAS 上，Windows 计划任务已停用）
+--------------------------------------------------------
+NAS 侧用 DSM 任务计划，每 15 分钟唤醒一次：
+  控制面板 → 任务计划 → 用户定义的脚本，用户选 root，频率「每 15 分钟」
+  脚本 = sh /volume2/docker_ssd/prowlarr_cross-seed_autohardlink/drive-loop/run.sh
+
 `--once` 模式下每次唤醒只跑一批；`--min-sleep` 保证不会连续猛打。
+★ 为什么在 NAS 上跑（原本是 Windows 计划任务）—— 两个独立的坑，见 SUMMARY §14：
+  ① Windows 任务计划的 <StopOnIdleEnd>true（默认配置，不是代码问题）：
+     你一动鼠标/键盘就**直接 TerminateProcess 整个任务实例**，
+     表现是批次「凭空消失」：没有 traceback、没有 finally 收尾、状态文件里
+     running_pid 永远挂着，之后每轮都空转。
+  ② 包装器 drive-loop-once.cmd 曾是 LF 行尾：cmd.exe 按字节块读批处理文件，
+     LF-only 会让它从某行中间开始执行（REM 注释的单词被当命令跑），
+     set 的变量全丢 → 留下 exit=9009 且**有 exit= 没有 start=**。已修成 CRLF。
+  根因与完整证据见 README「把调度挂到 NAS 上」+ SUMMARY §14。
 """
+# ★ 必须放在所有其它 import 之前 —— 这行是 Python 3.10 以下能跑起来的前提。
+#   本文件通篇用 `str | None` / `list[str]` 这种写法，它们在 <3.10 上会在
+#   **函数定义时**当场求值并抛 TypeError（不是等到调用）。PEP 563 让所有注解
+#   退化成字符串、不求值，于是 3.8 也能正常导入。
+#   ★ NAS 上系统 python3 就是 3.8.15（DSM 自带，没有更新的）——
+#     所以这不是「顺手加的好习惯」，是运行前提：去掉它 drive-loop 在 NAS 上
+#     会在 import 阶段就崩，且**连一行日志都写不出来**（崩在 logging 配置之前）。
+#   本项目的 state.py / notify.py / reseed-state.py 早就带了这行，这里补齐。
+from __future__ import annotations
+
 import argparse
 import json
 import logging
@@ -63,6 +83,41 @@ LOG = logging.getLogger("drive-loop")
 
 # sidecar 状态库默认位置（与 reseed-state.py 的 DEFAULT_DB 保持一致）
 DEFAULT_DB = os.environ.get("RESEED_STATE_DB", str(ROOT / "hlink" / "state.db"))
+
+
+# --------------------------------------------------------------------------- #
+# cross-seed 的 compose 目录 —— 同一批文件，两种视角
+# --------------------------------------------------------------------------- #
+# 这个目录在哪台机器上看，写法不一样：
+#
+#   在 NAS 本机（DSM 计划任务跑）： /volume2/docker_ssd/prowlarr_cross-seed_autohardlink
+#   在 Windows（经 SMB 跑）：       //iSunker-DS423/docker_ssd/prowlarr_cross-seed_autohardlink
+#
+# ★ 顺序必须「NAS 原生优先」：
+#   在 NAS 上 UNC 写法虽然也能通（等于从本机绕一圈 SMB 连回自己），但慢、且
+#   依赖 SMB 服务；原生路径一定在。反过来在 Windows 上原生路径不存在，
+#   自动落到第二项 —— 于是同一份代码、同一条命令行两边都能跑，
+#   不需要维护两套参数（这正是 2026-09-11 把驱动搬到 NAS 时想要的：
+#   搬迁只是换个地方执行，不是分叉出第二个版本）。
+CROSSSEED_DIRS = (
+    "/volume2/docker_ssd/prowlarr_cross-seed_autohardlink",
+    "//iSunker-DS423/docker_ssd/prowlarr_cross-seed_autohardlink",
+)
+
+
+def first_existing(rel: str) -> str | None:
+    """在 CROSSSEED_DIRS 里找第一个存在的 `rel`，返回完整路径；都没有返回 None。
+
+    ★ 找不到时**必须让调用方出声**（见 main() 里两处 LOG.warning）：
+      这两个文件缺失会让「回灌」静默退化 —— cross-seed.db 没了就推不出
+      MATCH/SEEDING，info 日志没了就推不出「是否在做种」，结果是 SEEDING
+      被误降级成 MATCHED。数算错但**不报错**，正是无人值守最怕的那种坏法。
+    """
+    for d in CROSSSEED_DIRS:
+        p = Path(d) / rel
+        if p.is_file():
+            return str(p)
+    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -486,6 +541,36 @@ def run_round(pack: str, args, api_key: str) -> S.DriveStats | None:
         LOG.info("[%s] 没有待搜索项。", pack)
         return None
 
+    # ★ 必须把 on_event 接到 LOG 上，否则整批**全程零输出**（2026-09-12 凌晨踩过，
+    #   当时对着空日志怀疑批次被杀了，白查一轮）。
+    #   DriveSession 自己**不写任何日志**，进度全靠这个回调；不传时它默认是
+    #   `lambda *a, **k: None`（见 orchestrator/state.py:1517）。于是最长的那一段
+    #   （50 部 × --interval 30s ≈ 25 分钟起，撞上站点退避还可能再等 max_wait）
+    #   在 drive-loop.log 里一个字都没有 —— 从日志上**无法区分**
+    #   「在正常推进」和「卡死在第 3 部」。无人值守的系统在最长的阶段没有可观测性，
+    #   这是实打实的缺陷，不是"日志打得少"而已。
+    #   对照：reseed-state.py 的 drive 子命令一直有接（reseed-state.py:452），
+    #   所以手工跑的时候看得到进度 —— 差别只在于这里漏传了参数。
+    last = [0.0]
+
+    def on_event(kind, *rest):
+        now = time.time()
+        if kind == "sent":
+            pth, code, i, total = rest
+            tag = "OK" if code in (200, 202, 204) else "!!"
+            gap = f" (+{now - last[0]:.0f}s)" if last[0] else ""
+            last[0] = now
+            LOG.info("  [%d/%d] %s %s%s  %s", i, total, tag, code, gap,
+                     Path(pth).name[:56])
+        elif kind == "wait":
+            LOG.info("  ⏸  %s", rest[0])
+        elif kind == "warn":
+            LOG.warning("  !  %s", rest[0])
+        elif kind == "abort":
+            LOG.error("  ✗  %s", rest[0])
+        elif kind == "drained":
+            LOG.info("  ·  %s", rest[0])
+
     sess = S.DriveSession(
         url=args.url,
         api_key=api_key,
@@ -495,6 +580,7 @@ def run_round(pack: str, args, api_key: str) -> S.DriveStats | None:
         max_wait=args.max_wait,
         timeout=args.timeout,
         pause_on_backoff=not args.no_pause_on_backoff,
+        on_event=on_event,
     )
     stats = sess.run(paths)
     LOG.info("[%s] 发送完毕：成功 %s / 失败 %s，退避等待 %.1f 分钟（%s 次）",
@@ -816,19 +902,39 @@ def main() -> int:
 
     packs = [p.strip() for p in args.packs.split(",") if p.strip()]
 
-    # 默认日志路径（NAS 上 cross-seed 的 info 日志），回灌要用
+    # 默认日志路径（cross-seed 的 info 日志），回灌要用
     if not args.log:
-        default_log = ("//iSunker-DS423/docker_ssd/prowlarr_cross-seed_autohardlink"
-                       "/cross-seed/logs/info.current.log")
-        if Path(default_log).is_file():
-            args.log = [default_log]
+        p = first_existing("cross-seed/logs/info.current.log")
+        if p:
+            args.log = [p]
+            LOG.debug("info 日志：%s", p)
+        else:
+            LOG.warning("⚠ 找不到 cross-seed 的 info 日志（试过 %s）——"
+                        " 回灌将**推不出「是否在做种」**，原本 SEEDING 的片子会被"
+                        " 误降级成 MATCHED。", " 和 ".join(CROSSSEED_DIRS))
 
     # 默认 cross-seed.db 路径
     if not args.db_path:
-        default_db = ("//iSunker-DS423/docker_ssd/prowlarr_cross-seed_autohardlink"
-                      "/cross-seed/cross-seed.db")
-        if Path(default_db).is_file():
-            args.db_path = default_db
+        p = first_existing("cross-seed/cross-seed.db")
+        if p:
+            args.db_path = p
+            LOG.debug("cross-seed.db：%s", p)
+        else:
+            LOG.warning("⚠ 找不到 cross-seed.db（试过 %s）——"
+                        " 回灌与索引器自检都会跳过，状态机会停止更新。",
+                        " 和 ".join(CROSSSEED_DIRS))
+
+    # 默认 .env（取 CROSSSEED_API_KEY）。★ 默认值 ROOT/.env 在 Windows 上对，
+    # 但搬到 NAS 后脚本住在 <compose>/drive-loop/，.env 在**上一级**。
+    # 所以这里补一个回退：ROOT/.env 不在就去 compose 目录找。这样即使 run.sh
+    # 忘了传 --env，也不会退化成"找不到 key"直接退出码 2。
+    if not Path(args.env).is_file():
+        for d in CROSSSEED_DIRS:
+            cand = Path(d) / ".env"
+            if cand.is_file():
+                LOG.debug("--env 默认值 %s 不存在，改用 %s", args.env, cand)
+                args.env = str(cand)
+                break
 
     LOG.info("=== drive-loop 启动：packs=%s indexers=%s limit=%d ===",
              packs, args.indexers, args.limit)
