@@ -1030,21 +1030,49 @@ searchee（非视频文件忽略，黑名单目录忽略且不再下钻）。
   - 新增 `_scan_pack()`：多根配对 + 本地路径→NAS 路径回写 + `--pattern`/`--exclude` 过滤；
     返回 `(条目, 重名, 问题)`，重名与列不了目录都会**明确报出来**（不静默丢）
 
-**用法**（DC 47 根）：
+**用法**（一条命令，不用手抄 47 条路径）：
 
 ```bash
 # 先看（不写库）
 python scripts/reseed-state.py init --pack dc-collection --depth 2 \
-  --root /volume1/.../DC系列剧集/01.绿箭侠（2012.10-2019.10） \
-  --local-root //YOUR-NAS/.../DC系列剧集/01.绿箭侠（2012.10-2019.10） \
-  ...（47 组，按序一一对应）--dry-run
+  --roots-from-env .env --match "DC相关剧集全系列大合集" --dry-run
+#   → 从 .env 的 DATA_DIRS（共 49 条）里挑了 47 条
+#   → 根 47 个，深度 maxDataDepth=2
+#   → 识别到 115 个单片
 
 # 真写
-python scripts/reseed-state.py init --pack dc-collection --depth 2 <同样的 47 组>
+python scripts/reseed-state.py init --pack dc-collection --depth 2 \
+  --roots-from-env .env --match "DC相关剧集全系列大合集"
 ```
 
-> 47 组参数太长，建议用 `scripts/gen-datadirs.py --level 2` 生成后再套壳，
-> 或直接在 `.env` 的 `DATA_DIRS` 基础上用脚本拼（见 §10.2 的生成器）。
+三个包各自的命令（都从同一个 `.env` 派生）：
+
+```bash
+python scripts/reseed-state.py init --pack frds-top250-2024 --depth 2 \
+  --roots-from-env .env --match "DouBan_IMDB" --exclude "0观影清单*"     # → 486
+python scripts/reseed-state.py init --pack my-brilliant-friend-s01-s04 --depth 2 \
+  --roots-from-env .env --match "My.Brilliant.Friend"                    # → 4
+python scripts/reseed-state.py init --pack dc-collection --depth 2 \
+  --roots-from-env .env --match "DC相关剧集全系列大合集"                  # → 115
+```
+
+**为什么从 `.env` 派生，而不是手抄路径**：`.env` 的 `DATA_DIRS` **就是 cross-seed
+实际会扫的清单**。从它派生，状态机的根就**永远不可能和 cross-seed 漂移** ——
+加了新包改完 `.env`，`init` 跟着重跑一遍即可，不会出现"cross-seed 在搜、状态机不知道"。
+
+| 参数 | 作用 |
+|---|---|
+| `--roots-from-env ENVFILE` | 从该 `.env` 的 `DATA_DIRS` 派生根（与 `--root` 二选一） |
+| `--match KEYWORD` | 只取路径里含该关键词的条目（可重复，OR）。**多包共用一个 `.env` 时靠它分拣** |
+| `--unc-host //HOST` | 本地根的主机前缀；不给则从 `scripts/.nasrc` 的 `NAS_NAME` 推断 |
+| `--nas-prefix /volume1` | NAS 卷前缀，用于拼本地根，默认 `/volume1` |
+
+> `--root` / `--local-root` 的显式写法仍然保留（适合单根包或临时试）。
+> 两种方式**只能选一种**，同时给会直接报错。
+>
+> 已知限制：`--roots-from-env` 用**子串**匹配，所以两个包的关键词如果互相包含，
+> 需要给更长的关键词。当前三个包（`DouBan_IMDB` / `My.Brilliant.Friend` /
+> `DC相关剧集全系列大合集`）互不包含，无歧义。
 
 ---
 

@@ -159,6 +159,84 @@ def _idx_list(s: str | None) -> list[str]:
     return [x.strip() for x in (s or "").split(",") if x.strip()]
 
 
+def _read_env_file(path: str) -> dict[str, str]:
+    """读一个 `.env` 风格的键值文件（只取 `KEY=VALUE`，忽略注释与空行）。"""
+    try:
+        text = Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError as e:
+        raise SystemExit(f"[!!] 读不了 {path}: {e}") from e
+    out: dict[str, str] = {}
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        out[k.strip()] = v.strip()
+    return out
+
+
+def _guess_unc_host() -> str | None:
+    """从 `scripts/.nasrc`（gitignored）里读 NAS_NAME，拼成 `//HOST`。"""
+    rc = Path(__file__).resolve().parent / ".nasrc"
+    if not rc.is_file():
+        return None
+    for raw in rc.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = raw.strip()
+        if line.startswith("NAS_NAME="):
+            v = line.split("=", 1)[1].strip().strip('"').strip("'")
+            return ("//" + v) if v else None
+    return None
+
+
+def _roots_from_env(envfile: str, matches: list[str] | None,
+                    unc_host: str | None,
+                    nas_prefix: str) -> tuple[list[str], list[str], list[str]]:
+    """从 `.env` 的 `DATA_DIRS` 里挑出属于某个包的根。
+
+    为什么这么做：`.env` 的 `DATA_DIRS` **就是 cross-seed 实际会扫的清单**，
+    所以"状态机的根"从它派生，就永远不会和 cross-seed 漂移 ——
+    比手抄 47 条路径安全得多。
+
+    返回 `(NAS 根, 本地根, 说明)`。本地根 = 把 `nas_prefix` 换成 `unc_host`。
+    """
+    env = _read_env_file(envfile)
+    entries = [p.strip() for p in env.get("DATA_DIRS", "").split(",") if p.strip()]
+    if not entries:
+        return [], [], [f"{envfile} 里没有 DATA_DIRS，或它是空的"]
+
+    pats = [m for m in (matches or []) if m]
+    picked = [p for p in entries if any(m in p for m in pats)] if pats else list(entries)
+    if not picked:
+        return [], [], [f"DATA_DIRS 共 {len(entries)} 条，没有一条包含 {pats}"]
+
+    notes = [f"从 {envfile} 的 DATA_DIRS（共 {len(entries)} 条）里挑了 {len(picked)} 条"
+             + (f"，匹配 {pats}" if pats else "（未给 --match，全取）")]
+
+    host = (unc_host or "").rstrip("/")
+    if not host:
+        notes.append("[warn] 没给 --unc-host，也没能从 scripts/.nasrc 读到 NAS_NAME；"
+                     "本地根将直接沿用 NAS 路径（只有本机就是 NAS 时才可行）")
+    pfx = (nas_prefix or "/volume1").rstrip("/")
+
+    nas_roots: list[str] = []
+    local_roots: list[str] = []
+    off_prefix = 0
+    for p in picked:
+        nas_roots.append(p)
+        if not host:
+            local_roots.append(p)
+        elif p == pfx:
+            local_roots.append(host + "/")
+        elif p.startswith(pfx + "/"):
+            local_roots.append(host + p[len(pfx):])
+        else:
+            local_roots.append(p)
+            off_prefix += 1
+    if host and off_prefix:
+        notes.append(f"[warn] {off_prefix} 条不以 {pfx}/ 开头，本地根直接沿用原路径（请核对）")
+    return nas_roots, local_roots, notes
+
+
 def _sync_now(args, st, *, quiet: bool = False):
     """跑一次完整 sync（三来源）。drive 的回灌也用它。"""
     qb = []
@@ -188,6 +266,32 @@ def _sync_now(args, st, *, quiet: bool = False):
 def cmd_init(args) -> int:
     nas_roots = [r for r in (args.root or []) if r]
     local_roots = [r for r in (getattr(args, "local_root", None) or []) if r]
+    notes: list[str] = []
+
+    # ---- 根的来源：显式 --root 列表，或从 .env 的 DATA_DIRS 派生（二选一）----
+    if args.roots_from_env:
+        if nas_roots:
+            _say("[!!] --root 与 --roots-from-env 是两种取根方式，只能选一种")
+            return 2
+        host = args.unc_host or _guess_unc_host()
+        nas_roots, local_roots, notes = _roots_from_env(
+            args.roots_from_env, args.match, host, args.nas_prefix)
+        for n in notes:
+            _say(f"    {n}")
+        if not nas_roots:
+            _say("[!!] --roots-from-env 没挑到任何根（原因见上一行）")
+            return 2
+
+    if not nas_roots:
+        _say("[!!] 没有根。两种用法：")
+        _say("    A) 显式列出（适合单根包）：")
+        _say("       --root /volume1/video/... --local-root //YOUR-NAS/video/...")
+        _say("    B) 从 .env 派生（适合多根包，推荐）：")
+        _say("       --roots-from-env .env --match <路径关键词> [--unc-host //YOUR-NAS]")
+        _say("    路径视角说明：--root 必须是 cross-seed 视角的 NAS 路径（webhook 要用它），")
+        _say("    列目录另外用本地/UNC 路径；多根包两者**按序一一对应**。")
+        return 2
+
     entries, dups, problems = _scan_pack(
         nas_roots, local_roots,
         depth=args.depth, pattern=args.pattern, exclude=args.exclude)
@@ -196,8 +300,6 @@ def cmd_init(args) -> int:
         _say(f"[!!] {p}")
     if not entries:
         _say("没有扫到任何单片，未写库。")
-        _say("    --root      = cross-seed 视角的 NAS 路径（/volume1/...，webhook 要用它）")
-        _say("    --local-root= 本机能列目录的等价路径（//YOUR-NAS/...），**按序一一对应**")
         return 2
 
     _say(f"根 {len(nas_roots)} 个，深度 maxDataDepth={args.depth}")
@@ -513,12 +615,23 @@ def build_parser() -> argparse.ArgumentParser:
 
     a = sub.add_parser("init", help="登记大包与包内子目录")
     a.add_argument("--pack", required=True)
-    a.add_argument("--root", required=True, action="append",
+    a.add_argument("--root", action="append",
                    help="★cross-seed 视角的路径（NAS 上），如 /volume1/video/download/movies/<PACK>。"
                         "多根包（嵌套合集）可重复传，与 --local-root 按序一一对应")
     a.add_argument("--local-root", action="append",
                    help="本机可访问的等价路径（Windows 上填 //YOUR-NAS/video/...），只用于列目录。"
                         "多根包可重复传")
+    # ---- 从 .env 的 DATA_DIRS 派生根（多根包强烈推荐，免手抄 47 条）----
+    a.add_argument("--roots-from-env", metavar="ENVFILE",
+                   help="从该 .env 的 DATA_DIRS 派生根。★这是 cross-seed 实际会扫的清单，"
+                        "从它派生就不会与 cross-seed 漂移")
+    a.add_argument("--match", action="append", metavar="KEYWORD",
+                   help="配合 --roots-from-env：只取路径里含该关键词的条目（可重复，OR）")
+    a.add_argument("--unc-host", metavar="//HOST",
+                   help="配合 --roots-from-env：本地根的主机前缀，如 //YOUR-NAS。"
+                        "不给则尝试从 scripts/.nasrc 的 NAS_NAME 推断")
+    a.add_argument("--nas-prefix", default="/volume1",
+                   help="配合 --roots-from-env：NAS 上的卷前缀，用于拼本地根，默认 /volume1")
     a.add_argument("--depth", type=int, default=S.DEFAULT_MAX_DATA_DEPTH,
                    help=f"枚举深度，对应 cross-seed 的 maxDataDepth，默认 {S.DEFAULT_MAX_DATA_DEPTH}。"
                         "★必须与 cross-seed 的配置一致，否则会登记出 cross-seed 根本不搜的幽灵条目")

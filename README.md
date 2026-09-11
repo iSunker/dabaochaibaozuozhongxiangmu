@@ -191,11 +191,11 @@ cross-seed **不会排队、不会重试**：索引器被退避时，待搜索�
 
 ```bash
 PACK=frds-top250-2024
-NAS=/volume1/video/download/movies/DouBan_IMDB.TOP250.Movies.Mixed.Collection.20240501.FRDS
-UNC=//YOUR-NAS/video/download/movies/DouBan_IMDB.TOP250.Movies.Mixed.Collection.20240501.FRDS
 N=//YOUR-NAS/docker_ssd/prowlarr_cross-seed_autohardlink
 
-python scripts/reseed-state.py init --pack $PACK --root "$NAS" --local-root "$UNC" --exclude "0观影清单*"
+# ★推荐：根清单直接从 cross-seed 的 .env 里派生 —— 永不与 cross-seed 漂移
+python scripts/reseed-state.py init --pack $PACK --depth 2 \
+  --roots-from-env .env --match "DouBan_IMDB" --exclude "0观影清单*"
 python scripts/reseed-state.py sync --pack $PACK \
   --db-path "$N/cross-seed/cross-seed.db" \
   --log "$N/cross-seed/logs/info.current.log" --log "$N/cross-seed/logs/verbose.current.log" \
@@ -204,6 +204,27 @@ python scripts/reseed-state.py report --pack $PACK
 python scripts/reseed-state.py todo  --pack $PACK --indexers SiteA,SiteB --out scripts/todo.txt
 python scripts/reseed-state.py drive --pack $PACK --indexers SiteA,SiteB --limit 50 --apply \
   --url http://NAS_IP:2468 --api-key <CROSSSEED_API_KEY>
+```
+
+**`init` 的根怎么给**（两种方式，二选一）：
+
+| 方式 | 写法 | 什么时候用 |
+|---|---|---|
+| ★从 `.env` 派生 | `--roots-from-env .env --match "<路径关键词>"` | **推荐**。`.env` 的 `DATA_DIRS` 就是 cross-seed 实际会扫的清单，从它派生 ⇒ 状态机与 cross-seed **永不漂移**。多根包（DC 47 根）就靠它一行搞定 |
+| 显式列出 | `--root <NAS路径> --local-root <本机路径>`（均可重复传） | 单根包、或想手工挑根时。**多根必须按序一一对应**（第 i 个 `--local-root` 就是第 i 个 `--root` 的 UNC） |
+
+- `--match` 可重复（OR 关系），只取路径里含关键词的 `DATA_DIRS` 条目；不给则全取。
+- `--unc-host //YOUR-NAS` 用来把 NAS 路径翻成 UNC；不给则尝试从 `scripts/.nasrc` 的 `NAS_NAME` 推断。
+- `--nas-prefix` 默认 `/volume1`，是 NAS 上的卷前缀。
+- ⚠ **`--depth` 必须与 cross-seed 的 `maxDataDepth` 完全一致**（本项目未显式配置 ⇒ 用默认值 2）。
+  它是"从 dataDir 往下数几层"，第 1..N 层的**目录和视频文件**都算一个 searchee ——
+  详见 SUMMARY §10.6。对不上就会出现"状态机有、cross-seed 没有"的幽灵条目。
+
+DC 那种 47 个根的包，一条命令就是全部参数：
+
+```bash
+python scripts/reseed-state.py init --pack dc-collection --depth 2 \
+  --roots-from-env .env --match "DC相关剧集全系列大合集" --dry-run   # 先核对
 ```
 
 **分批**：`--limit N` 每批 N 条，`--batch K` 指定第几批（默认第 1 批），
