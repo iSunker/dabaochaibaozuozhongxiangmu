@@ -36,8 +36,10 @@ import argparse
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
@@ -133,6 +135,62 @@ def alert_if_all_done(packs: list[str], db: str) -> bool:
     LOG.warning("   或手动停掉：schtasks /Delete /TN \"reseed-drive-loop\" /F")
     LOG.warning("=" * 62)
     return True
+
+
+# --------------------------------------------------------------------------- #
+# 索引器自检 —— cross-seed 实际会搜的站 vs --indexers
+# --------------------------------------------------------------------------- #
+def _norm_indexer_name(n: str) -> str:
+    """取站名主干：'NanyangPT (南洋)' → 'nanyangpt'。
+
+    cross-seed 里的名字来自站点 caps，常带括号后缀；`--indexers` 是人手写的短名。
+    直接比集合会每次都误报，所以去掉括号后缀与大小写再比。
+    """
+    return re.split(r"[(（]", n.strip(), 1)[0].strip().lower()
+
+
+def check_indexers(args) -> None:
+    """★ 这两份信息是**分开维护**的，对不上会**静默错记**。
+
+    cross-seed 按它自己的 `TORZNAB_URLS` **全站搜索**；
+    `--indexers` 只决定状态机把"搜过"**记到哪个站名下**（`indexer_seen` / 重搜周期）。
+    加了站却忘了改 `--indexers` → 新站搜到的结果被记成"没搜过那个站"
+    → 要么反复重搜（浪费额度），要么永远不重搜。而且**不报错**，只是数算错。
+    """
+    if not args.db_path:
+        return
+    try:
+        snap = S.read_crossseed_db(args.db_path)
+    except Exception as e:  # noqa: BLE001 —— 自检失败不该挡住正事
+        LOG.debug("索引器自检跳过（读不到 cross-seed.db）: %s", e)
+        return
+
+    live = list(snap.indexers)
+    mine = {_norm_indexer_name(x) for x in (args.indexers or "").split(",") if x.strip()}
+
+    # cross-seed 侧用 "prowlarr#<id>" 表示"active 但拉不到名字"的索引器（见 read_crossseed_db）
+    unnamed = [lbl for lbl in live if lbl.startswith("prowlarr#")]
+    named = [lbl for lbl in live if not lbl.startswith("prowlarr#")]
+    missing = [lbl for lbl in named if _norm_indexer_name(lbl) not in mine]
+    extra = sorted(mine - {_norm_indexer_name(lbl) for lbl in named})
+
+    if unnamed:
+        LOG.warning("⚠ cross-seed 有 %d 个 active 索引器**拉不到名字**（%s）——"
+                    " 多半是该站返回错误（410/403/CF），caps 取不回来。",
+                    len(unnamed), ", ".join(unnamed))
+        LOG.warning("  常见原因：`.env` 里删了站但容器没重建，或该站被 Prowlarr 禁用。")
+    if missing:
+        LOG.warning("⚠ cross-seed 实际会搜 %s，但 --indexers 没列 ——"
+                    " 这些站的搜索结果会被状态机**漏记**（→ 重复搜 / 永不重搜）。",
+                    ", ".join(missing))
+        LOG.warning("  建议把 --indexers 改成：--indexers %s", ",".join(named))
+    if extra:
+        LOG.warning("⚠ --indexers 列了 %s，但 cross-seed 根本不会搜 ——"
+                    " 状态机会把它们记成'搜过'，实际是假的（→ 永远不会去搜）。",
+                    ", ".join(extra))
+    if not (unnamed or missing or extra):
+        LOG.info("索引器自检通过：cross-seed 实际会搜 %s，与 --indexers 一致。",
+                 ", ".join(named))
 
 
 # --------------------------------------------------------------------------- #
@@ -248,6 +306,62 @@ def write_state(d: dict) -> None:
         LOG.warning("写状态文件失败（忽略）: %s", e)
 
 
+# 心跳多久没刷新就认为上一批已经死了。批次里每 60s 刷一次，10 分钟足够宽裕
+# （等于容忍 10 次丢拍），又能让被 kill 的残留批次在 10 分钟内被识别、不再挡住后续唤醒。
+HEARTBEAT_STALE_SEC = 600
+
+
+def write_heartbeat() -> None:
+    """刷新心跳（合并进现有状态，不动 running_pid / last_pack_idx）。"""
+    st = read_state()
+    st["heartbeat_ts"] = time.time()
+    write_state(st)
+
+
+class Heartbeat:
+    """后台心跳线程：批次运行期间每 `period` 秒刷一次状态文件。
+
+    ★ 为什么不能只靠 PID 判断"上一批还在不在"
+      Windows 会**复用 PID**。批次被强杀后状态文件里留着 running_pid，
+      若那个号恰好被别的进程占用，pid_alive() 会永远返回 True
+      —— 于是每次唤醒都判"上一批还在跑"，**静默永久停工**。
+      这正是无人值守最怕的失败模式：不报错，只是不动。
+
+      加了心跳就变成「PID 活着 **且** 心跳新鲜」才算在跑：进程真死了心跳必停，
+      PID 被复用也救不回来。
+
+    ★ 为什么用独立线程，而不是"每发一条 webhook 就刷一次"
+      批次里有长时间不发请求的阶段 —— 等 cross-seed 日志静默（最多
+      --drain-max-wait，默认 1 小时）和回灌。那些阶段没有可挂钩的事件，
+      心跳会假死、被误判成残留。独立线程与批次同生共死，最省心。
+
+    用法：`with Heartbeat(): stats = run_round(...)`
+    """
+
+    def __init__(self, period: float = 60.0):
+        self.period = period
+        self._stop = threading.Event()
+        self._th: threading.Thread | None = None
+
+    def __enter__(self) -> "Heartbeat":
+        self._th = threading.Thread(target=self._loop, daemon=True, name="drive-loop-hb")
+        self._th.start()
+        return self
+
+    def _loop(self) -> None:
+        while not self._stop.wait(self.period):
+            try:
+                write_heartbeat()
+            except Exception:  # noqa: BLE001 —— 心跳失败绝不能拖垮批次
+                pass
+
+    def __exit__(self, *exc) -> bool:
+        self._stop.set()
+        if self._th:
+            self._th.join(timeout=5)   # 确保不再与 finally 里写状态竞争
+        return False
+
+
 def pid_alive(pid) -> bool:
     """判断 pid 是否还在跑。Windows 上用 tasklist（os.kill(pid,0) 在 Windows 会杀进程！）。"""
     if not pid:
@@ -274,6 +388,27 @@ def pid_alive(pid) -> bool:
         return True
 
 
+def batch_alive(st: dict) -> bool:
+    """上一批是否**真的**还在跑：PID 存活 **且** 心跳新鲜。
+
+    只看 PID 会被 Windows 的 PID 复用骗到（详见 Heartbeat 的说明）——
+    那会导致"永远判在跑 → 静默停工"。
+    """
+    pid = st.get("running_pid")
+    if not pid_alive(pid):
+        return False
+    hb = float(st.get("heartbeat_ts") or 0)
+    if not hb:
+        return False          # 早期版本留下的状态文件没有心跳字段 → 当残留处理
+    stale = time.time() - hb
+    if stale <= HEARTBEAT_STALE_SEC:
+        return True
+    LOG.warning("状态文件里的 pid %s 仍存在，但心跳已停 %.0f 分钟"
+                "（PID 复用？进程卡死？）—— 判定为残留，接管本轮",
+                pid, stale / 60)
+    return False
+
+
 def log_result(pack: str, stats: S.DriveStats | None) -> None:
     if stats is None:
         LOG.info("[%s] 本批无动作（没待搜或计划为空）", pack)
@@ -296,7 +431,7 @@ def once_round(packs: list[str], args, api_key: str, min_sleep: float) -> int:
     - 否则跑「轮到的那个包」一批，并把 {结束时间, 包序号} 写回状态文件
     """
     st = read_state()
-    if pid_alive(st.get("running_pid")):
+    if batch_alive(st):
         LOG.info("上一批（pid %s）仍在运行，跳过本轮", st.get("running_pid"))
         return 0
     last_end = float(st.get("last_end_ts") or 0)
@@ -308,14 +443,16 @@ def once_round(packs: list[str], args, api_key: str, min_sleep: float) -> int:
 
     idx = (int(st.get("last_pack_idx", -1)) + 1) % len(packs)
     pack = packs[idx]
-    write_state({**st, "running_pid": os.getpid()})
+    write_state({**st, "running_pid": os.getpid(), "heartbeat_ts": time.time()})
     LOG.info("[--once] 跑包 %s（第 %d/%d 个）", pack, idx + 1, len(packs))
 
     stats = None
     rc = 0
     failed = False
     try:
-        stats = run_round(pack, args, api_key)
+        # 心跳线程只包住跑批阶段：跑完就停，免得和下面 finally 写状态打架
+        with Heartbeat():
+            stats = run_round(pack, args, api_key)
         log_result(pack, stats)
         if stats is None:
             # 这个包没待搜 —— 看看是不是所有包都干完了（无人值守时必须出声）
@@ -398,6 +535,9 @@ def main() -> int:
 
     LOG.info("=== drive-loop 启动：packs=%s indexers=%s limit=%d ===",
              packs, args.indexers, args.limit)
+
+    # 自检：cross-seed 真实搜索范围 vs --indexers（不一致会静默错记，务必先喊出来）
+    check_indexers(args)
 
     # key：--api-key 显式给优先，否则从 --env 读
     api_key = args.api_key
