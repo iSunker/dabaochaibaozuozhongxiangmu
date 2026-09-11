@@ -146,7 +146,9 @@ def _norm_indexer_name(n: str) -> str:
     cross-seed 里的名字来自站点 caps，常带括号后缀；`--indexers` 是人手写的短名。
     直接比集合会每次都误报，所以去掉括号后缀与大小写再比。
     """
-    return re.split(r"[(（]", n.strip(), 1)[0].strip().lower()
+    # ★ maxsplit 必须写成关键字：Python 3.13 起按位置传会发 DeprecationWarning
+    #   （re.split(pattern, string, maxsplit) 里 maxsplit 是 keyword-only 的语义）。
+    return re.split(r"[(（]", n.strip(), maxsplit=1)[0].strip().lower()
 
 
 def check_indexers(args) -> None:
@@ -168,7 +170,9 @@ def check_indexers(args) -> None:
     live = list(snap.indexers)
     mine = {_norm_indexer_name(x) for x in (args.indexers or "").split(",") if x.strip()}
 
-    # cross-seed 侧用 "prowlarr#<id>" 表示"active 但拉不到名字"的索引器（见 read_crossseed_db）
+    # cross-seed 侧用 "prowlarr#<N>" 表示"active 但拉不到名字"的索引器（见 read_crossseed_db）
+    # ★ N 是 **URL 里的 N**（Prowlarr 的索引器号，与 TORZNAB_URLS 的写法一致），
+    #   不是 cross-seed 数据库的行号 —— 别拿它去对 indexer 表的 id。
     unnamed = [lbl for lbl in live if lbl.startswith("prowlarr#")]
     named = [lbl for lbl in live if not lbl.startswith("prowlarr#")]
     missing = [lbl for lbl in named if _norm_indexer_name(lbl) not in mine]
@@ -178,6 +182,7 @@ def check_indexers(args) -> None:
         LOG.warning("⚠ cross-seed 有 %d 个 active 索引器**拉不到名字**（%s）——"
                     " 多半是该站返回错误（410/403/CF），caps 取不回来。",
                     len(unnamed), ", ".join(unnamed))
+        LOG.warning("  编号是 `TORZNAB_URLS` 里的那个（`#N` = `/N/api`），不是 Prowlarr 界面序号。")
         LOG.warning("  常见原因：`.env` 里删了站但容器没重建，或该站被 Prowlarr 禁用。")
     if missing:
         LOG.warning("⚠ cross-seed 实际会搜 %s，但 --indexers 没列 ——"

@@ -2424,6 +2424,64 @@ $ git check-ignore -v .env.bak.20260911-204109
 > ★ 教训是通用的：**任何"把密钥文件复制一份"的备份流程，都要单独加 gitignore 规则。**
 > 备份不是"同一个文件"，精确匹配的规则不会管它。
 
+**发现并堵上一个会误导人的标签 bug（`prowlarr#N` 里 N 不是表行号）**
+
+`drive-loop` 启动自检报了一句：
+
+```text
+⚠ cross-seed 有 1 个 active 索引器**拉不到名字**（prowlarr#4）—— 多半是该站返回错误（410/403/CF）
+```
+
+按 `TORZNAB_URLS` 的写法（`/4/api` = NanyangPT）读，这句话像是说 **NanyangPT 挂了**。
+但查 `error.current.log` —— **`/4/api` 一次都没出现过**，最近的 caps 失败是 `/2/api`（10:27）
+和 HDFans（15:59）。直接查 cross-seed 的 `indexer` 表才看清：
+
+| 表 `id` | `url` | `name` | `status` |
+|---|---|---|---|
+| 1 | `/1/api` | *(空)* | RATE_LIMITED |
+| 2 | `/2/api` | HDFans | RATE_LIMITED |
+| **4** | **`/3/api`** | ***(空)*** ← 真正拉不到名字的是它 | UNKNOWN_ERROR |
+| **5** | **`/4/api`** | **NanyangPT (南洋)** ✅ | *(空，健康)* |
+
+**`indexer.id` 是 cross-seed 的自增行号，不是 Prowlarr 的索引器号。**
+`read_crossseed_db` 用 `f"prowlarr#{iid}"` 拼标签，于是**行号 4** 被打成 `prowlarr#4` ——
+恰好与"Prowlarr 的 #4"撞名，指向了完全无辜的 NanyangPT。
+
+> ★ 这个 bug 藏了很久，因为**行 id=1 恰好对应 `/1/api`**，偶然是对的。
+> 真正拉不到名字的是 `/3/api`（BTSCHOOL）—— 和那 49 次 410 是同一件事（§10.5.10）。
+
+**更糟的是它和既有契约冲突**：`state.py` 里早就有一个 `normalize_indexer()`，
+把 URL `.../N/api` 映射成 `prowlarr#N`（**用的是 URL 里的 N**）。
+而 `read_crossseed_db` 同时在写 `snap.alias[url] = label` ——
+于是 `alias[".../3/api"]` 给的是行号版 `prowlarr#4`，正则回退却给 `prowlarr#3`。
+**同一个索引器两条路两个标签**，正是 `normalize_indexer()` 文档里警告的那种"一个站变成多个成员"。
+
+**修法**：新增 `_fallback_indexer_label(row_id, url)` —— 优先从 **URL** 取号
+（复用既有的 `_INDEXER_URL_ID`），取不到才退化成 `prowlarr#row<id>`，
+**明确标成行号、不冒充 Prowlarr 号**。三处调用点统一：
+
+- `read_crossseed_db` 的 `indexers` / `indexer_status` / `indexer_label`
+- `read_indexer_backoff`（顺带把查询加上 `url` 列，原来没取）
+- `idx_names.get(iid, ...)` 的兜底也改成 `prowlarr#row{iid}`
+
+**修完实测（拿生产 DB 跑）**：
+
+```text
+active 索引器标签: ['HDFans', 'prowlarr#3', 'NanyangPT (南洋)']
+alias:  .../3/api -> 'prowlarr#3'     ← 与 normalize_indexer 一致了
+        .../4/api -> 'NanyangPT (南洋)'
+```
+
+自检现在报 `prowlarr#3` —— 指对了站，也指对了人。
+
+**顺带修掉一个 `DeprecationWarning`**：`drive-loop.py:149` 的
+`re.split(r"[(（]", n, 1)` 把 `maxsplit` 按位置传了。改成 `maxsplit=1`
+（用 `python -W error::DeprecationWarning` 验证已消除）。
+
+> 教训：**日志里带 `#数字` 的标签，一定要写清是"哪套编号"。**
+> 这个项目同时存在三套编号 —— Prowlarr 界面序号、`TORZNAB_URLS` 的 `/N/api`、
+> cross-seed 的 `indexer.id` —— 打印时用一个、脑子里想另一个，就会去查错的站。
+
 **提交**
 
 | 提交 | 内容 |

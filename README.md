@@ -157,6 +157,11 @@ docker compose run --rm reseed-orchestrator status                          # �
 - **注入后一直"校验中"或校验失败**：单种发布名/文件大小与你的数据不完全一致属正常（换一个匹配结果）；确认 `LINK_DIR` 与源**同卷**、`/volume1/video` 已 1:1 挂进 cross-seed 与 `:3060` 两个容器。
 - **cross-seed 启动报 `unknown option`/键名错误**：版本键名差异，按 `cross-seed/config.js` 顶部说明与官方文档改键名。
 - **外网连不上 / 上传为 0**：路由器 56883 的 **TCP 和 UDP** 都要转发；确认 conf 三处端口都是 56883。
+- **`drive-loop` 报「有 N 个 active 索引器拉不到名字（prowlarr#3）」**：
+  这是**索引器拉的 caps 失败**（名字来自站点 caps，取不回来就没名字），
+  `#N` 就是 `TORZNAB_URLS` / `/N/api` 那个号，**不是 Prowlarr 界面序号**。
+  先去 Prowlarr 看这站还在不在、是否被禁用 —— 多半又是「`.env` 删了站但容器没重建」
+  （见上面「交接必读的坑」），重建即可。SUMMARY §13.11 记了这个标签曾经写错的 bug。
 - **`:3060` API 403**：白名单网段没覆盖来源 IP（改 `WebUI\AuthSubnetWhitelist`），或应改用 `QBIT_AUTH_MODE=password`。
 
 ---

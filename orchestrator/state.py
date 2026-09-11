@@ -524,6 +524,29 @@ def _open_csdb(db_path: Path, keep_copy: str | None = None):
     return con, tmp
 
 
+def _fallback_indexer_label(row_id: int, url: str | None) -> str:
+    """给「拉不到名字」的索引器起一个**不会误导**的标签（`name` 为空时用）。
+
+    ★ `prowlarr#N` 里的 N 是 **URL 里的 N**，也就是 Prowlarr 的索引器号 ——
+    与 `TORZNAB_URLS` 的写法（`/2/api` → `#2`）和 `normalize_indexer()` 一致。
+
+    ★★ **绝不能拿 `indexer.id` 当 N**：那是 cross-seed 的**自增行号**，不是 Prowlarr 的号。
+    实测生产库：
+
+        id=2 → /2/api → HDFans          （有名字，不走这里）
+        id=4 → /3/api → BTSCHOOL 已删    ← 行号 4 会被打成 `prowlarr#4`
+        id=5 → /4/api → NanyangPT (南洋)  ← 而 Prowlarr 的 #4 是**它**
+
+    于是「`prowlarr#4` 拉不到 caps」会被读成"NanyangPT 出问题了"，实际是 `/3/api`。
+    `id=1` 恰好对应 `/1/api`，所以这个错一直没暴露。
+    """
+    if url:
+        m = _INDEXER_URL_ID.search(url)
+        if m:
+            return f"prowlarr#{m.group(1)}"
+    return f"prowlarr#row{row_id}"  # 连 URL 都没记 —— 明确标成行号，别冒充 Prowlarr 号
+
+
 def read_crossseed_db(db_path: str | Path, *, keep_copy: str | None = None) -> CrossSeedSnapshot:
     """只读 cross-seed.db，取出三样事实：
 
@@ -545,7 +568,7 @@ def read_crossseed_db(db_path: str | Path, *, keep_copy: str | None = None) -> C
         for iid, name, url, active, status, retry_after in con.execute(
             "SELECT id, name, url, active, status, retry_after FROM indexer"
         ):
-            label = name or f"prowlarr#{iid}"
+            label = name or _fallback_indexer_label(iid, url)
             idx_names[iid] = label
             if url:
                 snap.alias[url.rstrip("/")] = label
@@ -574,7 +597,7 @@ def read_crossseed_db(db_path: str | Path, *, keep_copy: str | None = None) -> C
         ):
             if not sname:
                 continue
-            label = idx_names.get(iid, f"prowlarr#{iid}")
+            label = idx_names.get(iid, f"prowlarr#row{iid}")
             iso = ""
             if last_ms:
                 try:
@@ -623,8 +646,8 @@ def read_indexer_backoff(db_path: str | Path) -> list[IndexerBackoff]:
     con, _tmp = _open_csdb(db_path)
     try:
         out = []
-        for iid, name, status, retry_after in con.execute(
-            "SELECT id, name, status, retry_after FROM indexer"
+        for iid, name, url, status, retry_after in con.execute(
+            "SELECT id, name, url, status, retry_after FROM indexer"
         ):
             until = None
             if retry_after:
@@ -632,7 +655,8 @@ def read_indexer_backoff(db_path: str | Path) -> list[IndexerBackoff]:
                     until = datetime.fromtimestamp(retry_after / 1000)
                 except (OverflowError, OSError, ValueError):
                     until = None
-            out.append(IndexerBackoff(name or f"prowlarr#{iid}", status or "-", until))
+            out.append(IndexerBackoff(name or _fallback_indexer_label(iid, url),
+                                      status or "-", until))
         return out
     finally:
         con.close()
