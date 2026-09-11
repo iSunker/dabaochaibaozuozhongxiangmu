@@ -10,7 +10,8 @@
 > **§11.12 生产 `.env` 一键更新（含"怎么确认真的落地了"）**、
 > **§10.6.4 `init --roots-from-env`（DC 47 组参数 → 一条命令）**、
 > **§11.13 429 退避与 SKIPPED 的真相**、
-> **§11.14 三个包 init 完成与 drive 分批策略**）
+> **§11.14 三个包 init 完成与 drive 分批策略**、
+> **§12 收尾归档（现状快照 / 下一步手册 / 踩坑清单）—— 接手先读这里**）
 > 本文件是给「下一次接手的人（或下一个会话）」看的。读完这一篇应当能直接接着干，
 > 不需要回翻聊天记录。
 
@@ -1700,3 +1701,117 @@ python scripts/reseed-state.py drive --pack frds-top250-2024 --indexers HDFans -
 - `drive` 默认 dry-run，**不加 `--apply` 不会发任何请求**
 - 打完自动 `sync` 回灌，直接告诉你 `newly_seeding`（这轮真赚到几部）
 - 状态机数据库 `hlink/state.db` 已 gitignore，**不要提交到 GitHub**
+
+---
+
+## 12. 收尾归档（2026-09-11 会话结束）
+
+> 本章是**交接快照**。本节点已停止所有自动动作（不发 webhook、不 drive）。
+> 下次接手从这里读起，再按需跳到 §10（多包）/§11（状态机）看细节。
+
+### 12.1 本次会话产出（提交记录）
+
+| 提交 | 内容 |
+|---|---|
+| `1273acb` | 状态机支持嵌套包：多根 init + 深度枚举 + 路径最长前缀匹配 |
+| `40289d3` | `init --roots-from-env`：根的清单直接从 cross-seed 的 `.env` 派生（DC 47 组参数 → 一条命令） |
+| `827231c` | NAS `.env` 一键更新脚本加固：三道安全闸 + 中间文件相对路径 + 验证指南（§11.12） |
+| `c686669` | §11.13 429 退避与 SKIPPED 的真相 |
+| `273e2db` | §11.14 三个包 init 完成与 drive 分批策略 |
+| 本次 | §12 收尾归档 + README「当前状态与下一步」 |
+
+更早（`82ababe` `--limit` 分批、`6e0ffea` 脚本生成器）见 §5 进度表。
+
+### 12.2 系统现状快照
+
+| 项目 | 状态 | 怎么验证 |
+|---|---|---|
+| NAS `.env` | ✅ `DATA_DIRS` = **49 条**，真实密钥保留 | `awk '/^DATA_DIRS=/{n=split($0,a,","); print n}' .env` |
+| cross-seed 容器 | ✅ 已重启（16:00） | 日志 `Validated 1888 entries from dataDirs` |
+| cross-seed.db `data` | ✅ **1963 行** | `select count(*) from data` |
+| ├ FRDS | 932 | `path like '%DouBan_IMDB%'` |
+| ├ DC | ~993 | `path like '%DC相关剧集全系列大合集%'` |
+| └ MBF | 38 | `path like '%Brilliant%'` |
+| 状态机 `hlink/state.db` | ✅ **605 部** | `report --pack <包>` |
+| cross-seed API | ✅ 可达 | `curl http://192.168.0.7:2468/api/ping` → `OK` |
+| qBittorrent | ✅ v4.6.5 | `curl .../api/v2/app/version` |
+| 索引器 HDFans | ⚠ `RATE_LIMITED` 但 `retry_after` 已过期 → 实际可用 | 读 `indexer` 表 |
+
+### 12.3 三个包的最终台账
+
+| 包 | 单片 | 待搜 | 阶段分布 | 备注 |
+|---|---|---|---|---|
+| FRDS | 486 | **390** | PENDING 108 / SKIPPED 282 / UNMATCHED 48 / SEEDING 48 | `--depth 2` 后从 382→486（多认 104 个嵌套目录） |
+| MBF | 4 | **4** | PENDING 4 | 剧集，每季一个 searchee |
+| DC | 115 | **115** | PENDING 115 | 47 个 dataDir，嵌套包 |
+| **合计** | **605** | **509** | | |
+
+- SEEDING 48 部 = HDFans 已匹配并注入成功（终点，永不重搜）
+- UNMATCHED 48 部 = 真搜过、没匹配到（7 天后或加新站才重搜）
+- SKIPPED 282 部 = **被 429 退避秒跳，真的没搜过** → 优先级最高，见 §11.13
+
+### 12.4 下一步操作手册
+
+**顺序建议**：MBF（2 分钟，验证通路）→ DC（3 批）→ FRDS（8 批）。
+
+```bash
+URL=http://192.168.0.7:2468
+KEY=<CROSSSEED_API_KEY>
+DB="//iSunker-DS423/docker_ssd/prowlarr_cross-seed_autohardlink/cross-seed/cross-seed.db"
+
+# ★--db-path 必须给，否则回灌被跳过（见 12.5 坑 1）
+python scripts/reseed-state.py drive --pack mbf --indexers HDFans --limit 50 \
+  --url $URL --api-key $KEY --db-path "$DB" --apply
+
+python scripts/reseed-state.py drive --pack dc-collection --indexers HDFans --limit 50 \
+  --url $URL --api-key $KEY --db-path "$DB" --apply
+
+python scripts/reseed-state.py drive --pack frds-top250-2024 --indexers HDFans --limit 50 \
+  --url $URL --api-key $KEY --db-path "$DB" --apply
+```
+
+**节奏**：每批约 24 分钟（50 条 × 30s 间隔）；批间隔 ≥1 小时；每天 2~3 批较安全。
+**推进**：一批做完**重跑同一条命令**即可自动进入下一批（待办按优先级排序，已完成的不会重复）。
+
+**每轮结束后看这两个数**（`drive` 会自动打印）：
+- `newly_seeding` —— 这轮真赚到几部
+- `still_skipped` —— 这轮又被退了几部（>0 说明撞了 429，放慢节奏）
+
+### 12.5 本次会话踩到的坑（按严重度）
+
+1. 🔴 **`drive` 忘给 `--db-path` → 回灌被跳过、状态不更新。**
+   现象：4 条 webhook 全发成功（HTTP 204），结尾却打
+   `[!!] 回灌需要 --db-path（cross-seed.db 路径），已跳过`，退出码 **3**。
+   后果：请求发出去了，但状态机不知道，`todo` 里还是 PENDING，重跑会重复发。
+   补救：补上 `--db-path` 重跑（幂等，已发过的不会重复）。
+   → 已写进 README「当前状态与下一步」。
+
+2. 🔴 **`.env.new` 存在 ≠ `.env` 已更新。**
+   实测出现过「备份和 `.env.new` 都生成了、但 `.env` 还是老值」（脚本在 `mv` 前中断，
+   旧版无 trap 兜底）。判断生效与否**一律看** ① 容器内 `DATA_DIRS` 条数
+   ② `cross-seed.db` 的 `data` 表。详见 §11.12。
+
+3. 🟠 **一次 429 废掉 295 条。**
+   webhook 是单线程顺序处理，中途撞 429 → 标记索引器临时禁用 → 后面全部
+   `Skipped searching (filtered by temporarily disabled indexers)`。详见 §11.13。
+   → 所以**绝不能对大包根打 webhook**，只能用 `drive --limit N` 分批。
+
+4. 🟠 **`--depth` 必须等于 cross-seed 的 `maxDataDepth`**（默认 2）。
+   它是"从 dataDir 往下数几层"，第 1..N 层的目录和视频文件都算 searchee。
+   对不上 → 出现"状态机有、cross-seed 没有"的幽灵条目。详见 §10.6。
+
+5. 🟡 **本地 `.env` 是脱敏占位符，生产 `.env` 是真实密钥。**
+   `TORZNAB_URLS` 本地是 `apikey=xxxx…`，生产是 `da94d20a…`。
+   直接 scp 覆盖 = cross-seed 带假 key 重启 = 全线 401。
+   → `gen-nas-env-update.py` 只搬 `DATA_DIRS`/`LINK_DIR` 两键，且有逐字节安全闸。
+
+6. 🟡 **Windows 侧别对 NAS（UNC 路径）跑 `rm`。**
+   safe-delete 钩子会因 genie-trash 不支持 UNC 而 fail-closed。
+   测试用 `D:/tmp/...` 本地路径；NAS 上的清理让 NAS 自己的脚本做。
+
+### 12.6 还没做（留给下次）
+
+- **v3 硬链接农场**：1 条 dataDir 取代 49 条，顺带闭合嵌套包缺口。设计已完成，见 §10.5。
+- **Phase 2.6 重跑全量**：等合适时机。
+- **编排器 `status` 子命令**：见 §11.9。
+- **IYUU 扩散**：本次范围外，接口已预留，见 §1。

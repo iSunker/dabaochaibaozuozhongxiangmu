@@ -379,3 +379,74 @@ sh nas-update-env.sh --no-restart    # 只改不重启
 
 - `.env`、`cross-seed/`（含 cross-seed 自建的 db）、`prowlarr/`（Prowlarr 配置）**不要提交/外传**——含 cookie/passkey/apikey。
 - PT 站凭据只进 **Prowlarr**；`:3060` 走局域网免密白名单（或 `.env` 里的密码），二选一。
+
+---
+
+## 当前状态与下一步（2026-09-11 收尾归档）
+
+> 本节点已停止所有自动动作（不再发 webhook、不再 drive）。下面是交接快照。
+
+### 系统现状
+
+| 项目 | 状态 |
+|---|---|
+| NAS `.env` | ✅ `DATA_DIRS` = **49 条**，真实密钥保留 |
+| cross-seed 容器 | ✅ 已重启（16:00），`Validated 1888 entries from dataDirs` |
+| cross-seed.db `data` 表 | ✅ **1963 行**（FRDS 932 / DC ~993 / MBF 38） |
+| 状态机 `hlink/state.db` | ✅ **605 部**（gitignored，本地管理，勿提交） |
+| cross-seed API / qBittorrent | ✅ 可达（`:2468` OK / qB v4.6.5） |
+
+### 三个包
+
+| 包 | 单片 | 待搜 | 阶段分布 |
+|---|---|---|---|
+| FRDS | 486 | 390 | PENDING 108 / SKIPPED 282 / UNMATCHED 48 / SEEDING 48 |
+| MBF | 4 | 4 | PENDING 4 |
+| DC | 115 | 115 | PENDING 115 |
+
+### 恢复执行时的命令（**先 `--plan`，确认后再加 `--apply`**）
+
+完整命令必须带 `--db-path`，否则回灌会被跳过（这是个坑，见下）：
+
+```bash
+# 通用参数
+URL=http://192.168.0.7:2468
+KEY=<CROSSSEED_API_KEY>
+DB="//iSunker-DS423/docker_ssd/prowlarr_cross-seed_autohardlink/cross-seed/cross-seed.db"
+
+# 1) MBF（4 部，约 2 分钟）—— 先跑它验证通路
+python scripts/reseed-state.py drive --pack mbf --indexers HDFans --limit 50 \
+  --url $URL --api-key $KEY --db-path "$DB" --apply
+
+# 2) DC（115 部，3 批，每批约 24 分钟）
+python scripts/reseed-state.py drive --pack dc-collection --indexers HDFans --limit 50 \
+  --url $URL --api-key $KEY --db-path "$DB" --apply
+
+# 3) FRDS（390 部，8 批，每批约 24 分钟）—— SKIPPED 优先，排在最前
+python scripts/reseed-state.py drive --pack frds-top250-2024 --indexers HDFans --limit 50 \
+  --url $URL --api-key $KEY --db-path "$DB" --apply
+```
+
+**一批做完重跑同一条命令就自动推进**，不用记批次号。
+
+### ⚠ 本次踩到的坑（交接必读）
+
+1. **`drive` 忘给 `--db-path` → 回灌被跳过，状态不更新。**
+   现象：webhook 全发成功（204），但结尾打
+   `[!!] 回灌需要 --db-path（cross-seed.db 路径），已跳过`，退出码 3。
+   补救：补上 `--db-path` 重跑即可（幂等，不会重复发送已发过的）。
+2. **`.env.new` 存在 ≠ `.env` 已更新。** 判断是否生效一律看
+   ① 容器内 `DATA_DIRS` 条数 ② `cross-seed.db` 的 `data` 表，别看 `ls`。
+3. **别对大包根打 webhook。** cross-seed 的 webhook 是单线程顺序处理，
+   中途撞一次 429 → 后面几百条全部 `Skipped searching (filtered by temporarily
+   disabled indexers)`。已实测：一次 429 废掉 295 条。改用 `drive --limit N` 分批。
+4. **`--depth` 必须等于 cross-seed 的 `maxDataDepth`**（本项目默认 2），
+   对不上就会出现"状态机有、cross-seed 没有"的幽灵条目。
+
+### 还没做
+
+- v3 **硬链接农场**（1 条 dataDir 取代 49 条）—— 设计已完成，见 SUMMARY §10.5。
+- Phase 2.6 重跑全量（等合适时机）。
+- 编排器 `status` 子命令（见 SUMMARY §11.9）。
+
+详细的过程记录、踩坑与决策都在 **SUMMARY.md**（尤其 §11.12 / §11.13 / §11.14）。
