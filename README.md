@@ -69,7 +69,7 @@ prowlarr_cross-seed_autohardlink/   # NAS 部署目录（compose 就放这里，
 
 > 开发仓库里另有 `scripts/`（`run-batch.sh` 抽样脚本、`reseed-state.py` 状态机 CLI、
 > `drive-loop.py` 自动续跑、`add-indexers.py` 加站、`gen-datadirs.py` 生成嵌套包的 `DATA_DIRS` 片段、
-> `build-farm.sh` 构建硬链接农场〔**在 NAS 上跑**，见「扩展 → 硬链接农场」〕）。
+> `build-farm.sh` 构建硬链接农场〔NAS 本机**或** Windows 经 SMB 都能跑，见「扩展 → 硬链接农场」〕）。
 > 其余都是**在 Windows 上跑**的工具，不必进容器。由状态机导出的 `unmatched.tsv` /
 > `todo.txt` 属运行时产物，已 gitignore。
 
@@ -367,7 +367,7 @@ sh nas-update-env.sh --no-restart    # 只改不重启
 6. **日常重搜别打大包根的 webhook** —— 它不会排除已做种的片子。走
    `reseed-state.py drive`（已排除 `SEEDING`/`MATCHED`），详见 SUMMARY §11.11。
 
-### 硬链接农场（v3，已实现待启用）—— 把 49 条 `dataDirs` 收成 1 条
+### 硬链接农场（v3，**农场已建好 / 配置待切换**）—— 把 49 条 `dataDirs` 收成 1 条
 
 **它解决什么**：现在 `DATA_DIRS` 是 **49 条**（3 个大包 + DC 的 47 个标签目录），
 每加一个包就要重算一遍路径、同步 `.env`、重建容器。农场把这些归一成**一条**。
@@ -391,20 +391,38 @@ FRDS/MBF 行为完全不变）。
 > searchee **逐条相同**。★ 这是**构造上**的等价 —— 同一个函数作用在同一批首层条目上，
 > 不依赖我们对 depth 规则的建模是否精确（实测 475 条、**零重名**）。
 
-**怎么用**（NAS 上跑，硬链接只能在 NAS 本机建 —— SMB/Windows 建不了）。
-`deploy.sh` 只管容器文件，**不含** `scripts/`，所以先把它拷上去（纯 LF，`sh` 可直接跑）：
+**怎么用**。`deploy.sh` 只管容器文件，**不含** `scripts/`，所以先把它拷到 NAS 的
+compose 目录（纯 LF，`sh` 可直接跑）：
 
 ```bash
 # 本地：拷到 NAS 的 compose 目录
 cp scripts/build-farm.sh "//iSunker-DS423/docker_ssd/prowlarr_cross-seed_autohardlink/"
+```
 
-# NAS 上：
+然后**在 NAS 上跑**（最省事）：
+
+```bash
 cd /volume2/docker_ssd/prowlarr_cross-seed_autohardlink
 sh build-farm.sh                    # 默认 dry-run：只统计预演，一个文件都不建
-sh build-farm.sh --apply            # 真建（增量，已存在的跳过）
+sh build-farm.sh --apply            # 真建（增量：已存在的跳过）
 sh build-farm.sh --apply --prune    # 顺带删掉"源已经没了"的条目
 sh build-farm.sh --verify           # 只校验农场 vs 源
 ```
+
+> ★ **也能直接从 Windows 跑**（走 SMB）—— 2026-09-11 实测：这个 NAS 上
+> `os.link()` / `cp -al` 经 SMB 过来是**服务端真硬链接**（同 inode、`nlink=2`、
+> 删掉原文件后另一个还在）。原先"Windows 建不了硬链接"的说法**是错的**。
+> 此时 `.env` 里的 `/volume1/...` 在本机不存在，用 `--map` 做前缀翻译即可：
+>
+> ```bash
+> COMPOSE_DIR="//iSunker-DS423/docker_ssd/prowlarr_cross-seed_autohardlink" \
+> FARM="//iSunker-DS423/video/download/reseed_farm" \
+> sh scripts/build-farm.sh --map "/volume1=//iSunker-DS423"          # 先 dry-run
+> # 确认 → 同一行末尾加 --apply
+> ```
+>
+> 两种跑法结果完全一样（脚本每次都用探针**自证**硬链接真的建成了，见下）。
+> Windows 跑的代价是逐文件 RPC，475 条用时数分钟。
 
 确认无误后，切换（**与"移除 BTSCHOOL"合并成一次容器重建更省事**）：
 
@@ -517,10 +535,13 @@ python scripts/reseed-state.py drive --pack dc-collection --indexers HDFans,Nany
    **建议与第 4 条合并成一次重建**，省一次中断。
 2. ~~挂 Windows 计划任务~~ ✅ **已完成**（`reseed-drive-loop`，每 15 分钟 `drive-loop.py --once`）。
 3. **换一个站替换 BTSCHOOL**（已在计划中）——加站流程见 SUMMARY §13.3。
-4. v3 **硬链接农场**：构建脚本 `scripts/build-farm.sh` 已写好并**在沙箱里验证通过**
-   （硬链接同 inode / 幂等 / prune 只删该删的 / 期望集为空时拒绝 prune），
-   见上面「扩展 → 硬链接农场」。
-   ⬜ **待你在 NAS 上执行** `sh build-farm.sh`（先 dry-run）→ 确认 → 切换 `DATA_DIRS`。
+4. v3 **硬链接农场**：**农场已建好（475/475）**，但 `.env` 还没切过去 ——
+   **农场建好 ≠ 已生效**，容器不重建 cross-seed 就看不见它。
+   ✅ 构建（从 Windows 经 SMB，`--map` 翻译路径）已完成并通过独立复核：
+   475/475 名字对齐、零重名、抽样 160 个文件全部同 inode 同尺寸（**零数据复制**）；
+   ✅ 原先"Windows/SMB 建不了硬链接"的说法**已实测推翻**（见 SUMMARY §10.5.7）。
+   ⬜ **待你在 NAS 上**把 `DATA_DIRS` 从 49 条切成农场这一条 + `--force-recreate` 容器
+   —— **与第 1 条合并成一次重建**。
 5. 编排器 `status` 子命令（见 SUMMARY §11.9）；IYUU 扩散（本范围外）。
 
 详细的过程记录、踩坑与决策都在 **SUMMARY.md**
