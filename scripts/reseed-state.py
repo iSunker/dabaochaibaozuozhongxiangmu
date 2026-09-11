@@ -44,8 +44,6 @@ import argparse
 import os
 import sys
 import time
-import urllib.parse
-import urllib.request
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -120,39 +118,6 @@ def _scan_pack(nas_roots: list[str], local_roots: list[str], *,
                 break
         out.append((name, nas))
     return out, dups, problems
-
-
-def _qbit_torrents(url: str, category: str, timeout: float = 30.0) -> list[dict]:
-    import json
-    q = urllib.parse.urlencode({"category": category})
-    full = url.rstrip("/") + "/api/v2/torrents/info?" + q
-    req = urllib.request.Request(full, headers={"Referer": url.rstrip("/")})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read().decode("utf-8")) or []
-
-
-def _parse_alias(items: list[str] | None) -> dict[str, str]:
-    """`--indexer-alias 'http://prowlarr:9696/1/api=SiteB'` → {url: name}"""
-    out: dict[str, str] = {}
-    for it in items or []:
-        if "=" in it:
-            k, v = it.split("=", 1)
-            out[k.strip().rstrip("/")] = v.strip()
-    return out
-
-
-def _parse_cadence(spec: str | None) -> dict[str, int]:
-    """`--cadence "SiteA=7,SiteB=30"` → {"SiteA": 7, "SiteB": 30}"""
-    out: dict[str, int] = {}
-    for it in (spec or "").split(","):
-        it = it.strip()
-        if "=" in it:
-            k, v = it.split("=", 1)
-            try:
-                out[k.strip()] = int(float(v.strip()))
-            except ValueError:
-                pass
-    return out
 
 
 def _idx_list(s: str | None) -> list[str]:
@@ -242,7 +207,7 @@ def _sync_now(args, st, *, quiet: bool = False):
     qb = []
     if getattr(args, "qbit_url", None):
         try:
-            qb = _qbit_torrents(args.qbit_url, args.category)
+            qb = S.qbit_torrents(args.qbit_url, args.category)
             if not quiet:
                 _say(f"qB {args.qbit_url} 分类 {args.category!r}：{len(qb)} 个种")
         except Exception as e:  # noqa: BLE001
@@ -253,9 +218,9 @@ def _sync_now(args, st, *, quiet: bool = False):
         log_paths=getattr(args, "log", None) or [],
         qbit_torrents=qb,
         indexers_override=_idx_list(getattr(args, "indexers", None)) or None,
-        indexer_alias=_parse_alias(getattr(args, "indexer_alias", None)),
+        indexer_alias=S.parse_alias(getattr(args, "indexer_alias", None)),
         cadence_days=args.cadence_days,
-        cadence_by_indexer=_parse_cadence(getattr(args, "cadence", None)),
+        cadence_by_indexer=S.parse_cadence(getattr(args, "cadence", None)),
         log_attempts=not getattr(args, "quiet_attempts", False),
     )
 
@@ -349,7 +314,7 @@ def _print_cadence(st, args) -> None:
     idx = _idx_list(getattr(args, "indexers", None))
     tab = st.cadence_table(args.pack, indexers_now=idx,
                            cadence_days=args.cadence_days,
-                           cadence_by_indexer=_parse_cadence(getattr(args, "cadence", None)))
+                           cadence_by_indexer=S.parse_cadence(getattr(args, "cadence", None)))
     if not tab:
         return
     _say("")
@@ -387,7 +352,7 @@ def cmd_report(args) -> int:
         pairs = st.todo_detail(args.pack, indexers_now=idx,
                                include_cooldown=args.include_cooldown,
                                cadence_days=args.cadence_days,
-                               cadence_by_indexer=_parse_cadence(args.cadence))
+                               cadence_by_indexer=S.parse_cadence(args.cadence))
         _say("")
         _say(f"    → 待搜索: {len(pairs)} 部")
         _say(f"       周期: 每站 {args.cadence_days} 天"
@@ -404,40 +369,17 @@ def cmd_report(args) -> int:
     return 0
 
 
-def _apply_batch(pairs, *, limit, batch):
-    """按 --limit / --batch 切出一批。
-
-    返回 (这批, 说明文字)；说明为 None 表示参数有误（调用方应报错退出）。
-
-    顺序由 StateStore.todo() 保证（SKIPPED → ERROR → PENDING → UNMATCHED），
-    所以"取前 N 条"永远先吃掉最该搜的；一批做完后状态会变（被搜过的离开待办），
-    下一批自然接着往下走 —— 因此 **不加 --batch 反复跑同一条命令就能逐批推进**。
-    """
-    total = len(pairs)
-    if not limit:
-        return pairs, f"共 {total} 部待搜（未分批，一次全发）"
-    nbatch = max(1, -(-total // limit))          # 向上取整
-    k = batch or 1
-    if k < 1 or k > nbatch:
-        return None, f"--batch {k} 超出范围：共 {nbatch} 批（每批 {limit}）"
-    lo, hi = (k - 1) * limit, k * limit
-    return pairs[lo:hi], (
-        f"共 {total} 部待搜 → 每批 {limit}，共 {nbatch} 批；"
-        f"本批 = 第 {k} 批（第 {lo + 1}~{min(hi, total)} 部）"
-    )
-
-
 def cmd_todo(args) -> int:
     with S.StateStore(args.db) as st:
         idx = _idx_list(args.indexers)
         pairs = st.todo_detail(args.pack, indexers_now=idx,
                                include_cooldown=args.include_cooldown,
                                cadence_days=args.cadence_days,
-                               cadence_by_indexer=_parse_cadence(args.cadence))
+                               cadence_by_indexer=S.parse_cadence(args.cadence))
         if args.stage:
             want = {s.strip().upper() for s in args.stage.split(",")}
             pairs = [(r, d) for r, d in pairs if r["stage"] in want]
-        pairs, plan = _apply_batch(pairs, limit=args.limit, batch=args.batch)
+        pairs, plan = S.apply_batch(pairs, limit=args.limit, batch=args.batch)
         if pairs is None:
             _note(f"[!!] {plan}")
             return 2
@@ -458,7 +400,7 @@ def cmd_todo(args) -> int:
 def cmd_drive(args) -> int:
     with S.StateStore(args.db) as st:
         idx = _idx_list(args.indexers)
-        cad_by = _parse_cadence(args.cadence)
+        cad_by = S.parse_cadence(args.cadence)
         pairs = st.todo_detail(args.pack, indexers_now=idx,
                                include_cooldown=args.include_cooldown,
                                cadence_days=args.cadence_days,
@@ -467,7 +409,7 @@ def cmd_drive(args) -> int:
             want = {s.strip().upper() for s in args.stage.split(",")}
             pairs = [(r, d) for r, d in pairs if r["stage"] in want]
         total_all = len(pairs)
-        pairs, plan = _apply_batch(pairs, limit=args.limit, batch=args.batch)
+        pairs, plan = S.apply_batch(pairs, limit=args.limit, batch=args.batch)
         if pairs is None:
             _say(f"[!!] {plan}")
             return 2

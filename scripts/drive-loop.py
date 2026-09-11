@@ -40,6 +40,7 @@ import subprocess
 import sys
 import time
 from datetime import datetime
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -52,36 +53,6 @@ LOG = logging.getLogger("drive-loop")
 
 # sidecar 状态库默认位置（与 reseed-state.py 的 DEFAULT_DB 保持一致）
 DEFAULT_DB = os.environ.get("RESEED_STATE_DB", str(ROOT / "hlink" / "state.db"))
-
-
-def parse_cadence(spec: str | None) -> dict[str, int]:
-    """`--cadence "SiteA=7,SiteB=30"` → {"SiteA": 7, "SiteB": 30}（内联自 reseed-state.py）"""
-    out: dict[str, int] = {}
-    for it in (spec or "").split(","):
-        it = it.strip()
-        if "=" in it:
-            k, v = it.split("=", 1)
-            try:
-                out[k.strip()] = int(float(v.strip()))
-            except ValueError:
-                pass
-    return out
-
-
-def apply_batch(pairs, *, limit, batch):
-    """按 --limit / --batch 切出一批（内联自 reseed-state.py：顺序由 todo() 保证）。"""
-    total = len(pairs)
-    if not limit:
-        return pairs, f"共 {total} 部待搜（未分批，一次全发）"
-    nbatch = max(1, -(-total // limit))          # 向上取整
-    k = batch or 1
-    if k < 1 or k > nbatch:
-        return None, f"--batch {k} 超出范围：共 {nbatch} 批（每批 {limit}）"
-    lo, hi = (k - 1) * limit, k * limit
-    return pairs[lo:hi], (
-        f"共 {total} 部待搜 → 每批 {limit}，共 {nbatch} 批；"
-        f"本批 = 第 {k} 批（第 {lo + 1}~{min(hi, total)} 部）"
-    )
 
 
 # --------------------------------------------------------------------------- #
@@ -114,6 +85,57 @@ def next_sleep(stats: S.DriveStats) -> tuple[float, str]:
 
 
 # --------------------------------------------------------------------------- #
+# 「出声」机制 —— 无人值守最怕的是**无声停摆**
+# --------------------------------------------------------------------------- #
+# 站点持续 502 时 next_sleep 只会给它 3 小时休息，然后接着试、接着失败。
+# 跑一晚上没人知道。所以连续失败要跨过阈值就大声喊；全部干完也要喊一声。
+ABORT_ALERT_AFTER = 3
+
+
+def update_abort_streak(prev: int, stats: S.DriveStats | None, *,
+                        failed: bool = False) -> int:
+    """维护"连续失败批数"。
+
+    算失败：提前中止（`stats.aborted`）、整批异常（`failed=True`）。
+    正常跑完（含"本包无待搜"）清零。
+    """
+    aborted = failed or bool(stats is not None and stats.aborted)
+    if not aborted:
+        return 0
+    n = prev + 1
+    reason = stats.aborted if (stats is not None and stats.aborted) else "整批异常"
+    if n < ABORT_ALERT_AFTER:
+        LOG.warning("连续第 %d 批失败（%s）", n, reason)
+        return n
+    LOG.warning("!" * 62)
+    LOG.warning("⚠ 已连续 %d 批失败（最近：%s）", n, reason)
+    LOG.warning("  无人值守下这通常意味着两种可能：")
+    LOG.warning("   ① 站点持续 502 / 限流（看 Prowlarr 里各站状态）")
+    LOG.warning("   ② .env 改了但没 force-recreate（容器里还是旧配置，见 SUMMARY §13.6）")
+    LOG.warning("  请人工看一眼 cross-seed 日志与 Prowlarr。")
+    LOG.warning("!" * 62)
+    return n
+
+
+def alert_if_all_done(packs: list[str], db: str) -> bool:
+    """所有包都没有待搜项 → 大声报告"干完了"（否则循环静默退出，没人知道）。"""
+    st = S.StateStore(db)
+    try:
+        remaining = sum(1 for p in packs
+                        for r in st.movies(p) if r["stage"] not in S.DONE_STAGES)
+    finally:
+        st.con.close()
+    if remaining:
+        return False
+    LOG.warning("=" * 62)
+    LOG.warning("🎉 所有包均无待搜项 —— 自动循环已无事可做。")
+    LOG.warning("   计划任务可保留（新片/新站接入后会自动变回待搜），")
+    LOG.warning("   或手动停掉：schtasks /Delete /TN \"reseed-drive-loop\" /F")
+    LOG.warning("=" * 62)
+    return True
+
+
+# --------------------------------------------------------------------------- #
 # 读 .env 里的 CROSSSEED_API_KEY（避免 key 出现在命令行/聊天）
 # --------------------------------------------------------------------------- #
 def read_key_from_env(env_path: Path) -> str | None:
@@ -121,32 +143,6 @@ def read_key_from_env(env_path: Path) -> str | None:
         if ln.startswith("CROSSSEED_API_KEY="):
             return ln.split("=", 1)[1].strip()
     return None
-
-
-def qbit_torrents(url: str, category: str, timeout: float = 30.0) -> list[dict]:
-    """取 qB 某分类的全部种子（内联自 reseed-state.py）。失败返回 []，不中断循环。"""
-    import json
-    import urllib.parse
-    import urllib.request
-    try:
-        q = urllib.parse.urlencode({"category": category})
-        full = url.rstrip("/") + "/api/v2/torrents/info?" + q
-        req = urllib.request.Request(full, headers={"Referer": url.rstrip("/")})
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return json.loads(r.read().decode("utf-8")) or []
-    except Exception as e:  # noqa: BLE001 —— qB 挂了不该让循环死
-        LOG.warning("取 qB 列表失败（忽略）: %s", e)
-        return []
-
-
-def parse_alias(items: list[str] | None) -> dict[str, str]:
-    """`--indexer-alias 'http://prowlarr:9696/1/api=SiteB'` → {url: name}（内联）。"""
-    out: dict[str, str] = {}
-    for it in items or []:
-        if "=" in it:
-            k, v = it.split("=", 1)
-            out[k.strip().rstrip("/")] = v.strip()
-    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -164,12 +160,12 @@ def run_round(pack: str, args, api_key: str) -> S.DriveStats | None:
         pairs = st.todo_detail(pack, indexers_now=idx,
                                include_cooldown=args.include_cooldown,
                                cadence_days=args.cadence_days,
-                               cadence_by_indexer=parse_cadence(args.cadence))
+                               cadence_by_indexer=S.parse_cadence(args.cadence))
         seeding_before = sum(1 for r in st.movies(pack) if r["stage"] == S.STAGE_SEEDING)
     finally:
         st.con.close()
 
-    pairs, plan = apply_batch(pairs, limit=args.limit, batch=args.batch)
+    pairs, plan = S.apply_batch(pairs, limit=args.limit, batch=args.batch)
     if pairs is None:
         LOG.warning("[%s] %s", pack, plan)
         return None
@@ -196,7 +192,13 @@ def run_round(pack: str, args, api_key: str) -> S.DriveStats | None:
     if args.log:
         S.wait_for_log_quiet(args.log[0], quiet_sec=args.settle,
                              max_wait=args.drain_max_wait)
-    qb = qbit_torrents(args.qbit_url, args.category) if args.qbit_url else []
+    # qB 挂了不该让整批死 —— 少一个数据源而已（代价：推不出 SEEDING，会被降级）
+    qb: list[dict] = []
+    if args.qbit_url:
+        try:
+            qb = S.qbit_torrents(args.qbit_url, args.category)
+        except Exception as e:  # noqa: BLE001
+            LOG.warning("取 qB 列表失败（忽略）: %s", e)
     st = S.StateStore(args.db)
     try:
         rep = S.sync_pack(
@@ -206,9 +208,9 @@ def run_round(pack: str, args, api_key: str) -> S.DriveStats | None:
             qbit_torrents=qb,
             indexers_override=[i.strip() for i in (args.indexers or "").split(",")
                                if i.strip()] or None,
-            indexer_alias=parse_alias(args.indexer_alias),
+            indexer_alias=S.parse_alias(args.indexer_alias),
             cadence_days=args.cadence_days,
-            cadence_by_indexer=parse_cadence(args.cadence),
+            cadence_by_indexer=S.parse_cadence(args.cadence),
         )
         stats.resync = rep
         stats.still_skipped = sum(1 for r in st.movies(pack)
@@ -308,16 +310,26 @@ def once_round(packs: list[str], args, api_key: str, min_sleep: float) -> int:
     pack = packs[idx]
     write_state({**st, "running_pid": os.getpid()})
     LOG.info("[--once] 跑包 %s（第 %d/%d 个）", pack, idx + 1, len(packs))
+
+    stats = None
+    rc = 0
+    failed = False
     try:
         stats = run_round(pack, args, api_key)
         log_result(pack, stats)
-    except Exception as e:  # noqa: BLE001 —— 单批异常也要正确收尾状态
+        if stats is None:
+            # 这个包没待搜 —— 看看是不是所有包都干完了（无人值守时必须出声）
+            alert_if_all_done(packs, args.db)
+    except Exception:  # noqa: BLE001 —— 单批异常也要正确收尾状态
         LOG.exception("[%s] 本批异常", pack)
-        return 1
+        failed, rc = True, 1
     finally:
-        write_state({"running_pid": None, "last_end_ts": time.time(), "last_pack_idx": idx})
+        # 连续失败计数跨进程持久化（无人值守下没人盯着，只能靠日志喊）
+        streak = update_abort_streak(int(st.get("consec_abort") or 0), stats, failed=failed)
+        write_state({"running_pid": None, "last_end_ts": time.time(),
+                     "last_pack_idx": idx, "consec_abort": streak})
     LOG.info("--once 完成。")
-    return 0
+    return rc
 
 
 def main() -> int:
@@ -360,7 +372,11 @@ def main() -> int:
         format="%(asctime)s [%(levelname)s] %(message)s",
         handlers=[
             logging.StreamHandler(),
-            logging.FileHandler(str(HERE / "drive-loop.log"), encoding="utf-8"),
+            # ★必须轮转：无人值守会跑几个月，FileHandler 只追加会涨到几百 MB
+            RotatingFileHandler(
+                str(HERE / "drive-loop.log"),
+                maxBytes=5_000_000, backupCount=5, encoding="utf-8",
+            ),
         ],
     )
 
@@ -403,6 +419,7 @@ def main() -> int:
     round_no = 0
     # 包轮流：记录上次跑到哪个包，下次从下一个开始
     cur_pack_idx = 0
+    consec_abort = 0     # 连续失败批数（跨过阈值就大声报警）
     while args.max_rounds == 0 or round_no < args.max_rounds:
         pack = packs[cur_pack_idx % len(packs)]
         round_no += 1
@@ -414,8 +431,8 @@ def main() -> int:
             pairs = st.todo_detail(pack, indexers_now=idx,
                                    include_cooldown=args.include_cooldown,
                                    cadence_days=args.cadence_days,
-                                   cadence_by_indexer=parse_cadence(args.cadence))
-            pairs, plan = apply_batch(pairs, limit=args.limit, batch=args.batch)
+                                   cadence_by_indexer=S.parse_cadence(args.cadence))
+            pairs, plan = S.apply_batch(pairs, limit=args.limit, batch=args.batch)
             LOG.info("[%s] %s", pack, plan)
             st.con.close()
             if args.once:
@@ -431,6 +448,7 @@ def main() -> int:
             stats = run_round(pack, args, api_key)
         except Exception as e:  # noqa: BLE001 —— 循环不能因单批异常而死
             LOG.exception("[%s] 本批异常（继续循环）", pack)
+            consec_abort = update_abort_streak(consec_abort, None, failed=True)
             if args.once:
                 return 1
             time.sleep(BACKOFF_SLEEP)
@@ -439,16 +457,11 @@ def main() -> int:
 
         if stats is None:
             LOG.info("[%s] 本批无动作（没待搜或计划为空），跳过该包", pack)
+            consec_abort = update_abort_streak(consec_abort, None)   # 正常，清零
             # 全部包都没待搜 → 全部完成，退出
             cur_pack_idx += 1
             if cur_pack_idx % len(packs) == 0:
-                remaining = 0
-                st = S.StateStore(args.db)
-                for p in packs:
-                    remaining += sum(1 for r in st.movies(p) if r["stage"] not in S.DONE_STAGES)
-                st.con.close()
-                if remaining == 0:
-                    LOG.info("=== 所有包均无待搜项，任务完成，退出 ===")
+                if alert_if_all_done(packs, args.db):
                     return 0
             if args.once:
                 return 0
@@ -456,6 +469,7 @@ def main() -> int:
             continue
 
         sleep_sec, reason = next_sleep(stats)
+        consec_abort = update_abort_streak(consec_abort, stats)
         LOG.info("[第 %d 轮] %s | 原因：%s | 下次间隔 %.0f 分钟",
                  round_no, stats.render().splitlines()[0] if stats else "?",
                  reason, sleep_sec / 60)

@@ -1586,3 +1586,71 @@ def wait_for_log_quiet(log_path: str | Path, *, quiet_sec: float = 90.0,
             on_event("timeout", f"等了 {max_wait / 60:.0f} 分钟仍未静默，先继续")
             return "timeout"
         sleep(poll)
+
+
+# --------------------------------------------------------------------------- #
+# 共用小工具
+# --------------------------------------------------------------------------- #
+# 这几个原本在 scripts/reseed-state.py 里（私有 `_xxx`），drive-loop.py 又各复制了
+# 一份公开版 —— 两份实现"改一个忘一个"就会静默算错数。集中到这里，两边都 import。
+def qbit_torrents(url: str, category: str, timeout: float = 30.0) -> list[dict]:
+    """取 qB 某分类的全部种子。
+
+    **失败会抛异常** —— 由调用方决定是忽略（无人值守的循环，宁可少一个数据源
+    也不要整批挂掉）还是中止（诊断脚本，想知道 qB 是不是真的不通）。
+    """
+    import urllib.parse
+    import urllib.request
+
+    q = urllib.parse.urlencode({"category": category})
+    full = url.rstrip("/") + "/api/v2/torrents/info?" + q
+    req = urllib.request.Request(full, headers={"Referer": url.rstrip("/")})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8")) or []
+
+
+def parse_alias(items: list[str] | None) -> dict[str, str]:
+    """`--indexer-alias 'http://prowlarr:9696/1/api=SiteB'` → {url: name}"""
+    out: dict[str, str] = {}
+    for it in items or []:
+        if "=" in it:
+            k, v = it.split("=", 1)
+            out[k.strip().rstrip("/")] = v.strip()
+    return out
+
+
+def parse_cadence(spec: str | None) -> dict[str, int]:
+    """`--cadence "SiteA=7,SiteB=30"` → {"SiteA": 7, "SiteB": 30}"""
+    out: dict[str, int] = {}
+    for it in (spec or "").split(","):
+        it = it.strip()
+        if "=" in it:
+            k, v = it.split("=", 1)
+            try:
+                out[k.strip()] = int(float(v.strip()))
+            except ValueError:
+                pass
+    return out
+
+
+def apply_batch(pairs, *, limit, batch):
+    """按 --limit / --batch 切出一批。
+
+    返回 (这批, 说明文字)；说明为 None 表示参数有误（调用方应报错退出）。
+
+    顺序由 StateStore.todo() 保证（SKIPPED → ERROR → PENDING → UNMATCHED），
+    所以"取前 N 条"永远先吃掉最该搜的；一批做完后状态会变（被搜过的离开待办），
+    下一批自然接着往下走 —— 因此 **不加 --batch 反复跑同一条命令就能逐批推进**。
+    """
+    total = len(pairs)
+    if not limit:
+        return pairs, f"共 {total} 部待搜（未分批，一次全发）"
+    nbatch = max(1, -(-total // limit))          # 向上取整
+    k = batch or 1
+    if k < 1 or k > nbatch:
+        return None, f"--batch {k} 超出范围：共 {nbatch} 批（每批 {limit}）"
+    lo, hi = (k - 1) * limit, k * limit
+    return pairs[lo:hi], (
+        f"共 {total} 部待搜 → 每批 {limit}，共 {nbatch} 批；"
+        f"本批 = 第 {k} 批（第 {lo + 1}~{min(hi, total)} 部）"
+    )
