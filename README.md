@@ -33,6 +33,9 @@
 | 我卡住了（报错 / 搜不到 / 不动了） | **常见问题** + **交接必读的坑** |
 | 加站 / 换站 | **多站点** → SUMMARY §13.3（完整流程，可复用） |
 | 让它出事了主动通知我 | **通知 / 告警（NAS 侧发信）** |
+| **下一步该做什么** | **当前状态与下一步** 的「🔴 下一步（按优先级）」 |
+| 下一步还能自动化什么 | **还没做** 第 7 条 → **SUMMARY §16**（四条预案 + **两条前提被推翻**） |
+| 状态机说没做种、qB 里明明在做种 | **常见问题** 最后两条 → **SUMMARY §17.3** |
 | 接手这个项目 | **当前状态与下一步** → **SUMMARY §13**（全过程 + 坑单）→ **§13.11**（最新进度与唯一待办） |
 
 > **两份文档怎么分工**（照日志分级来）：
@@ -164,6 +167,24 @@ docker compose run --rm reseed-orchestrator status                          # �
   先去 Prowlarr 看这站还在不在、是否被禁用 —— 多半又是「`.env` 删了站但容器没重建」
   （见上面「交接必读的坑」），重建即可。SUMMARY §13.11 记了这个标签曾经写错的 bug。
 - **`:3060` API 403**：白名单网段没覆盖来源 IP（改 `WebUI\AuthSubnetWhitelist`），或应改用 `QBIT_AUTH_MODE=password`。
+- **`drive-loop` 回灌打出 `新增做种 -26`（负数）/ qB 里明明在做种，状态机却写 `MATCHED` 或 `UNMATCHED`**：
+  状态机的 `SEEDING` 是**推导**出来的 —— `seeding_count = |matched_hashes ∩ qB 的 hash|`
+  （`orchestrator/state.py:963`）。**`matched_hashes` 一空，stage 就必然降级**，跟 qB 通不通无关。
+  **先别怀疑 qB**，直接两边数一下对照：
+  ```bash
+  curl -s "http://NAS_IP:3060/api/v2/torrents/info?category=reseed-singles" \
+    | python -c "import sys,json;print('qB 在做种:',len(json.load(sys.stdin)))"
+  python -c "
+  import sqlite3;c=sqlite3.connect(r'//YOUR-NAS/.../drive-loop/hlink/state.db')
+  print('状态机认的:', c.execute('SELECT COUNT(*) FROM movie WHERE seeding_count>0').fetchone()[0])"
+  ```
+  ★ **补救（幂等、不发任何站点请求）**：补跑一次带 `--qbit-url` 的 `sync`。
+  ⚠ 2026-09-12 实测过一次 **qB 160 / 状态机 13**，而且 `attempts.log` 与 cross-seed 日志
+  全都正常 —— 排查过程、已排除的可能（cross-seed 季包不搜单集是**正常行为**）与未解项见 **SUMMARY §17.3**。
+- **`attempts.log` 里出现 `exit=127 (no python: /usr/bin/python3)`，但同一批的 python 明明跑完了**：
+  **那是假象** —— `deploy.sh` 曾在脚本**运行中**覆盖它（`sh` 边读边执行，会从旧偏移读到新内容）。
+  `deploy.sh` 已改成**原子替换**（写 `.new` 再 `mv`，换 inode），并在检测到批次在跑时给出告警。
+  判据：**同一次 `start` 没有配对的 `exit`** 时，先怀疑"脚本被换过"，别急着信那个退出码。详见 **SUMMARY §17.2**。
 
 ---
 
@@ -202,6 +223,9 @@ docker compose run --rm reseed-orchestrator status                          # �
 
 **对站点友好**：`delay` 保持 30~45；Prowlarr 每个站的 **Query Limit 只当保险丝**（设成明显高于实际用量的值，如 1000/天），
 不要拿它当节流阀。加站**不会**增加单个站的查询量 —— 一次搜索由 Prowlarr 分发到各站各一次。
+
+> ★ 「定期人工看额度」这件事**能自动化到什么程度、哪里是天花板**（站点真实余额
+> Prowlarr 根本不知道），见 **SUMMARY §16.1**。
 
 > **怎么判断某个站要不要 FlareSolverr**：在 Prowlarr 里手动搜一下。
 > 看到 `403` + 挑战页 HTML / 日志里出现 `Cloudflare` → 需要；
@@ -415,6 +439,12 @@ sh build-farm.sh --apply --prune    # 顺带删掉"源已经没了"的条目
 sh build-farm.sh --verify           # 只校验农场 vs 源
 ```
 
+> ⚠ **`--verify` 在 `DATA_DIRS` 切到农场之后会失效**（2026-09-12 发现，**尚未修**）：
+> 它取「期望集」的方式是**从 `.env` 的 `DATA_DIRS` 派生**（脚本第 108 行），
+> 而 v3 的全部意义正是把 `DATA_DIRS` 改成农场这一条 —— 于是它**拿农场校验农场，永远 PASS**。
+> ★ 在修好之前**别把它挂成定期巡检**：它会每天如期报「一切正常」，实际什么都没检查。
+> 修法（新增 `FARM_SOURCES` 等三个方案）与前置条件见 **SUMMARY §16.2.1**。
+
 > ★ **也能直接从 Windows 跑**（走 SMB）—— 2026-09-11 实测：这个 NAS 上
 > `os.link()` / `cp -al` 经 SMB 过来是**服务端真硬链接**（同 inode、`nlink=2`、
 > 删掉原文件后另一个还在）。原先"Windows 建不了硬链接"的说法**是错的**。
@@ -496,39 +526,100 @@ spool 积压: 0 条告警
 
 ### NAS 侧一次性配置
 
-1. **DSM → 控制面板 → 通知 → 电子邮件**：必须是「**自定义 SMTP 服务器 + 应用专用密码**」。
-   ⚠ 用 Gmail「登录(OAuth)」方式配的拿不到可用凭据，脚本这条路**不通**，先改过来。
+1. **DSM → 控制面板 → 通知 → 电子邮件**：勾「**启用电子邮件通知**」，用
+   「**自定义 SMTP 服务器 + 应用专用密码**」填好并存盘。
+   ✅ **2026-09-12 实测已通** —— 配好之后脚本这边不需要再做任何事。
+   ★★ **别去看 `/etc/ssmtp/ssmtp.conf`**：DSM **改过** ssmtp 的配置路径，它实际读的是
+   `/usr/syno/etc/synosmtp.conf`。前者在本机是个 **0 字节空壳**，
+   **邮件天天正常送达时它照样是 0 字节** —— 从它推断"邮件没配"必然出错
+   （我这么错过一次，详见 SUMMARY §15）。那个文件里的密码还是**加密**存的
+   （`eventpasscrypted`），所以「读 DSM 配置、自己发信」这条路也不存在。
 2. 把 NAS 侧脚本同步过去 —— **已在 `deploy.sh` 白名单里**，一条命令：
    ```bash
    DST=//YOUR-NAS/docker_ssd/prowlarr_cross-seed_autohardlink bash deploy.sh          # 先看 diff
    DST=//YOUR-NAS/docker_ssd/prowlarr_cross-seed_autohardlink bash deploy.sh --apply   # 写入
    ```
+   > ⚠ **别在批次运行中 `--apply`**（2026-09-12 踩过）：`sh` 是**边读边执行**脚本的，
+   > 覆盖正在跑的 `run.sh` 会让它执行到错位的代码 —— `deploy.sh` 现在改成**原子替换**
+   > （写 `.new` 再 `mv`，换 inode，老进程继续读旧内容），并会在**检测到心跳新鲜**时给出告警。
+   > 但它不会拦你：那批会继续用旧脚本跑完。详见 **SUMMARY §17.2**。
+   >
+   > ⚠ 想拿临时目录演练（`DST=/tmp/x bash deploy.sh --apply`）之前请确认脚本是新的 ——
+   > 旧版本的 `DST=` 会被 `scripts/.nasrc` **静默覆盖**，演练会**打到生产**。已修（§17.4.1）。
+   > 现在规则是：**命令行 > `.nasrc`**。
+
    然后在 NAS 上填配置：
    ```bash
    cd /volume2/docker_ssd/prowlarr_cross-seed_autohardlink/notify
-   cp notify.conf.example notify.conf && vi notify.conf     # 至少填 MAIL_TO
+   cp notify.conf.example notify.conf && vi notify.conf
+   #   MAIL_TO   = 你的收件邮箱
+   #   MAIL_FROM = ★ 必须与 DSM 里那个**认证账号完全相同**（逐字相同，包括域名）
+   #               QQ/163/Gmail 都要求「信封发件人 == 认证账号」，不一致就会得到：
+   #                 ssmtp: 501 Mail from address must be same as authorization user.
+   #               ★ 这条 501 是**服务器回的**，说明连接和认证都成功了，只差发件人。
+   #               留空也行（交给 ssmtp 用它自己配置里的默认发件人）。
    ```
    ★ `notify.conf`（含你的收件人邮箱）**不在白名单里**，`deploy.sh` 永远动不到它 ——
    和白名单"绝不覆盖生产独有内容"的原则一致（`.env` / `prowlarr/` 同理）。
    （不想用 `deploy.sh` 就手工拷这两个文件。）
 3. **先验证，再挂任务**：
    ```bash
-   sh notify-spool.sh --selftest     # 探测到什么、缺什么（不打密码，只打键名）
-   sh notify-spool.sh --test-mail    # 真发一封
+   sh notify-spool.sh --selftest     # 探测发信方式 / 配置 / 目录（**不判断**邮件配置对不对）
+   sh notify-spool.sh --test-mail    # ★ 唯一的判据：真发一封
    ```
-4. **DSM 任务计划**建两个任务，**用户都选 `root`**（`/etc/ssmtp/ssmtp.conf` 通常只有 root 能读），
-   且**都勾上「发送运行详情」**：
+4. **DSM 任务计划**建**三个**任务，**用户都选 `root`**（要读 `.env` / spool，还要发信）：
 
-   | 任务 | 计划 | 脚本 |
-   |---|---|---|
-   | 排空 spool | 每 5 分钟 | `sh <路径>/notify-spool.sh` |
-   | 每日摘要 | 每天 21:00 | `sh <路径>/notify-spool.sh --digest` |
+   | 任务 | 计划 | 脚本 | 发送运行详情 |
+   |---|---|---|---|
+   | 排空 spool | 每 5 分钟 | `sh <路径>/notify-spool.sh` | **不要勾** |
+   | 每日摘要 | 每天 21:00 | `sh <路径>/notify-spool.sh --digest` | **不要勾** |
+   | 驱动跑批 | 每 15 分钟 | `sh <路径>/drive-loop/run.sh` | **不要勾** |
 
-> 「发送运行详情」会把脚本的 stdout/stderr 寄给你 —— **SSH 关着时，这是我们唯一能看见
-> NAS 上报错的通道**（实测 SSH 22 端口 Connection refused）。
+> ⚠ **三个都不要勾「发送运行详情」**：排空任务每 5 分钟一趟 = **一天 288 封**，
+> 驱动任务一天 96 封 —— 那不是告警，是骚扰。结果一定是你去建一条
+> 「来自 NAS 的邮件」过滤规则，**连真正的告警一起过滤掉**。
+>
+> 勾了的唯一好处是"能收到失败邮件"；但失败信号在下面这些文件里**更全**
+> （还带退出码和时间线）。装上后想确认 DSM 失败时会不会发信，
+> 把任务脚本临时改成 `sh /nonexistent` 手动跑一次就知道了。
+>
+> **运行详情不用靠邮件看**（SSH 关着也不再是障碍，这些文件经 SMB 直接可读）：
+> - `<路径>/drive-loop/attempts.log` —— 每轮的起跑时间 + 退出码。四个信号分得很清：
+>   没有 start 行 = 任务压根没被触发；**有 start 无 exit = 先别下结论**，
+>   最常见的是**批次还在跑**（50 部 × `--interval 30s` ≈ 25 分钟起步，
+>   再加回灌前的 `--settle 90s`），其次才是进程树被强杀；exit≠0 = 它自己出错了。
+>   ★ 判活**别用** `ps | grep drive-loop.py` —— BusyBox 的 `ps` 只显示 `comm`
+>   （也就是 `python3`），**看不到命令行参数**，怎么 grep 都是空的。
+>   用 `pgrep -f drive-loop.py`，或看 `drive-loop/scripts/.drive-loop.state`
+>   里的 `heartbeat_ts` 在不在涨（批次运行期间每 60s 刷一次）。
+> - `<路径>/drive-loop/scripts/drive-loop.log` —— 完整日志（自轮转，5MB × 6）。
+> - `<路径>/notify/log/` —— 发信记录。
+>
+> 真正**该**打扰你的东西（连续 3 批失败、`.env` 没生效、索引器拉不到名字）
+> 由 notify 走**它自己的 SMTP 通道**发信 —— 那条路才是告警路径，
+> 和 DSM 的任务邮件完全是两回事。
 
-> ★ 实测这台 NAS（DSM 7.2 / 423+）**一个发信程序都没有**（ssmtp/sendmail/msmtp/mail 全 MISS），
-> 但 `/usr/bin/python3` 在 —— 所以脚本走 `python3 + smtplib` 读同一个 `/etc/ssmtp/ssmtp.conf`。
+> ★ 实测这台 NAS（DSM 7.2 / 423+）发信走的是 **`/usr/bin/ssmtp`** —— 它存在，
+> 而且**真的能把信发出去**（2026-09-12 实测收到）。脚本按
+> `ssmtp → sendmail → msmtp → mail → python3+smtplib` 的顺序探测，本机命中第一个。
+> （早先这里写着"一个发信程序都没有"，那是只查了 sendmail/msmtp 的误判，已纠正。）
+>
+> ★★ **同一个 `python3` 也是 drive-loop 的解释器** —— 于是它成了整条链路的
+> 单点依赖：版本是 **3.8.15**（DSM 自带，Package Center 里没有更新的）。
+> ✅ **2026-09-11 23:27 已在 NAS 上实测通过**（`sh drive-loop/run.sh --dry-run`
+> → `attempts.log` 记到 `start py=/usr/bin/python3` + `exit=0`；
+> 旁边生成了 `__pycache__/*.cpython-38.pyc`，版本由此坐实）。
+> 这就是 `scripts/drive-loop.py` 顶部那行 `from __future__ import annotations`
+> **不能删**的原因：本文件通篇用 `str | None` / `list[str]`，在 <3.10 上会在
+> **函数定义时**当场求值并抛 `TypeError`（不是等到调用），而且崩在 `logging`
+> 配置之前 —— **连一行日志都留不下**，表现就是「任务跑了，什么都没发生」。
+> `state.py` / `notify.py` / `reseed-state.py` 早就带这行，drive-loop 是补的。
+>
+> 万一那台 NAS 的 python3 版本对不上（或 DS 升级后换了），症状同样会是「静默」，
+> 所以 `run.sh` 在 shell 这一层另记了一份 `attempts.log`（见上）。
+> 后备方案：把 `run.sh` 里的 `PY=` 指到一个 Docker 一次性容器
+> （`docker run --rm -v ... python:3.12-slim python3 ...`），
+> 或换 Entware 的 `python3`（`opkg install python3`，3.11+）。
 > 你的 NAS 未必一样：`--selftest` 会打印实际探测结果。
 
 ### Windows 侧开关
@@ -558,35 +649,56 @@ python scripts/drive-loop.py --once --notify-spool "D:/tmp/x"    # 换个 spool
 
 ---
 
-## 当前状态与下一步（2026-09-11 晚）
+## 当前状态与下一步（2026-09-12 凌晨）
 
 > 本节是**操作入口**：怎么继续跑 / 卡住了看哪。
-> 完整状态数据与逐项快照只维护在 **SUMMARY §13.7**，避免两处漂移。
+> 完整状态数据与逐项快照只维护在 **SUMMARY §13.7 / §15.6 / §17**，避免两处漂移。
 
 ### 系统现状（一句话）
 
+**调度**：✅ **已完全迁到 NAS** —— DSM 三个任务已建，**2026-09-12 00:17 首次由计划任务自动跑完一批**
+（23:51 那批，26 分钟，`成功 50 / 失败 0`），跨进程节流与 60s 心跳都正常。见下「把调度挂到 NAS 上」·
+**通知**：✅ **端到端打通并实测收到邮件**（`--test-mail` → QQ 收件箱；批次通知也真的写进 spool 并被取走）·
 **生产 NAS 磁盘上的 `.env`**：`DATA_DIRS` ✅ 49 条 · `TORZNAB_URLS` ✅ **2 条**（HDFans `/2` + NanyangPT `/4`）·
 **跑着的容器**：⚠ `DATA_DIRS` 仍是 49 条、`TORZNAB_URLS` 里还留着已删的 `/3`（BTSCHOOL）——
 两者都只差**一次 `--force-recreate`**（见下面「收尾命令」）。
 索引器 HDFans ✅ / NanyangPT ✅ · 状态机 `hlink/state.db` ✅ 605 部 ·
-农场 `/volume1/video/download/reseed_farm` ✅ **已建好 475/475**（本地 `.env` 已切，生产未切）·
-新脚本 `add-indexers.py`（加站）、`drive-loop.py`（自动续跑）、`build-farm.sh`（建农场）·
-**通知**：Windows 侧 ✅ 已接好（`notify.py`），NAS 侧 ⬜ **脚本已写好并本地验证，还没部署**。见下面「通知」。
+农场 `/volume1/video/download/reseed_farm` ✅ **已建好 475/475**（本地 `.env` 已切，生产未切）。
 
 > ★ **磁盘 vs 容器**是本项目头号复发坑：`.env` 改了不会自动生效，
 > 必须 `up -d --force-recreate`（`restart` **不重新注入环境变量**）。
 > `drive-loop.py` 的「索引器自检」（⑧）会在启动时扫日志自动喊出来，见 SUMMARY §13.10。
 
-### 三个包
+### 🔴 下一步（按优先级，2026-09-12 凌晨排）
 
-| 包 | 单片 | 待搜 | 阶段分布 |
+| 优先 | 做什么 | 为什么 | 详见 |
 |---|---|---|---|
-| FRDS | 486 | **~410** | PENDING 331 / UNMATCHED 79 / **SEEDING 76** |
-| DC | 115 | **~96** | PENDING 45 / UNMATCHED 51 / **SEEDING 19** |
-| MBF | 4 | 0 | ⚠ UNMATCHED 4 |
+| **1** | **修「状态机把在做种的片子降级」** —— 先补跑一次带 `--qbit-url` 的 `sync`（**幂等**，看 `SEEDING` 能否回到 ~160）；再查 `blocking_backoffs` 为什么不认 `RATE_LIMITED` | qB 里 **160** 部在做种，状态机只认 **13** 部 → 过重搜周期会被**重复搜、白烧站点额度**（额度是本项目最高优先） | §17.3 |
+| **2** | **给四个容器加 `logging:` 上限** | 全走默认 `json-file`，**没有任何上限**；`/volume1` 只剩 ~20 GB | §16.4.2 |
+| **3** | **一次 `--force-recreate` 同时办完两件事**（清掉容器里的 `/3/api`、`DATA_DIRS` 切农场） | 「收尾命令」已全部备好，只差执行。⚠ **会打断正在跑的 drive，务必等批次跑完** | 本节的「收尾命令」 |
+| **4** | **换一个站替换 BTSCHOOL** | 加站流程已沉淀成可复用步骤 | §13.3 |
+| **5** | 四个新功能（额度感知 / 农场巡检 / 趋势 / 日志轮转） | ⬜ **只写了设计，均未实现**；其中**两条的前提被探针推翻** | §16 |
+| — | **人工**：删掉 Windows 计划任务 `reseed-drive-loop`（现在只是 `/DISABLE`，**没删**） | 两边同时驱动会打出成片 429 | §14.6 |
 
-> **⚠ MBF 已实测：HDFans 上 0 匹配**（4 个季包全 `Found 0 torrents`）。
-> 状态已是 `UNMATCHED`，加新站后会自动解锁、**不会重复浪费额度**。
+### 三个包（**数字会变，别信写死的**）
+
+阶段分布**一律以状态库为准** —— 下面这张静态快照在 2026-09-12 已实测**过期**，不再维护：
+
+| 包 | 单片 | 结构 |
+|---|---|---|
+| `frds-top250-2024` | 486 | ✅ 根目录子目录即发布名 |
+| `dc-collection` | 115 | ⚠ 根下多一层中文标签，见「多包支持 → 嵌套结构」 |
+| `mbf` | 4 | ⚠ HDFans 上 **0 匹配**（4 个季包全 `Found 0 torrents`） |
+
+```bash
+DB="//YOUR-NAS/docker_ssd/prowlarr_cross-seed_autohardlink/drive-loop/hlink/state.db"
+python -c "
+import sqlite3; c=sqlite3.connect(r'$DB')
+for r in c.execute('SELECT pack,stage,COUNT(*) FROM movie GROUP BY pack,stage ORDER BY pack,stage'): print(r)"
+python scripts/reseed-state.py report --pack frds-top250-2024    # 带按站重搜周期表
+```
+
+> **⚠ MBF**：HDFans 上已实测 0 匹配。状态已是 `UNMATCHED`，加新站后会自动解锁、**不会重复浪费额度**。
 
 ### 怎么继续跑（两种方式）
 
@@ -600,14 +712,81 @@ python scripts/drive-loop.py --once --indexers HDFans,NanyangPT --limit 50
 python scripts/drive-loop.py --indexers HDFans,NanyangPT
 ```
 
-> `drive-loop` 已内置 `--db-path` / `--qbit-url` 默认值（指向 NAS），**回灌不会漏参数**。
-> 挂 Windows 计划任务每 15 分钟 `--once` 即可无人值守推进 —— 计划任务指向的是包装器
-> **`scripts/drive-loop-once.cmd`**，不是直接指向 `python.exe`：
-> python 路径里有**非 ASCII 用户名**，经 `schtasks` / MINGW 传递会被搞坏；
-> 包装器用 `%USERPROFILE%` 让 cmd.exe 在**运行时**展开，任务定义本身保持纯 ASCII。
-> `--once` 靠 `scripts/.drive-loop.state` 自我节流（有人在跑 / 距上批结束不足 30 分钟 → 直接退出），
-> 所以 15 分钟一次**不会**和 24 分钟一批重叠。
-> 真实进度一律以 `scripts/drive-loop.log` 为准，**别看终端**（输出会被块缓冲吞掉，SUMMARY §13.8）。
+> `drive-loop` 已内置 `--db-path` / `--qbit-url` 的**候选探测**（`CROSSSEED_DIRS`：
+> 先 NAS 原生路径、再 UNC），所以同一份代码在 Windows 和 NAS 上都能跑，
+> 不需要两套参数，**回灌不会漏参数**。
+>
+> **★ 2026-09-11 起，调度跑在 NAS 上**：DSM 任务计划每 15 分钟执行
+> `sh /volume2/docker_ssd/prowlarr_cross-seed_autohardlink/drive-loop/run.sh`。
+> Windows 计划任务已停用。原因不是性能，是 Windows 侧**批次会静默消失**，
+> 查下去是**两个独立的坑**（完整证据与复现见 SUMMARY §14）：
+>
+> * **`<StopOnIdleEnd>true`**（当场读任务定义确认）：你一动鼠标/键盘，
+>   Windows 就 `TerminateProcess` 整个任务实例 —— 没有 traceback、没有
+>   finally 收尾、状态文件里 `running_pid` 永远挂着，之后每轮都空转。
+> * **包装器 `.cmd` 是 LF 行尾**（这一条是 2026-09-11 深夜改包装器时引入的）：
+>   cmd.exe 按字节块读批处理文件，LF-only 会让它**从某行中间开始执行** ——
+>   `REM` 注释里的英文单词被当成命令跑，前面的 `set` 全部丢失，于是留下
+>   `exit=9009` + `'""' 不是内部或外部命令`，且**有 `exit=` 没有 `start=`**。
+>   已修（转 CRLF）。`deploy.sh` / `run-batch.sh` 的 CRLF 行尾也一并归正成 LF。
+>
+> `--once` 的自我节流（有人在跑 / 距上批结束不足 30 分钟 → 直接退出）和
+> **心跳超时接管**（卡死 10 分钟后下一轮自动接管）两边通用，
+> 所以 15 分钟一次**不会**和 24 分钟一批重叠。这也是没有改用
+> 「常驻容器跑自带循环」的原因 —— 常驻进程卡死就没人接管了。
+> 真实进度一律以 `drive-loop.log` 为准，**别看终端**（输出会被块缓冲吞掉，SUMMARY §13.8）：
+> NAS 上是 `<compose>/drive-loop/scripts/drive-loop.log`，
+> Windows 上是 `scripts/drive-loop.log`。
+>
+> ⚠ 万一要**回退到 Windows 跑**，`scripts/drive-loop-once.cmd` 包装器有两个必须守住的点：
+> 1. **别把包装器换成直接指向 `python.exe`** —— python 路径里有中文用户名，
+>    经 `schtasks` / MINGW 传递会被搞坏；包装器用 `%USERPROFILE%` 让 cmd.exe
+>    在**运行时**展开，任务定义本身保持纯 ASCII。
+> 2. **包装器必须是 CRLF 行尾** —— LF-only 会让 cmd.exe 解析错位、整行命令失效
+>    （现象：`exit=9009` 且 `attempts.log` 里没有 `start` 行）。改完包装器务必确认：
+>    ```bash
+>    python -c "b=open('scripts/drive-loop-once.cmd','rb').read(); print('CRLF',b.count(b'\r\n'),'LF',b.count(b'\n')-b.count(b'\r\n'))"
+>    # 要 CRLF 59 / LF 0
+>    ```
+
+### 把调度挂到 NAS 上（✅ 已完成 —— 2026-09-12 凌晨）
+
+代码、状态库、DSM 计划任务**都已就位**并实测跑通：
+
+- `deploy.sh --apply` 已执行（`drive-loop/` 下 6 个文件）；
+- `hlink/state.db` 的 605 部已迁到 `<路径>/drive-loop/hlink/state.db`，
+  `local_roots` 已从 UNC 归一成 NAS 原生路径；
+- DSM 三个任务已建（见「通知」那节的任务表）；Windows 侧任务已 `DISABLE`；
+- ✅ **2026-09-11 23:51 / 2026-09-12 00:01 实测**：手动触发的那批正常跑起来
+  （`attempts.log` 有 `start py=/usr/bin/python3`），下一次唤醒时正确地打出
+  「上一批（pid …）仍在运行，跳过本轮」—— **跨进程节流工作正常**。
+
+**★ 建任务时最容易踩的一脚：「最后运行时间」的小时位存错。**
+
+`synoschedtask --get` 实测到的**错误**状态：
+
+```
+reseed-drive-loop    Run time: [2]:[0]    Repeat every [15] min until [2]:[45]
+reseed-notify-drain  Run time: [0]:[0]    Repeat every [5]  min until [0]:[55]
+```
+
+—— 两条任务分别**只在 02:00–02:45 / 00:00–00:55 之间**才触发，于是表现成
+「**手动点『运行』能跑，计划却永远不自动触发**」。
+
+正确值：**小时位明确设成 `23`** —— `drive-loop` → 最后 `23:45`、每 15 分钟；
+`drain` → 最后 `23:55`、每 5 分钟（`digest` 每天 21:20、无 repeat，不受影响）。
+改完务必复核：
+
+```bash
+sudo /usr/syno/bin/synoschedtask --get | grep -A 12 'reseed-drive-loop'
+#  期望看到： Repeat every [15] min (s) until [23]:[45]
+```
+
+**排错**：`attempts.log` 里 `exit=127` = `run.sh` 找不到 python3 或脚本；
+`exit≠0` 且有 traceback = python 层出错（最可能是版本，见「通知」那节关于 3.8 的说明）；
+**压根没有 `start` 行** = 任务没被触发（没启用 / **计划窗口不对** / 脚本路径错）；
+**有 `start` 没 `exit`** = **先别下结论**，最常见的是**批次还在跑**（见上）。
+完整排查表见 SUMMARY §14.5；计划窗口这个坑见 SUMMARY §15.5。
 
 **方式 B：手动单批（原来的做法）**
 
@@ -652,7 +831,9 @@ python scripts/reseed-state.py drive --pack dc-collection --indexers HDFans,Nany
    那些 410 **纯粹是容器没重建**（磁盘上的 `.env` 是对的，跑着的容器用的是旧环境变量）。
    所以不用跑 `add-indexers.py --remove`，**只差 `--force-recreate`**。
    ⚠ 重建会打断正在跑的 drive，务必等当前批次跑完。
-2. ~~挂 Windows 计划任务~~ ✅ **已完成**（`reseed-drive-loop`，每 15 分钟 `drive-loop.py --once`）。
+2. ~~挂 Windows 计划任务~~ ✅ 已完成过一次，但 **2026-09-11 晚已迁到 NAS**
+   （`reseed-drive-loop` 这个 Windows 任务**请停用**，否则两边同时驱动
+   cross-seed → 成片的 429）。现在挂的是 DSM 任务计划，见 SUMMARY §14。
 3. **换一个站替换 BTSCHOOL**（已在计划中）——加站流程见 SUMMARY §13.3。
 4. v3 **硬链接农场**：**农场已建好（475/475）并通过独立复核**，
    切换前的**等价性也已在真实数据上验过**：按 cross-seed 真正用的指纹
@@ -660,11 +841,22 @@ python scripts/reseed-state.py drive --pack dc-collection --indexers HDFans,Nany
    （1888 = 1888，双向 0 差异）。见 SUMMARY §10.5.7 / §10.5.9。
    ⬜ 只差把 `DATA_DIRS` 切过去 —— **与第 1 条同一次重建**。
 5. 编排器 `status` 子命令（见 SUMMARY §11.9）；IYUU 扩散（本范围外）。
-6. **通知：NAS 侧还没部署** —— Windows 侧已接好，NAS 侧脚本已写好并**本地全路径验证通过**
-   （含真发信路径、发不出去时的保留与积压上报、重复排空不重复记账）。
-   剩的是**必须在 NAS 上做**的三步，见上面「通知 / 告警」的「NAS 侧一次性配置」：
-   ① DSM 里配好自定义 SMTP ② 拷 `notify-spool.sh` + `notify.conf` ③ 建两个任务计划（root + 发送运行详情）。
-   ⬜ 在此之前**一封邮件都不会发出去**（Windows 侧写的文件会堆在 spool 里，不会丢）。
+6. ~~**通知：NAS 侧还没部署**~~ ✅ **已完成（2026-09-12 凌晨）** —— 三个任务计划已建，
+   **实测收到邮件**（`--test-mail` → QQ 收件箱），spool→发信整条链路打通。
+   踩坑全过程见 SUMMARY §15（DSM 的 ssmtp 读的是 `synosmtp.conf`、`MAIL_FROM` 必须等于认证账号、
+   计划窗口小时位存错导致"手动能跑、计划不跑"）。
+7. ⬜ **四个自动化的设计预案（只是记下来，未实现）** —— 见 **SUMMARY §16**：
+   站点额度感知 / 农场巡检自动化 / 命中率趋势 / 日志轮转。
+   ★ 探完之后**两条的前提被推翻**：日志**其实已经在自我轮转**（真正无上限的是**容器的
+   docker 日志**），而 `build-farm.sh --verify` 在 `DATA_DIRS` 切到农场后会
+   **自己和自己比、永远通过**。动这四条之前**先读 §16**，里面还给了优先级。
+8. 🔴 **状态机把"其实在做种"的片子降级了（2026-09-12 凌晨实测，未修）** —— 首次 NAS 真跑后
+   回灌打出 `新增做种 -26`（**负数**），现在全库只剩 **13** 部 `SEEDING` 而 qB 里**有 160 部在做种**。
+   后果是这些片子过了重搜周期会被**重复搜、白烧站点额度**。同批还查出
+   `backoff_hits=0` 但 HDFans 状态是 `RATE_LIMITED`（退避检测没触发）。
+   **优先级高于上面第 7 条。** 证据与下一步见 **SUMMARY §17.3**。
+   （另：`attempts.log` 里可能看到一行**假的** `exit=127 (no python)` —— 那是部署覆盖了
+   正在运行的 `run.sh` 造成的，**不是真的没有 python**，见 §17.2。）
 
 #### 收尾命令（一次重建同时办完两件事）
 
