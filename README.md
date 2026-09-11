@@ -336,9 +336,19 @@ sh nas-update-env.sh                 # 改 .env + 重启 cross-seed + 回读容�
 sh nas-update-env.sh --no-restart    # 只改不重启
 ```
 
-脚本会：① 备份 `.env` → `.env.bak.<时间戳>`；② 用 `awk` 就地替换 `DATA_DIRS=` 那一行
-（不走 `sed`，避开分隔符与 `&` 转义坑）；③ 逐条 `[ -d ]` 校验；④ 重启后 `docker inspect`
-回读容器内的 `DATA_DIRS` 条数并比对。回滚：`cp -p .env.bak.<时间戳> .env`。
+脚本会：① 备份 `.env` → `.env.bak.<时间戳>`；② 用 `awk` 就地替换 `DATA_DIRS=` / `LINK_DIR=`
+两行（不走 `sed`，避开分隔符与 `&` 转义坑）；③ 逐条 `[ -d ]` 校验（缺失只告警）；
+④ 重启后 `docker inspect` 回读容器内的 `DATA_DIRS` 条数并比对。回滚：`cp -p .env.bak.<时间戳> .env`。
+
+**它只动 `DATA_DIRS` / `LINK_DIR` 两行，其余键逐字节保留** —— 因为本地 `.env` 里的
+`TORZNAB_URLS` 是脱敏占位符（`apikey=xxxx…`），生产上是真实密钥，串了就是全线 401。
+写盘前有一道硬闸：把两边除这两键外的所有行各导一份做 `cmp -s`，不一致就打印 `diff` 并拒绝写入。
+中间文件全放 compose 目录里（相对路径 + `trap` 兜底），跑完一个都不留。
+
+> ⚠ **怎么确认它真的生效了**：`.env.new` 存在 ≠ `.env` 已更新。判断一律看这两处 ——
+> `sudo docker inspect reseed-cross-seed --format '{{range .Config.Env}}{{println .}}{{end}}' | grep '^DATA_DIRS='`
+> 的条数，或 `cross-seed.db` 的 `data` 表里有没有新包的路径。
+> 详见 SUMMARY §11.12。
 
 #### 其它要点
 

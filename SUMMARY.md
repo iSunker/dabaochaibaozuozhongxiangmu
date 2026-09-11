@@ -6,7 +6,9 @@
 > **§11.8 `drive` 控速 + 退避闭环**；§11.10 说明 `orchestrator/main.py`；
 > **§10 多包支持已落地**，含 **§10.2 嵌套结构陷阱（DC 案例）**、
 > **§10.6 cross-seed 的 searchee 枚举规则（读源码定论）**；
-> **§11.7.1 `--limit` 分批**、**§10.5 A/B 方案对比**、**§11.11 全量能否排除已做种**）
+> **§11.7.1 `--limit` 分批**、**§10.5 A/B 方案对比**、**§11.11 全量能否排除已做种**、
+> **§11.12 生产 `.env` 一键更新（含"怎么确认真的落地了"）**、
+> **§10.6.4 `init --roots-from-env`（DC 47 组参数 → 一条命令）**）
 > 本文件是给「下一次接手的人（或下一个会话）」看的。读完这一篇应当能直接接着干，
 > 不需要回翻聊天记录。
 
@@ -313,7 +315,8 @@ bash deploy.sh --rollback   # 回滚到最近一次备份
 | v2-a | **多包接入**：MBF（剧集，每季）+ DC（嵌套，47 个 dataDir） | ✅ **配置已落地**，见 §10.1 / §10.2 |
 | v2-b | 状态机支持嵌套包（多根 + 深度） | ✅ **已完成并实测**（DC 47 根 → 115 单片），见 §10.4 / §10.6 |
 | v2-c | **`--limit` 分批 + 优先级排序**（`--batch` / `--plan`） | ✅ **已完成并实测**，见 §11.7.1 |
-| v2-d | **生产 `.env` 一键更新脚本**（`gen-nas-env-update.py` → `nas-update-env.sh`） | ✅ **已完成并实测**（含备份/校验/重启/闭环回读），见 README「生产 .env 怎么更新」 |
+| v2-d | **生产 `.env` 一键更新脚本**（`gen-nas-env-update.py` → `nas-update-env.sh`） | ✅ **已完成并实测**（备份 / 三道安全闸 / 重启 / 闭环回读 / 不留中间文件），见 §11.12 |
+| v2-e | **`init --roots-from-env`**：根的清单直接从 cross-seed 的 `.env` 派生 | ✅ **已完成并实测**（DC 47 组参数 → 一条命令），见 §10.6.4 |
 | v3 | **硬链接农场**（1 条 dataDir 取代 49 条，顺带闭合状态机的嵌套包缺口） | ⬜ **未做** —— 设计已完成，见 §10.5 |
 
 ### 5.1 Phase 2 验收结果
@@ -1508,4 +1511,72 @@ if r["stage"] in DONE_STAGES:      # DONE_STAGES = {SEEDING, MATCHED}
    那就接受"已做种的重搜一遍"，或者用 `blockList` 的 `folder:` 规则把已命中的目录名排除掉
    —— 但那是**静态清单**，每命中一部就要手工加一条，不划算，**不如直接用状态机**。
 3. 需要"只补没搜过的站"时，`--indexers` 传当前生效的站名，`due_indexers()` 会算出
-   `indexer_seen` 里缺的那些站，只对这些站发 —— 这比全量重扫精准得多。
+   `indexer_seen` 里缺的那些站，只对这些站发 —— 这比全量重搜精准得多。
+
+---
+
+### 11.12 生产 `.env` 一键更新（`gen-nas-env-update.py` → `nas-update-env.sh`）
+
+> 回答："NAS 上的 .env 还得手动更新，把这个手动更新的代码发给我，我去 nas 一键完成。"
+
+**为什么不能直接 `scp` 本地 `.env` 上去**：两个 `.env` 是**不同性质**的东西 ——
+
+| | 本地仓库 `.env` | 生产 `.env`（NAS compose 目录） |
+|---|---|---|
+| 密钥 | **脱敏占位符**（`apikey=xxxxxxxx…`） | **真实密钥** |
+| `DATA_DIRS` | 49 条（真相） | 1 条（老值，待更新） |
+
+直接覆盖 = 把真实密钥换成占位符 = cross-seed 带着假 key 重启 = 全线 401。
+所以做成"**只搬 `DATA_DIRS` / `LINK_DIR` 两键，其余键原样保留**"的补丁式更新。
+
+**流水线**：本地 `.env`（事实源）→ `scripts/gen-nas-env-update.py` → `scripts/nas-update-env.sh`
+（POSIX sh，gitignored）→ 拷到 NAS 的 compose 目录执行。生成物里 `DATA_DIRS` 用单引号
+heredoc 定界，CJK / 全角括号 / 带空格的路径**一个字符都不会被转义**。
+
+**用法**（NAS 上，SSH 或 Container Manager 均可）：
+
+```sh
+cd /volume2/docker_ssd/prowlarr_cross-seed_autohardlink
+sh nas-update-env.sh --dry-run      # 只看会改什么（不写盘、不重启、不留文件）
+sh nas-update-env.sh                # 改 + 备份 + 重启 cross-seed + 闭环回读
+sh nas-update-env.sh --no-restart   # 只改不重启
+```
+
+**三道安全闸**（都在写盘之前）：
+
+1. `.env.new` 里 `DATA_DIRS` 必须**恰好 1 行**（0 行=没替换上，2 行=替换逻辑炸了）；
+2. 除 `DATA_DIRS` / `LINK_DIR` 之外的行必须**逐字节不变** —— ⚠ **只比行数是不够的**：
+   行数一样但内容被换掉完全可能，而生产 `.env` 里是真实密钥、本地是占位符，
+   串了就是全线 401。实现：`grep -vE '^(DATA_DIRS|LINK_DIR)='` 两边各出一份 → `cmp -s`；
+   不一致就打印 `diff` 并拒绝写入；
+3. `DATA_DIRS` 里每条路径逐个 `[ -d ]`，不存在的**只告警不拦**（可能是还没建好的新目录）。
+
+**中间文件**（`.env.new.src` / `.env.new` / `.env.new.list` / `.env.other.old|new`）全部放在
+`COMPOSE_DIR` 里用相对路径，跑前先 `rm -f`、`trap ... EXIT INT TERM` 兜底 —— 成功落地后
+**一个都不留**，Ctrl-C 也不留。（最初用 `mktemp`，系统临时目录在某些环境不可写/会被清理，
+改成相对路径后 `rm` 必定成功。）
+
+**怎么确认它真的落地了** —— 只看脚本最后那行 `[4/4] [ok]` 不够，四处交叉验证：
+
+```sh
+# ① NAS 上的 .env 本身
+awk '/^DATA_DIRS=/{n=split($0,a,","); print n}' .env
+# ② 容器**实际**拿到的环境变量（最权威）
+sudo docker inspect reseed-cross-seed --format '{{range .Config.Env}}{{println .}}{{end}}' \
+  | grep '^DATA_DIRS=' | tr ',' '\n' | grep -c .
+# ③ cross-seed 自己扫出来的枚举结果（新包的路径应该出现）
+sqlite3 cross-seed/cross-seed.db "select count(*) from data where path like '%Brilliant%'"
+# ④ 日志里最近一次重载
+grep -n 'Validating your configuration\|entries from dataDirs' cross-seed/logs/info.current.log | tail -4
+```
+
+**回滚**：脚本每次都会先 `cp -p .env .env.bak.<时间戳>`，回滚就是
+
+```sh
+cp -p .env.bak.<时间戳> .env && sudo docker compose up -d --force-recreate cross-seed
+```
+
+> ⚠ **一个真实的坑**：`.env.new` 存在 ≠ `.env` 已更新。曾出现"备份和 `.env.new` 都生成了、
+> 但 `.env` 还是老值"的状态（脚本在 `mv` 之前中断，旧版没有 trap 兜底）。
+> 所以**判断成功与否一律以 ②（容器内环境变量）或 ③（DB 枚举结果）为准**，
+> 不要只看 `ls` 有没有 `.env.new`。

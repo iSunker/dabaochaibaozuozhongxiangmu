@@ -50,7 +50,8 @@ TEMPLATE = r'''#!/bin/sh
 #   3) 否则：备份 .env → .env.bak.<时间戳>，再落地
 #   4) 重启 cross-seed，并回读容器内的 DATA_DIRS 条数做闭环验证
 #
-# 幂等、可重复跑。中间文件叫 .env.new / .env.new.list，跑前会先清、trap 兜底再清。
+# 幂等、可重复跑。中间文件叫 .env.new.src / .env.new / .env.new.list（都放在
+# COMPOSE_DIR 里），跑前先清、trap 兜底再清；成功落地后一个都不会留下。
 # =====================================================================
 set -eu
 
@@ -69,13 +70,16 @@ done
 cd "$COMPOSE_DIR" 2>/dev/null || {{ echo "[!!] 目录不存在: $COMPOSE_DIR" >&2; exit 1; }}
 [ -f .env ] || {{ echo "[!!] $COMPOSE_DIR/.env 不存在" >&2; exit 1; }}
 
-# ---------- 0) 清掉上次中断可能残留的中间文件（这两个名字是本脚本专用的）----------
-rm -f .env.new .env.new.list
+# ---------- 0) 清掉上次中断可能残留的中间文件（这几个名字都是本脚本专用的）----------
+rm -f .env.new.src .env.new .env.new.list .env.other.old .env.other.new
 
 # ---------- 1) 新值：heredoc 用单引号定界 → 里面一个字符都不会被展开/转义 ----------
-NEWFILE="$(mktemp)"
+# 中间文件都放 COMPOSE_DIR 里（相对路径），不用 mktemp：
+#   ① 系统临时目录在某些环境下不可写/被清理；
+#   ② 相对路径能保证 trap 的 rm 一定成功，不会在 /tmp 里留垃圾。
+NEWFILE=".env.new.src"
 # 无论正常结束 / 报错 / Ctrl-C，都把自己产生的中间文件收干净
-trap 'rm -f "$NEWFILE" .env.new .env.new.list' EXIT INT TERM
+trap 'rm -f "$NEWFILE" .env.new .env.new.list .env.other.old .env.other.new' EXIT INT TERM
 cat > "$NEWFILE" <<'DATA_DIRS_EOF'
 {new_lines}
 DATA_DIRS_EOF
@@ -98,14 +102,25 @@ if ! grep -q '^DATA_DIRS=' .env.new; then
   echo "[!!] 替换失败：.env 里没有 DATA_DIRS= 行" >&2
   exit 1
 fi
-# 安全闸：除 DATA_DIRS 以外的行数必须不变（用 grep -c 而不是 wc -l，
-# 这样原文件末尾有没有换行都不影响判断）
-N_OTHER_OLD=$(grep -vc '^[[:space:]]*DATA_DIRS[[:space:]]*=' .env || true)
-N_OTHER_NEW=$(grep -vc '^[[:space:]]*DATA_DIRS[[:space:]]*=' .env.new || true)
-if [ "$N_OTHER_OLD" != "$N_OTHER_NEW" ]; then
-  echo "[!!] 其它行数变了（$N_OTHER_OLD → $N_OTHER_NEW），拒绝写入" >&2
+
+# ---- 安全闸 ----
+# 闸1：DATA_DIRS 必须恰好 1 行（0 行 = 没替换上，2 行 = 替换逻辑炸了）
+[ "$(grep -c '^DATA_DIRS=' .env.new)" = "1" ] || {{
+  echo "[!!] .env.new 里 DATA_DIRS 不是恰好 1 行，拒绝写入" >&2; exit 1; }}
+
+# 闸2：除 DATA_DIRS / LINK_DIR 之外的行必须**逐字节不变**。
+# 为什么不能只比行数：行数一样但内容被换掉完全可能。而生产的 .env 里是
+# 真实的 TORZNAB 密钥，本仓库里的 .env 是脱敏占位符（apikey=xxxx…）——
+# 一旦串了，cross-seed 会带着假密钥重启，全线 401。
+OTHER_RE='^[[:space:]]*(DATA_DIRS|LINK_DIR)[[:space:]]*='
+grep -vE "$OTHER_RE" .env     > .env.other.old || true
+grep -vE "$OTHER_RE" .env.new > .env.other.new || true
+if ! cmp -s .env.other.old .env.other.new; then
+  echo "[!!] 除 DATA_DIRS/LINK_DIR 外的行发生了变化，拒绝写入。差异（前 20 行）：" >&2
+  diff .env.other.old .env.other.new 2>/dev/null | head -20 >&2 || true
   exit 1
 fi
+echo "      [ok] 安全闸：DATA_DIRS 1 行；其它键逐字节未变"
 
 N_OLD=$(awk '/^[[:space:]]*DATA_DIRS[[:space:]]*=/{{n=split($0,a,","); print n; exit}}' .env)
 N_NEW=$(awk '/^DATA_DIRS=/{{n=split($0,a,","); print n}}' .env.new)
