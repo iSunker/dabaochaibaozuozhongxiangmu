@@ -60,6 +60,11 @@ def _say(*a) -> None:
     print(*a, flush=True)
 
 
+def _note(*a) -> None:
+    """走 stderr：用于分批说明等提示，避免污染 todo 的路径清单输出。"""
+    print(*a, file=sys.stderr, flush=True)
+
+
 def _safe_stdout() -> None:
     try:
         sys.stdout.reconfigure(encoding="utf-8")  # type: ignore[union-attr]
@@ -245,6 +250,29 @@ def cmd_report(args) -> int:
     return 0
 
 
+def _apply_batch(pairs, *, limit, batch):
+    """按 --limit / --batch 切出一批。
+
+    返回 (这批, 说明文字)；说明为 None 表示参数有误（调用方应报错退出）。
+
+    顺序由 StateStore.todo() 保证（SKIPPED → ERROR → PENDING → UNMATCHED），
+    所以"取前 N 条"永远先吃掉最该搜的；一批做完后状态会变（被搜过的离开待办），
+    下一批自然接着往下走 —— 因此 **不加 --batch 反复跑同一条命令就能逐批推进**。
+    """
+    total = len(pairs)
+    if not limit:
+        return pairs, f"共 {total} 部待搜（未分批，一次全发）"
+    nbatch = max(1, -(-total // limit))          # 向上取整
+    k = batch or 1
+    if k < 1 or k > nbatch:
+        return None, f"--batch {k} 超出范围：共 {nbatch} 批（每批 {limit}）"
+    lo, hi = (k - 1) * limit, k * limit
+    return pairs[lo:hi], (
+        f"共 {total} 部待搜 → 每批 {limit}，共 {nbatch} 批；"
+        f"本批 = 第 {k} 批（第 {lo + 1}~{min(hi, total)} 部）"
+    )
+
+
 def cmd_todo(args) -> int:
     with S.StateStore(args.db) as st:
         idx = _idx_list(args.indexers)
@@ -255,8 +283,14 @@ def cmd_todo(args) -> int:
         if args.stage:
             want = {s.strip().upper() for s in args.stage.split(",")}
             pairs = [(r, d) for r, d in pairs if r["stage"] in want]
-        if args.limit:
-            pairs = pairs[:args.limit]
+        pairs, plan = _apply_batch(pairs, limit=args.limit, batch=args.batch)
+        if pairs is None:
+            _note(f"[!!] {plan}")
+            return 2
+        if args.limit or args.batch or args.plan:
+            _note(f"    {plan}")
+        if args.plan:
+            return 0
         lines = [r["path"] for r, _ in pairs]
         if args.out:
             Path(args.out).write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -278,8 +312,11 @@ def cmd_drive(args) -> int:
         if args.stage:
             want = {s.strip().upper() for s in args.stage.split(",")}
             pairs = [(r, d) for r, d in pairs if r["stage"] in want]
-        if args.limit:
-            pairs = pairs[:args.limit]
+        total_all = len(pairs)
+        pairs, plan = _apply_batch(pairs, limit=args.limit, batch=args.batch)
+        if pairs is None:
+            _say(f"[!!] {plan}")
+            return 2
         paths = [r["path"] for r, _ in pairs]
 
         if not paths:
@@ -290,8 +327,15 @@ def cmd_drive(args) -> int:
         for r, _ in pairs:
             by_stage[r["stage"]] = by_stage.get(r["stage"], 0) + 1
         eta = max(0, len(paths) - 1) * args.interval
-        _say(f"待驱动 {len(paths)} 部  " + "  ".join(f"{k}={v}" for k, v in sorted(by_stage.items())))
-        _say(f"节流：每条间隔 {args.interval:.0f}s，预计发送耗时 {eta / 60:.0f} 分钟")
+        _say(plan)
+        _say(f"本批 {len(paths)} 部  " + "  ".join(f"{k}={v}" for k, v in sorted(by_stage.items())))
+        _say(f"节流：每条间隔 {args.interval:.0f}s → 本批约 {eta / 60:.0f} 分钟"
+             + (f"；全部 {total_all} 部约 {max(0, total_all - 1) * args.interval / 60:.0f} 分钟"
+                if args.limit else ""))
+
+        if args.plan:
+            _say("（--plan：只打印计划，未发任何请求）")
+            return 0
 
         if not args.apply:
             for p in paths[:20]:
@@ -448,7 +492,12 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("--pack", required=True)
     a.add_argument("--indexers")
     a.add_argument("--stage", help="只保留这些阶段，逗号分隔")
-    a.add_argument("--limit", type=int)
+    a.add_argument("--limit", type=int, help="每批多少条（分批用）")
+    a.add_argument("--batch", type=int, default=None,
+                   help="取第几批（配合 --limit）。默认第 1 批；"
+                        "一批做完重跑同一条命令即可推进到下一批")
+    a.add_argument("--plan", action="store_true",
+                   help="只打印分批计划，不导出清单")
     a.add_argument("--out")
     _add_cadence_opts(a)
     a.add_argument("--include-cooldown", action="store_true",
@@ -460,7 +509,12 @@ def build_parser() -> argparse.ArgumentParser:
     _add_source_opts(a)
     _add_cadence_opts(a)
     a.add_argument("--stage", help="只驱动这些阶段，逗号分隔")
-    a.add_argument("--limit", type=int)
+    a.add_argument("--limit", type=int, help="每批多少条（分批用）")
+    a.add_argument("--batch", type=int, default=None,
+                   help="取第几批（配合 --limit）。默认第 1 批；"
+                        "一批做完重跑同一条命令即可推进到下一批")
+    a.add_argument("--plan", action="store_true",
+                   help="只打印分批计划，不发请求")
     a.add_argument("--include-cooldown", action="store_true")
     a.add_argument("--url", help="cross-seed 地址，如 http://NAS_IP:2468")
     a.add_argument("--api-key")

@@ -70,6 +70,19 @@ RETRY_NOW_STAGES = frozenset({STAGE_PENDING, STAGE_SKIPPED, STAGE_ERROR})
 #: 需要等冷却期 / 等新增索引器才重搜
 COOLDOWN_STAGES = frozenset({STAGE_UNMATCHED})
 
+#: todo() 的**取件顺序**：数字越小越先搜。分批（--limit/--batch）时按这个排，
+#: 保证先花在"最该搜"的片子上。
+#:   SKIPPED   0 —— 上次根本没发出去（被退避秒跳），重搜不消耗任何重试预算
+#:   ERROR     1 —— 上次异常，尽快补
+#:   PENDING   2 —— 从没搜过
+#:   UNMATCHED 3 —— 真搜过没命中，等周期/等新站
+TODO_PRIORITY: dict[str, int] = {
+    STAGE_SKIPPED: 0,
+    STAGE_ERROR: 1,
+    STAGE_PENDING: 2,
+    STAGE_UNMATCHED: 3,
+}
+
 #: 未命中后，**每个站**默认多久重搜一次（用户要求：一周一次）
 DEFAULT_CADENCE_DAYS = 7
 #: 兼容旧名字
@@ -803,6 +816,9 @@ class StateStore:
                 )
                 if due:
                     out.append(row)
+        # 按"最该搜"排序（SKIPPED → ERROR → PENDING → UNMATCHED），同级按目录名稳定排序。
+        # 分批时靠这个顺序，保证每批都优先吃掉被退避跳过 / 从没搜过的片子。
+        out.sort(key=lambda r: (TODO_PRIORITY.get(r["stage"], 9), r["dir_name"]))
         return out
 
     def todo_detail(self, pack: str, *, indexers_now: list[str] | None = None,

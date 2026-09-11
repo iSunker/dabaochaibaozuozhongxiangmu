@@ -310,6 +310,7 @@ bash deploy.sh --rollback   # 回滚到最近一次备份
 | Phase 3 | 编排器 build / preflight / run --dry-run / run / status | ⬜ 未开始（`run` 已非必要，见 §6.4；`status` 仍值得做；`main.py` 说明见 §11.10） |
 | v2-a | **多包接入**：MBF（剧集，每季）+ DC（嵌套，47 个 dataDir） | ✅ **配置已落地**，见 §10.1 / §10.2 |
 | v2-b | 状态机支持嵌套包（多根 + 深度） | ⬜ **未做** —— DC 目前 cross-seed 会搜、但状态机看不到，见 §10.4 |
+| v2-c | **`--limit` 分批 + 优先级排序**（`--batch` / `--plan`） | ✅ **已完成并实测**，见 §11.7.1 |
 
 ### 5.1 Phase 2 验收结果
 
@@ -822,7 +823,7 @@ python scripts/gen-datadirs.py "//YOUR-NAS/video/download/movies/DC相关剧集�
 4. **磁盘**：新大包要占真实空间（§9）；硬链接侧依旧零开销。
 5. **站点压力**：包越多、搜索次数越多 → **按包分时段跑**，别同时开多个全量任务；`delay` 保持 30~45。
    接入 DC 后 searchee 总数从 ~405 涨到 **~1000+**（49 个 dataDir × 各自子目录），
-   一轮全量搜索的耗时和 API 次数都会成倍增长 —— **务必用 `--limit` 分批**。
+   一轮全量搜索的耗时和 API 次数都会成倍增长 —— **务必用 `--limit` 分批**（见 §11.7.1）。
 
 ### 10.4 已知缺口：状态机还不支持嵌套包
 
@@ -1075,6 +1076,61 @@ python scripts/reseed-state.py show  --pack $PACK --movie "十二怒汉.12.Angry
 python scripts/reseed-state.py drive --pack $PACK --indexers SiteA,SiteB --limit 50 --apply \
   --url http://NAS_IP:2468 --api-key <CROSSSEED_API_KEY>
 ```
+
+#### 11.7.1 分批：`--limit` / `--batch` / `--plan`（2026-09-11 新增）
+
+接入 DC 大包后 searchee 从 ~405 涨到 **1000+**，一轮全量会烧掉大量查询额度，
+所以 `todo` 与 `drive` 都支持分批。
+
+```bash
+# 先看计划（不发请求、不导出清单；计划文字走 stderr）
+python scripts/reseed-state.py drive --pack $PACK --limit 50 --plan
+
+# 第 1 批（不加 --batch 就是第 1 批）
+python scripts/reseed-state.py drive --pack $PACK --limit 50 --apply \
+  --url http://NAS_IP:2468 --api-key <KEY>
+
+# 一批做完，重跑同一条命令 → 自动推进到下一批
+python scripts/reseed-state.py drive --pack $PACK --limit 50 --apply \
+  --url http://NAS_IP:2468 --api-key <KEY>
+
+# 想显式指定批次（比如中断后跳着跑）
+python scripts/reseed-state.py drive --pack $PACK --limit 50 --batch 3 --plan
+```
+
+**为什么不需要记"我跑到第几批了"**：
+
+1. `todo()` 已经**排除 `DONE_STAGES`（`SEEDING`/`MATCHED`）** —— 搜中并做种的片不会再出现在清单里；
+2. `todo()` 内部按 `TODO_PRIORITY` 排序：
+
+   | 阶段 | 优先级 | 含义 |
+   |---|---|---|
+   | `SKIPPED` | 0 | 上次被退避秒跳，**根本没发出去**，重搜不消耗重试预算 |
+   | `ERROR` | 1 | 上次异常，尽快补 |
+   | `PENDING` | 2 | 从没搜过 |
+   | `UNMATCHED` | 3 | 真搜过没命中，等周期 / 等新站 |
+
+3. 因此"取前 N 条"永远先吃掉**最该搜**的；一批做完状态就变了（被搜过的离开待办），
+   下一批自然从剩下的头部开始 —— **重跑同一条命令就是推进**。
+
+实测（`frds-top250-2024`，待搜 286 = `SKIPPED` 282 + `PENDING` 4）：
+
+```text
+$ drive --limit 50 --plan
+共 286 部待搜 → 每批 50，共 6 批；本批 = 第 1 批（第 1~50 部）
+本批 50 部  SKIPPED=50
+节流：每条间隔 30s → 本批约 24 分钟；全部 286 部约 142 分钟
+
+$ drive --limit 50 --batch 6 --plan
+共 286 部待搜 → 每批 50，共 6 批；本批 = 第 6 批（第 251~286 部）
+本批 36 部  PENDING=4  SKIPPED=32      # ← PENDING 排在最后，符合优先级
+
+$ drive --limit 50 --batch 99 --plan
+[!!] --batch 99 超出范围：共 6 批（每批 50）   # 退出码 2
+```
+
+**`todo` 的输出约定**：路径清单走 **stdout**，分批说明走 **stderr** —— 所以
+`todo --limit 50 | xargs ...` 这种管道不会被提示文字污染。`--plan` 时 stdout 为空。
 
 **两个易踩的点**：
 - `--root` 必须是 **cross-seed 视角的 NAS 路径**（`/volume1/...`，webhook 要用它）；

@@ -206,6 +206,11 @@ python scripts/reseed-state.py drive --pack $PACK --indexers SiteA,SiteB --limit
   --url http://NAS_IP:2468 --api-key <CROSSSEED_API_KEY>
 ```
 
+**分批**：`--limit N` 每批 N 条，`--batch K` 指定第几批（默认第 1 批），
+`--plan` 只打印计划不发请求。因为待办清单**已排除已做种的片**、且按
+`SKIPPED → ERROR → PENDING → UNMATCHED` 排序，所以 **一批做完重跑同一条命令就自动推进**
+（不用记批次号）。`todo` 的路径走 stdout、分批说明走 stderr，管道不会被打扰。
+
 阶段（**由事实推导，不是手工填的**）：
 
 | 阶段 | 含义 | 会重搜吗 |
