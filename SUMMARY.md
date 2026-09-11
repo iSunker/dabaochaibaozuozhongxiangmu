@@ -8,7 +8,8 @@
 > **§10.6 cross-seed 的 searchee 枚举规则（读源码定论）**；
 > **§11.7.1 `--limit` 分批**、**§10.5 A/B 方案对比**、**§11.11 全量能否排除已做种**、
 > **§11.12 生产 `.env` 一键更新（含"怎么确认真的落地了"）**、
-> **§10.6.4 `init --roots-from-env`（DC 47 组参数 → 一条命令）**）
+> **§10.6.4 `init --roots-from-env`（DC 47 组参数 → 一条命令）**、
+> **§11.13 429 退避与 SKIPPED 的真相**）
 > 本文件是给「下一次接手的人（或下一个会话）」看的。读完这一篇应当能直接接着干，
 > 不需要回翻聊天记录。
 
@@ -317,6 +318,7 @@ bash deploy.sh --rollback   # 回滚到最近一次备份
 | v2-c | **`--limit` 分批 + 优先级排序**（`--batch` / `--plan`） | ✅ **已完成并实测**，见 §11.7.1 |
 | v2-d | **生产 `.env` 一键更新脚本**（`gen-nas-env-update.py` → `nas-update-env.sh`） | ✅ **已完成并实测**（备份 / 三道安全闸 / 重启 / 闭环回读 / 不留中间文件），见 §11.12 |
 | v2-e | **`init --roots-from-env`**：根的清单直接从 cross-seed 的 `.env` 派生 | ✅ **已完成并实测**（DC 47 组参数 → 一条命令），见 §10.6.4 |
+| v2-f | **429 退避与 SKIPPED 的真相** —— 文档化 cross-seed 的"退避后跳过"机制 | ✅ **已文档化**，见 §11.13 |
 | v3 | **硬链接农场**（1 条 dataDir 取代 49 条，顺带闭合状态机的嵌套包缺口） | ⬜ **未做** —— 设计已完成，见 §10.5 |
 
 ### 5.1 Phase 2 验收结果
@@ -1580,3 +1582,60 @@ cp -p .env.bak.<时间戳> .env && sudo docker compose up -d --force-recreate cr
 > 但 `.env` 还是老值"的状态（脚本在 `mv` 之前中断，旧版没有 trap 兜底）。
 > 所以**判断成功与否一律以 ②（容器内环境变量）或 ③（DB 枚举结果）为准**，
 > 不要只看 `ls` 有没有 `.env.new`。
+
+---
+
+### 11.13 429 退避与 SKIPPED 的真相（2026-09-11 新增）
+
+> 回答："为什么状态机里有 282 条 SKIPPED？cross-seed 到底搜没搜过？"
+
+**结论**：
+- **cross-seed 确实没搜** —— 这 282 条在 `timestamp` 表里**没有记录**（`searched_indexers='[]'`）。
+- **但这不是 bug，是 cross-seed 的"退避后跳过"机制**。
+
+**时间线**（2026-09-11 上午）：
+
+```
+12:24:28  HDFans 返回 429 → cross-seed 标记"snoozing until 12:25:28"
+12:24:28~  后续 295 条全部 "Skipped searching (filtered by temporarily disabled indexers)"
+```
+
+cross-seed 的 `webhook` 是**单线程顺序处理**的：
+1. 收到大包根的 webhook → 开始枚举 searchee（384 个）
+2. 逐个搜索 → 第 89 个（勇敢的心）时 HDFans 返回 429
+3. **标记 HDFans 为"临时禁用"**（snooze 1 分钟）
+4. 后续所有 searchee **直接跳过**，不再尝试搜索
+5. 1 分钟后（12:25:28）HDFans 恢复，但**webhook 已经处理完了**
+
+**所以**：
+- 被跳过的 295 条 = **真的没搜过**，不是"搜了没匹配"
+- 状态机的 `SKIPPED` 阶段 = **正确记录**了"被退避秒跳"这个事实
+- 这些条目**应该被重搜** —— 这就是 `drive` 命令存在的意义
+
+**状态机的处理逻辑**：
+
+```python
+# todo_detail() 里
+if r["stage"] == "SKIPPED":
+    # SKIPPED 的优先级最高（仅次于 ERROR），会立刻被重搜
+    priority = TODO_PRIORITY["SKIPPED"]
+```
+
+**实践建议**：
+
+1. **不要对大包根打 webhook** —— 384 条一次性轰出去，遇到 429 就全军覆没
+2. **用 `drive --limit N` 分批** —— 每批只发 N 条，429 只影响当前批
+3. **SKIPPED 的片子会优先被重搜** —— 跑 `drive` 时它们排在最前面
+4. **加索引器可以解锁 UNMATCHED** —— 但 SKIPPED 不需要加站，只需要重跑
+
+**验证方法**：
+
+```bash
+# 看 cross-seed.db 的 timestamp 表
+sqlite3 cross-seed.db "select count(*) from timestamp"
+# → 如果 < 382，说明有被跳过的（没搜过的没有记录）
+
+# 看状态机的待办清单
+python scripts/reseed-state.py todo --pack frds-top250-2024 --indexers SiteA,SiteB
+# → SKIPPED 会排在最前面，且被计入待办
+```
