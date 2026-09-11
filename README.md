@@ -400,9 +400,14 @@ sh nas-update-env.sh --no-restart    # 只改不重启
 
 | 包 | 单片 | 待搜 | 阶段分布 |
 |---|---|---|---|
-| FRDS | 486 | 390 | PENDING 108 / SKIPPED 282 / UNMATCHED 48 / SEEDING 48 |
-| MBF | 4 | 4 | PENDING 4 |
-| DC | 115 | 115 | PENDING 115 |
+| FRDS | 486 | **390** | PENDING 108 / SKIPPED 282 / UNMATCHED 48 / SEEDING 48 |
+| MBF | 4 | **0** | ⚠ **UNMATCHED 4** —— 实测 HDFans 上 0 匹配，见下 |
+| DC | 115 | **115** | PENDING 115 |
+
+> **⚠ MBF 已实测：HDFans 上 0 匹配。**
+> 4 个季包各搜一次，cross-seed 全部 `Found 0 torrents`，`searchee` 表里始终没有记录。
+> 当前单站条件下**做不了种**。出路：给 Prowlarr 加别的站再搜，或暂时放弃把额度留给 DC/FRDS。
+> 状态机已回灌为 `UNMATCHED`（不会重复浪费额度），加站后会自动解锁。详见 SUMMARY §12.3.1。
 
 ### 恢复执行时的命令（**先 `--plan`，确认后再加 `--apply`**）
 
@@ -414,15 +419,14 @@ URL=http://192.168.0.7:2468
 KEY=<CROSSSEED_API_KEY>
 DB="//iSunker-DS423/docker_ssd/prowlarr_cross-seed_autohardlink/cross-seed/cross-seed.db"
 
-# 1) MBF（4 部，约 2 分钟）—— 先跑它验证通路
-python scripts/reseed-state.py drive --pack mbf --indexers HDFans --limit 50 \
-  --url $URL --api-key $KEY --db-path "$DB" --apply
+# ⚠ MBF 不用再跑了 —— 已实测 HDFans 0 匹配（UNMATCHED），见上文。
+#    除非你已给 Prowlarr 加了新站；加站后它会自动解锁。
 
-# 2) DC（115 部，3 批，每批约 24 分钟）
+# 1) DC（115 部，3 批，每批约 24 分钟）—— 从这里开始
 python scripts/reseed-state.py drive --pack dc-collection --indexers HDFans --limit 50 \
   --url $URL --api-key $KEY --db-path "$DB" --apply
 
-# 3) FRDS（390 部，8 批，每批约 24 分钟）—— SKIPPED 优先，排在最前
+# 2) FRDS（390 部，8 批，每批约 24 分钟）—— SKIPPED 优先，排在最前
 python scripts/reseed-state.py drive --pack frds-top250-2024 --indexers HDFans --limit 50 \
   --url $URL --api-key $KEY --db-path "$DB" --apply
 ```
@@ -434,7 +438,11 @@ python scripts/reseed-state.py drive --pack frds-top250-2024 --indexers HDFans -
 1. **`drive` 忘给 `--db-path` → 回灌被跳过，状态不更新。**
    现象：webhook 全发成功（204），但结尾打
    `[!!] 回灌需要 --db-path（cross-seed.db 路径），已跳过`，退出码 3。
-   补救：补上 `--db-path` 重跑即可（幂等，不会重复发送已发过的）。
+   补救：补上 `--db-path` 重跑，或单独跑 `sync` 回灌（都不发新请求，幂等）。
+
+   ⚠ 附带一个**假象**：补 `--db-path` 重跑时终端可能返回**空输出**，看着像"没执行"，
+   但 cross-seed 日志里其实有 `Searching for` 记录 —— 它跑完了，只是输出被吞了。
+   **判断 drive 是否真跑，查 cross-seed 日志，别看终端。**
 2. **`.env.new` 存在 ≠ `.env` 已更新。** 判断是否生效一律看
    ① 容器内 `DATA_DIRS` 条数 ② `cross-seed.db` 的 `data` 表，别看 `ls`。
 3. **别对大包根打 webhook。** cross-seed 的 webhook 是单线程顺序处理，

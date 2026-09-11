@@ -1742,17 +1742,36 @@ python scripts/reseed-state.py drive --pack frds-top250-2024 --indexers HDFans -
 | 包 | 单片 | 待搜 | 阶段分布 | 备注 |
 |---|---|---|---|---|
 | FRDS | 486 | **390** | PENDING 108 / SKIPPED 282 / UNMATCHED 48 / SEEDING 48 | `--depth 2` 后从 382→486（多认 104 个嵌套目录） |
-| MBF | 4 | **4** | PENDING 4 | 剧集，每季一个 searchee |
+| MBF | 4 | **0** | **UNMATCHED 4** | ⚠ **已实测：HDFans 上 0 匹配**，见 12.3.1 |
 | DC | 115 | **115** | PENDING 115 | 47 个 dataDir，嵌套包 |
-| **合计** | **605** | **509** | | |
+| **合计** | **605** | **505** | | |
 
 - SEEDING 48 部 = HDFans 已匹配并注入成功（终点，永不重搜）
-- UNMATCHED 48 部 = 真搜过、没匹配到（7 天后或加新站才重搜）
+- UNMATCHED 52 部 = 真搜过、没匹配到（FRDS 48 + MBF 4），7 天后或加新站才重搜
 - SKIPPED 282 部 = **被 429 退避秒跳，真的没搜过** → 优先级最高，见 §11.13
+
+#### 12.3.1 ⚠ MBF 实测结论：HDFans 上 0 匹配
+
+这是停止动作前跑出来的一条**真实业务结论**，值得单独记一笔。
+
+- 现象：对 MBF 4 个季包各发一次 webhook，cross-seed 日志显示
+  `Searching for ... | MediaType: PACK` → `Found 0 torrents for {...}`。
+  4 部**全部 0 匹配**，`searchee` 表里也始终没有 Brilliant 相关记录。
+- 附带现象：日志里大量
+  `Did not search for ...S01E01....mkv | MediaType: EPISODE - it is a season pack episode`
+  —— cross-seed 识别出这是季包，**自动跳过单集、只搜整季**（这是正确行为，不是问题）。
+- 结论：**MBF（我的天才女友）这个资源在 HDFans 上没有对应种子，当前单站条件下做不了种。**
+- 出路（二选一）：
+  1. 给 Prowlarr **加别的站**再搜（多站是提高命中率的唯一手段，见 README「多站点」）；
+  2. 接受 MBF 暂时放弃，把额度留给 DC / FRDS。
+- 状态机已回灌为 `UNMATCHED`（不是 PENDING），所以**不会重复浪费额度**；
+  7 天后或加新站时会自动重新进入待搜。
 
 ### 12.4 下一步操作手册
 
-**顺序建议**：MBF（2 分钟，验证通路）→ DC（3 批）→ FRDS（8 批）。
+**顺序建议**：~~MBF（2 分钟，验证通路）~~ → **DC（3 批）→ FRDS（8 批）**。
+> MBF 已经跑过了，结论是 HDFans 上 0 匹配（见 12.3.1），**不必再跑第二遍**；
+> 除非你先给 Prowlarr 加了新站。加站后 MBF 的 4 部会自动从 UNMATCHED 解锁。
 
 ```bash
 URL=http://192.168.0.7:2468
@@ -1783,8 +1802,13 @@ python scripts/reseed-state.py drive --pack frds-top250-2024 --indexers HDFans -
    现象：4 条 webhook 全发成功（HTTP 204），结尾却打
    `[!!] 回灌需要 --db-path（cross-seed.db 路径），已跳过`，退出码 **3**。
    后果：请求发出去了，但状态机不知道，`todo` 里还是 PENDING，重跑会重复发。
-   补救：补上 `--db-path` 重跑（幂等，已发过的不会重复）。
+   补救：补上 `--db-path` 重跑，或单独跑 `sync` 回灌（都不发新请求，幂等）。
    → 已写进 README「当前状态与下一步」。
+
+   本次实测还发现一个**假象**：补 `--db-path` 重跑时，终端返回了**空输出**，
+   看起来像"没执行"，但 cross-seed 日志里 16:36 明明有搜索记录 ——
+   它其实**跑完了**，只是输出被截断吞掉了。
+   **判断 drive 有没有真跑，别看终端输出，去查 cross-seed 日志的 `Searching for`。**
 
 2. 🔴 **`.env.new` 存在 ≠ `.env` 已更新。**
    实测出现过「备份和 `.env.new` 都生成了、但 `.env` 还是老值」（脚本在 `mv` 前中断，
