@@ -72,23 +72,54 @@ def _safe_stdout() -> None:
         pass
 
 
-def _list_dirs(root: str, pattern: str = "*", exclude: list[str] | None = None) -> list[str]:
-    """列出包内子目录（跳过隐藏目录与 @eaDir）。exclude 支持 glob。"""
+def _scan_pack(nas_roots: list[str], local_roots: list[str], *,
+               depth: int, pattern: str = "*",
+               exclude: list[str] | None = None) -> tuple[list[tuple[str, str]], list[str], list[str]]:
+    """把若干 dataDir 扫成 `[(单片名, NAS 路径)]`。
+
+    返回 `(条目, 重名, 问题)`。**不写库**，方便 `--dry-run` 先核对。
+
+    路径映射：`--root`（NAS 视角，webhook 要用）与 `--local-root`（能列目录的 UNC）
+    **按序一一对应**；扫描在 local 侧做，结果再按根前缀替换回 NAS 视角。
+    """
+    problems: list[str] = []
+    if not nas_roots:
+        return [], [], ["至少要有一个 --root"]
+    if local_roots and len(local_roots) != len(nas_roots):
+        return [], [], [
+            f"--root {len(nas_roots)} 个、--local-root {len(local_roots)} 个，数量不等 —— "
+            f"多根包必须**按序一一对应**（第 i 个 local-root 就是第 i 个 root 的 UNC）"]
+
+    pairs: list[tuple[str, str]] = []
+    for i, nr in enumerate(nas_roots):
+        lr = local_roots[i] if i < len(local_roots) else nr
+        nr, lr = S._norm_path(nr), S._norm_path(lr)
+        if not os.path.isdir(lr):
+            problems.append(f"列不了目录: {lr}")
+            continue
+        pairs.append((nr, lr))
+    if not pairs:
+        return [], [], problems or ["没有任何一个根可以列目录"]
+
+    entries_local, dups = S.scan_pack([lr for _, lr in pairs], max_depth=depth)
+
     excl = [p for p in (exclude or []) if p]
-    out = []
-    with os.scandir(root) as it:
-        for e in it:
-            if not e.is_dir(follow_symlinks=False):
-                continue
-            n = e.name
-            if n.startswith(".") or n == "@eaDir":
-                continue
-            if any(Path(n).match(p) for p in excl):
-                continue
-            if pattern not in ("*", "") and not Path(n).match(pattern):
-                continue
-            out.append(n)
-    return sorted(out)
+    out: list[tuple[str, str]] = []
+    for name, path in entries_local:
+        if name.startswith(".") or name == "@eaDir":
+            continue
+        if any(Path(name).match(p) for p in excl):
+            continue
+        if pattern not in ("*", "") and not Path(name).match(pattern):
+            continue
+        np = S._norm_path(path)                    # scan_pack 已规范化，这里是双保险
+        nas = np                                   # 兜底：万一没配对上就用原路径
+        for nr, lr in pairs:
+            if np == lr or np.startswith(lr + "/"):
+                nas = nr + np[len(lr):]
+                break
+        out.append((name, nas))
+    return out, dups, problems
 
 
 def _qbit_torrents(url: str, category: str, timeout: float = 30.0) -> list[dict]:
@@ -155,29 +186,50 @@ def _sync_now(args, st, *, quiet: bool = False):
 # 子命令
 # --------------------------------------------------------------------------- #
 def cmd_init(args) -> int:
+    nas_roots = [r for r in (args.root or []) if r]
+    local_roots = [r for r in (getattr(args, "local_root", None) or []) if r]
+    entries, dups, problems = _scan_pack(
+        nas_roots, local_roots,
+        depth=args.depth, pattern=args.pattern, exclude=args.exclude)
+
+    for p in problems:
+        _say(f"[!!] {p}")
+    if not entries:
+        _say("没有扫到任何单片，未写库。")
+        _say("    --root      = cross-seed 视角的 NAS 路径（/volume1/...，webhook 要用它）")
+        _say("    --local-root= 本机能列目录的等价路径（//YOUR-NAS/...），**按序一一对应**")
+        return 2
+
+    _say(f"根 {len(nas_roots)} 个，深度 maxDataDepth={args.depth}")
+    for i, nr in enumerate(nas_roots):
+        lr = local_roots[i] if i < len(local_roots) else nr
+        _say(f"  [{i + 1}] NAS: {nr}")
+        _say(f"      本地: {lr}")
+    _say(f"识别到 {len(entries)} 个单片（= cross-seed 会去搜的 searchee 目录）")
+    if dups:
+        uniq = sorted(set(dups))
+        _say(f"[warn] {len(uniq)} 个重名（两个根下同名，只保留了先出现的那个）: "
+             + ", ".join(uniq[:5]) + (" ..." if len(uniq) > 5 else ""))
+
+    if args.dry_run:
+        for n, p in entries[:15]:
+            _say(f"    {n}")
+        if len(entries) > 15:
+            _say(f"    ... 其余 {len(entries) - 15} 个")
+        _say("(--dry-run，未写库)")
+        return 0
+
     with S.StateStore(args.db) as st:
-        st.upsert_pack(args.pack, args.root, local_root=args.local_root,
-                       link_dir=args.link_dir, category=args.category)
-        listing_root = args.local_root or args.root
-        if not os.path.isdir(listing_root):
-            _say(f"[!!] 列目录用的路径不可达: {listing_root}")
-            _say("     Windows 上列目录要传 --local-root //YOUR-NAS/video/...（UNC），")
-            _say("     --root 保持 NAS 视角的 /volume1/video/...（webhook 要用它）。")
-            return 2
-        dirs = _list_dirs(listing_root, args.pattern, args.exclude)
-        _say(f"NAS 根目录（写库/webhook 用）: {args.root}")
-        _say(f"列目录用的路径            : {listing_root}")
-        _say(f"识别到 {len(dirs)} 个子目录")
-        if args.dry_run:
-            for d in dirs[:10]:
-                _say("   ", d)
-            if len(dirs) > 10:
-                _say(f"    ... 其余 {len(dirs) - 10} 个")
-            _say("(--dry-run，未写库)")
-            return 0
-        added = st.register_dirs(args.pack, args.root, dirs)
+        st.upsert_pack(
+            args.pack, nas_roots[0],
+            local_root=(local_roots or nas_roots)[0],
+            roots=nas_roots,
+            local_roots=local_roots or nas_roots,
+            max_depth=args.depth,
+            link_dir=args.link_dir, category=args.category)
+        added = st.register_dirs(args.pack, entries)
         total = len(st.movies(args.pack))
-        _say(f"新登记 {added} 部，库内共 {total} 部（已存在的不重置）")
+    _say(f"新登记 {added} 部，库内共 {total} 部（已存在的不重置 stage）")
     return 0
 
 
@@ -461,10 +513,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     a = sub.add_parser("init", help="登记大包与包内子目录")
     a.add_argument("--pack", required=True)
-    a.add_argument("--root", required=True,
-                   help="★cross-seed 视角的路径（NAS 上），如 /volume1/video/download/movies/<PACK>")
-    a.add_argument("--local-root",
-                   help="本机可访问的等价路径（Windows 上填 //YOUR-NAS/video/...），只用于列目录")
+    a.add_argument("--root", required=True, action="append",
+                   help="★cross-seed 视角的路径（NAS 上），如 /volume1/video/download/movies/<PACK>。"
+                        "多根包（嵌套合集）可重复传，与 --local-root 按序一一对应")
+    a.add_argument("--local-root", action="append",
+                   help="本机可访问的等价路径（Windows 上填 //YOUR-NAS/video/...），只用于列目录。"
+                        "多根包可重复传")
+    a.add_argument("--depth", type=int, default=S.DEFAULT_MAX_DATA_DEPTH,
+                   help=f"枚举深度，对应 cross-seed 的 maxDataDepth，默认 {S.DEFAULT_MAX_DATA_DEPTH}。"
+                        "★必须与 cross-seed 的配置一致，否则会登记出 cross-seed 根本不搜的幽灵条目")
     a.add_argument("--link-dir")
     a.add_argument("--category")
     a.add_argument("--pattern", default="*")

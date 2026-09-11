@@ -269,23 +269,168 @@ class LogFacts:
     progress: list[tuple[str, int, int, str]] = field(default_factory=list)  # (time, n, m, kind)
 
 
-def dir_name_of(path: str, root: str) -> str | None:
-    """把日志里的绝对路径归到"包内子目录名"。root 之外的路径返回 None。
+# --------------------------------------------------------------------------- #
+# searchee 枚举：**逐字复刻** cross-seed v6.13.7 的 src/dataFiles.ts
+# --------------------------------------------------------------------------- #
+# 为什么要把这段逻辑抄过来，而不是"凭理解写一个"
+# ------------------------------------------------
+# 2026-09-11 直接读了 cross-seed **v6.13.7** 的源码（src/dataFiles.ts，已核对
+# master 与 v6.13.7 两版，这两段代码完全一致）：
+#
+#   findSearcheesFromAllDataDirs = dataDirs.flatMap(dd =>
+#       readdir(dd).flatMap(child => findPotentialNestedRoots(child, maxDataDepth)))
+#
+#   findPotentialNestedRoots(root, depth):
+#     if (depth <= 0 || shouldIgnore(root))  -> []
+#     else if (isDir)                        -> [...递归(子项, depth-1), root]  # 自己也算
+#     else /* 文件 */                        -> [root]
+#
+#   shouldIgnore: 目录名 ∈ IGNORED_FOLDERS_SUBSTRINGS / 文件扩展名 ∉ VIDEO_EXTENSIONS
+#
+# ⚠ 所以规则是**纯按深度**，**没有**"目录里含视频才算 searchee、否则被穿透"这回事。
+#   （我之前那个"含视频即叶子"的模型是错的 —— 它预测 485、实际 405。）
+#   正确含义：`maxDataDepth` = **从 dataDir 往下数几层**；第 1..N 层的
+#   **目录和视频文件**全都是 searchee（非视频文件忽略，黑名单目录忽略且不再下钻）。
+#
+# 实测校验（FRDS，maxDataDepth=2）：
+#   - 本函数枚举 857 条（487 目录 + 370 视频文件）
+#   - `cross-seed.db` 的 `searchee` 表 405 条**全部**落在枚举结果里（只在 DB = 0）
+#   - 日志里 "Searching for" 的路径只有**第 1 层（416 行）和第 2 层（100 行）**，无第 3 层
+DEFAULT_MAX_DATA_DEPTH = 2
+
+VIDEO_EXTENSIONS = frozenset({
+    ".mkv", ".mp4", ".avi", ".ts", ".m4v", ".3gp", ".nsv", ".ty", ".strm", ".rm",
+    ".rmvb", ".mov", ".qt", ".divx", ".xvid", ".bivx", ".pva", ".wmv", ".asf",
+    ".asx", ".ogm", ".ogv", ".m2v", ".dvr-ms", ".mpg", ".mpeg", ".avc", ".vp3",
+    ".svq3", ".nuv", ".viv", ".dv", ".fli", ".flv", ".wpl", ".wtv",
+})
+
+IGNORED_FOLDER_SUBSTRINGS = ("sample", "proof", "bdmv", "bdrom", "certificate",
+                             "video_ts")
+
+
+def should_ignore_path(name: str, is_dir: bool) -> bool:
+    """对应 cross-seed 的 `shouldIgnorePathHeuristically()`。"""
+    if is_dir:
+        return name.lower() in IGNORED_FOLDER_SUBSTRINGS
+    return os.path.splitext(name)[1].lower() not in VIDEO_EXTENSIONS
+
+
+def find_nested_roots(path: str, depth: int, is_dir: bool | None = None) -> list[str]:
+    """对应 cross-seed 的 `findPotentialNestedRoots()`。
+
+    返回顺序与源码一致（**由深到浅**，末位是自己）——源码注释说是为了 memoization，
+    我们保留同样的顺序，方便和源码逐行对照。
+    """
+    if is_dir is None:
+        is_dir = os.path.isdir(path)
+    if depth <= 0 or should_ignore_path(os.path.basename(path), is_dir):
+        return []
+    if not is_dir:
+        return [path]
+    try:
+        with os.scandir(path) as it:
+            children = [(e.name, e.is_dir()) for e in it]
+    except OSError:
+        return []
+    out: list[str] = []
+    for name, child_is_dir in children:
+        out += find_nested_roots(os.path.join(path, name), depth - 1, child_is_dir)
+    out.append(path)
+    return out
+
+
+def find_searchee_paths(data_dir: str, max_depth: int = DEFAULT_MAX_DATA_DEPTH) -> list[str]:
+    """对应 `findSearcheesFromAllDataDirs()` 里**单个** dataDir 的分支。"""
+    try:
+        with os.scandir(data_dir) as it:
+            names = [e.name for e in it]
+    except OSError:
+        return []
+    out: list[str] = []
+    for n in names:
+        out += find_nested_roots(os.path.join(data_dir, n), max_depth)
+    return out
+
+
+def scan_pack(local_roots: list[str], *, max_depth: int = DEFAULT_MAX_DATA_DEPTH
+              ) -> tuple[list[tuple[str, str]], list[str]]:
+    """把若干 dataDir 扫成 `[(单片名, 路径)]`，粒度 = cross-seed 的 searchee 目录。
+
+    只登记**目录**，外加"直接挂在 dataDir 下的视频文件"（罕见，但它自己就是一个
+    searchee）。更深的视频文件不用单独登记 —— `dir_name_of()` 会把它们塌回所在目录，
+    这正是我们要的粒度。
+
+    返回 `(条目, 重名列表)`。重名意味着两个 dataDir 下有同名目录，只能保留一个，
+    调用方应当把它报出来（别静默丢）。
+
+    ⚠ 返回的路径**一律是 `/` 分隔的规范形式**（`_norm_path()` 处理过）——
+    这样 Windows 上跑（`os.path.join` 会给反斜杠）和 NAS 上跑的产出完全一致，
+    调用方做前缀替换时不会踩分隔符不一致的坑。
+    """
+    picked: dict[str, str] = {}
+    dup: list[str] = []
+    for root in local_roots:
+        r = _norm_path(root)
+        for p in find_searchee_paths(root, max_depth):
+            p = _norm_path(p)
+            is_dir = os.path.isdir(p)
+            # 文件只收"直接挂在 dataDir 下"的那种
+            if not is_dir and _norm_path(os.path.dirname(p)) != r:
+                continue
+            name = p.rsplit("/", 1)[-1]
+            if name in picked:
+                if picked[name] != p:
+                    dup.append(name)
+                continue
+            picked[name] = p
+    return sorted(picked.items()), dup
+
+
+def _norm_path(p: str) -> str:
+    """日志是 Linux 的 `/`，本地测试可能是 Windows 的 `\\` —— 统一成 `/` 好比较。"""
+    return p.replace("\\", "/").rstrip("/")
+
+
+def dir_name_of(path: str, root: str | list[str],
+                dir_paths: dict[str, str] | None = None) -> str | None:
+    """把日志里的绝对路径归到"包内单片名"。
+
+    **优先级 1：`dir_paths`（已登记路径 → 单片名）的最长前缀匹配。**
+    多根 / 嵌套包必需。例：DC 的
+      `…/01.绿箭侠（…）/Arrow.S01-S08…/Arrow.S01.Bluray…`
+    应当命中**季层** `Arrow.S01.Bluray…`，而不是塌回容器 `Arrow.S01-S08…`；
+    而没有这一层时，容器那条 searchee 也会正确命中容器自己。
+
+    **优先级 2：退回单根语义** —— 取 root 之后的第一个路径段（老行为，兼容旧调用）。
 
     注意：cross-seed 的 searchee 既可能是目录，也可能是目录里的 .mkv 文件，
-    两者都归到同一个 dir_name —— 这正是我们要的粒度。
+    两者都归到同一个单片 —— 这正是我们要的粒度。
     """
-    p = path.rstrip("/")
-    r = root.rstrip("/")
-    if not p or not r or p == r:
+    p = _norm_path(path)
+    if not p:
         return None
-    if not p.startswith(r + "/"):
-        return None
-    rel = p[len(r) + 1:]
-    return rel.split("/")[0] or None
+    if dir_paths:
+        cur = p
+        while True:
+            hit = dir_paths.get(cur)
+            if hit is not None:
+                return hit
+            i = cur.rfind("/")
+            if i <= 0:
+                break
+            cur = cur[:i]
+    roots = [root] if isinstance(root, str) else list(root)
+    for r in sorted((_norm_path(x) for x in roots if x), key=len, reverse=True):
+        if p == r:
+            return None
+        if p.startswith(r + "/"):
+            return p[len(r) + 1:].split("/")[0] or None
+    return None
 
 
-def parse_log(text: str, root: str) -> LogFacts:
+def parse_log(text: str, root: str | list[str],
+              dir_paths: dict[str, str] | None = None) -> LogFacts:
     """解析 cross-seed 的 info/verbose 日志（两者格式一致，verbose 更全）。"""
     f = LogFacts()
     for line in text.splitlines():
@@ -297,7 +442,7 @@ def parse_log(text: str, root: str) -> LogFacts:
 
         mm = _RE_SEARCH.search(msg)
         if mm:
-            d = dir_name_of(mm.group(1), root)
+            d = dir_name_of(mm.group(1), root, dir_paths)
             if d:
                 f.searched.setdefault(d, set())
                 f.searches_seen += 1
@@ -311,7 +456,7 @@ def parse_log(text: str, root: str) -> LogFacts:
 
         mm = _RE_SKIP.search(msg) or _RE_SKIP_INFO.search(msg)
         if mm:
-            d = dir_name_of(mm.group(1), root)
+            d = dir_name_of(mm.group(1), root, dir_paths)
             if mm.re is _RE_SKIP:
                 idx = {x.strip() for x in mm.group(2).split(",") if x.strip()}
             else:
@@ -328,7 +473,7 @@ def parse_log(text: str, root: str) -> LogFacts:
 
         mm = _RE_FOUND.search(msg)
         if mm:
-            d = dir_name_of(mm.group(5), root)
+            d = dir_name_of(mm.group(5), root, dir_paths)
             if d:
                 f.found.setdefault(d, []).append((mm.group(2), mm.group(3)))
             continue
@@ -488,6 +633,9 @@ CREATE TABLE IF NOT EXISTS pack (
   name            TEXT PRIMARY KEY,
   root            TEXT NOT NULL,          -- ★cross-seed 视角的路径（NAS 上），webhook 要用它
   local_root      TEXT,                   -- 可选的本地/UNC 等价路径，只用于"列目录"
+  roots           TEXT,                   -- JSON 数组：多根包的全部 root（root = 第一个）
+  local_roots     TEXT,                   -- JSON 数组：与 roots 一一对应的可列目录路径
+  max_depth       INTEGER,                -- 枚举深度，对应 cross-seed 的 maxDataDepth
   link_dir        TEXT,
   category        TEXT,
   created_at      TEXT NOT NULL,
@@ -583,6 +731,12 @@ class StateStore:
         cols = {r["name"] for r in self.con.execute("PRAGMA table_info(pack)")}
         if "local_root" not in cols:
             self.con.execute("ALTER TABLE pack ADD COLUMN local_root TEXT")
+        # 2026-09-11：支持多根 / 嵌套包（DC 的"单片"分散在 47 个标签目录里）
+        for col in ("roots", "local_roots"):
+            if col not in cols:
+                self.con.execute(f"ALTER TABLE pack ADD COLUMN {col} TEXT")
+        if "max_depth" not in cols:
+            self.con.execute("ALTER TABLE pack ADD COLUMN max_depth INTEGER")
         mcols = {r["name"] for r in self.con.execute("PRAGMA table_info(movie)")}
         if "indexer_seen" not in mcols:
             self.con.execute(
@@ -599,18 +753,33 @@ class StateStore:
 
     # -- pack --------------------------------------------------------------- #
     def upsert_pack(self, name: str, root: str, *, local_root: str | None = None,
+                    roots: list[str] | None = None,
+                    local_roots: list[str] | None = None,
+                    max_depth: int | None = None,
                     link_dir: str | None = None,
                     category: str | None = None, note: str | None = None) -> None:
+        """登记/更新一个包。
+
+        多根包（如 DC 的 47 个标签目录）传 `roots` / `local_roots`；
+        `root` 仍必填 —— 它是 `roots[0]`，老代码和 webhook 都还在用它。
+        """
+        roots_json = json.dumps(roots, ensure_ascii=False) if roots else None
+        lroots_json = json.dumps(local_roots, ensure_ascii=False) if local_roots else None
         self.con.execute(
-            """INSERT INTO pack(name, root, local_root, link_dir, category, created_at, note)
-               VALUES(?,?,?,?,?,?,?)
+            """INSERT INTO pack(name, root, local_root, roots, local_roots, max_depth,
+                                link_dir, category, created_at, note)
+               VALUES(?,?,?,?,?,?,?,?,?,?)
                ON CONFLICT(name) DO UPDATE SET
                  root=excluded.root,
                  local_root=COALESCE(excluded.local_root, pack.local_root),
+                 roots=COALESCE(excluded.roots, pack.roots),
+                 local_roots=COALESCE(excluded.local_roots, pack.local_roots),
+                 max_depth=COALESCE(excluded.max_depth, pack.max_depth),
                  link_dir=COALESCE(excluded.link_dir, pack.link_dir),
                  category=COALESCE(excluded.category, pack.category),
                  note=COALESCE(excluded.note, pack.note)""",
-            (name, root, local_root, link_dir, category, _now(), note),
+            (name, root, local_root, roots_json, lroots_json, max_depth,
+             link_dir, category, _now(), note),
         )
         self.con.commit()
 
@@ -620,6 +789,36 @@ class StateStore:
         if p is None:
             raise KeyError(f"包未登记: {pack!r}")
         return p["local_root"] or p["root"]
+
+    def roots(self, pack: str) -> list[str]:
+        """包的全部 cross-seed 视角根（多根包返回全部；单根包返回 `[root]`）。"""
+        p = self.pack(pack)
+        if p is None:
+            raise KeyError(f"包未登记: {pack!r}")
+        return _u(p["roots"]) or [p["root"]]
+
+    def local_roots(self, pack: str) -> list[str]:
+        """包的全部"可列目录"根，与 `roots()` 按序对应。
+
+        多根包必须逐根配对：`roots[i]` 与 `local_roots[i]` 指的是同一目录，
+        只是视角不同（NAS 路径 vs UNC 路径）。数量对不上就退回 `local_root()`。
+        """
+        p = self.pack(pack)
+        if p is None:
+            raise KeyError(f"包未登记: {pack!r}")
+        rs, lrs = _u(p["roots"]), _u(p["local_roots"])
+        if lrs and len(lrs) == len(rs):
+            return lrs
+        return [p["local_root"] or p["root"]]
+
+    def max_depth(self, pack: str) -> int:
+        p = self.pack(pack)
+        if p is None:
+            raise KeyError(f"包未登记: {pack!r}")
+        try:
+            return int(p["max_depth"])
+        except (TypeError, ValueError, IndexError):
+            return DEFAULT_MAX_DATA_DEPTH
 
     def pack(self, name: str) -> sqlite3.Row | None:
         return self.con.execute("SELECT * FROM pack WHERE name=?", (name,)).fetchone()
@@ -636,19 +835,32 @@ class StateStore:
         self.con.commit()
 
     # -- movie -------------------------------------------------------------- #
-    def register_dirs(self, pack: str, root: str, dir_names: list[str]) -> int:
-        """把包内子目录登记成 PENDING（已存在的不动，stage 不会被重置）。"""
+    def register_dirs(self, pack: str, entries: list[tuple[str, str]]) -> int:
+        """把 `[(单片名, 完整路径)]` 登记成 PENDING（已存在的不动，stage 不会被重置）。
+
+        多根包必须传**完整路径** —— 因为两个根下可能有同名目录，而且
+        `dir_name_of()` 要靠路径做最长前缀匹配。
+        """
         added = 0
-        for d in dir_names:
+        for name, path in entries:
             cur = self.con.execute(
                 """INSERT INTO movie(pack, dir_name, path, stage, updated_at)
                    VALUES(?,?,?,?,?)
-                   ON CONFLICT(pack, dir_name) DO NOTHING""",
-                (pack, d, f"{root.rstrip('/')}/{d}", STAGE_PENDING, _now()),
+                   ON CONFLICT(pack, dir_name) DO UPDATE SET path=excluded.path""",
+                (pack, name, _norm_path(path), STAGE_PENDING, _now()),
             )
             added += cur.rowcount or 0
         self.con.commit()
         return added
+
+    def dir_paths(self, pack: str) -> dict[str, str]:
+        """`{规范化完整路径: 单片名}` —— 给 `dir_name_of()` 做最长前缀匹配用。
+
+        用完整路径（而不是只有目录名）是为了让嵌套包的"季层"能被正确区分：
+        DC 的 `…/01.绿箭侠…/Arrow.S01-S08…/Arrow.S01.Bluray…` 应当命中季层，
+        而不是塌回容器 `Arrow.S01-S08…`。
+        """
+        return {_norm_path(r["path"]): r["dir_name"] for r in self.movies(pack)}
 
     def movies(self, pack: str, *, stages: list[str] | None = None) -> list[sqlite3.Row]:
         sql = "SELECT * FROM movie WHERE pack=?"
@@ -1001,9 +1213,12 @@ def sync_pack(
     p = store.pack(pack_name)
     if p is None:
         raise KeyError(f"包未登记: {pack_name!r}（先跑 init）")
-    root = p["root"]
+    roots = store.roots(pack_name)          # 多根包会返回全部根
 
     dirs = {r["dir_name"] for r in store.movies(pack_name)}
+    # 路径 → 单片名：给日志解析做最长前缀匹配。多根/嵌套包靠它才能把
+    # "季层"路径和"容器层"路径分开（见 dir_name_of 的说明）。
+    dpaths = store.dir_paths(pack_name)
     rep = SyncReport(pack=pack_name, movies=len(dirs))
 
     # --- 1) cross-seed.db ------------------------------------------------- #
@@ -1044,7 +1259,7 @@ def sync_pack(
         except OSError:
             pass
     for t in texts:
-        f = parse_log(t, root)
+        f = parse_log(t, roots, dpaths)
         for d, idxs in f.searched.items():
             facts.searched.setdefault(d, set()).update(idxs)
         for d, idxs in f.skipped.items():

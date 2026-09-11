@@ -287,10 +287,16 @@ python scripts/gen-datadirs.py "//YOUR-NAS/video/download/movies/DC相关剧集�
 
 **不要**改用调大 `maxDataDepth` 来省这 47 条 —— 它是**全局**的，其它包会跟着多出一批 searchee，
 而中文标签照样进池子。实测两种接法的垃圾名数量：包根方案 **47 个**，本方案 **0 个**。
-完整分析与 cross-seed 的 searchee 生成规则见 SUMMARY §10.2。
+完整分析与 cross-seed 的 searchee 生成规则见 SUMMARY §10.2 / §10.6。
 
-> 已知缺口：状态机（`reseed-state.py`）目前**单根、只扫一层**，所以 DC 能被 cross-seed 搜到，
-> 但状态机还看不到它（会报 `unresolved`）。修法见 SUMMARY §10.4 / §10.5。
+> ⚠ **`--depth` 必须与 cross-seed 的 `maxDataDepth` 完全一致**。两者不一致时，
+> 状态机会登记出 cross-seed 根本不搜的**幽灵条目**（永远 PENDING），
+> 或者漏掉 cross-seed 真在搜的片子。规则是**纯按深度**的（第 1..N 层的目录和视频文件
+> 全是 searchee），不是"含视频才算"—— 详见 SUMMARY §10.6.1。
+
+> 状态机**已支持嵌套包**（2026-09-11）：`init --root` / `--local-root` 可重复传、
+> 新增 `--depth`（= cross-seed 的 `maxDataDepth`，**必须与它一致**）。
+> DC 47 根 → 115 单片已能正常登记，详见 SUMMARY §10.4 / §10.6。
 
 #### 生产 `.env` 怎么更新（本地改完要同步到 NAS）
 

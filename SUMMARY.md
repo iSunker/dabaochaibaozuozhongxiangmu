@@ -4,7 +4,8 @@
 > §6.1 SiteB 已恢复；§6.5 429 真因是站点 502；§6.6 indexerId 会变；
 > **§11 单片状态机已实现**，含 **§11.6 按站重搜周期（默认每站 7 天）** 与
 > **§11.8 `drive` 控速 + 退避闭环**；§11.10 说明 `orchestrator/main.py`；
-> **§10 多包支持已落地**，含 **§10.2 嵌套结构陷阱（DC 案例）**；
+> **§10 多包支持已落地**，含 **§10.2 嵌套结构陷阱（DC 案例）**、
+> **§10.6 cross-seed 的 searchee 枚举规则（读源码定论）**；
 > **§11.7.1 `--limit` 分批**、**§10.5 A/B 方案对比**、**§11.11 全量能否排除已做种**）
 > 本文件是给「下一次接手的人（或下一个会话）」看的。读完这一篇应当能直接接着干，
 > 不需要回翻聊天记录。
@@ -310,7 +311,7 @@ bash deploy.sh --rollback   # 回滚到最近一次备份
 | Phase 2.9 | **`drive` 控速 + 退避闭环**（`DriveSession`：`--interval` 节流、撞退避就等、打完自动 `sync` 回灌，见 §11.8） | ✅ **已实现**（默认 dry-run，`--apply` 才真发） |
 | Phase 3 | 编排器 build / preflight / run --dry-run / run / status | ⬜ 未开始（`run` 已非必要，见 §6.4；`status` 仍值得做；`main.py` 说明见 §11.10） |
 | v2-a | **多包接入**：MBF（剧集，每季）+ DC（嵌套，47 个 dataDir） | ✅ **配置已落地**，见 §10.1 / §10.2 |
-| v2-b | 状态机支持嵌套包（多根 + 深度） | ⬜ **未做** —— DC 目前 cross-seed 会搜、但状态机看不到，见 §10.4 |
+| v2-b | 状态机支持嵌套包（多根 + 深度） | ✅ **已完成并实测**（DC 47 根 → 115 单片），见 §10.4 / §10.6 |
 | v2-c | **`--limit` 分批 + 优先级排序**（`--batch` / `--plan`） | ✅ **已完成并实测**，见 §11.7.1 |
 | v2-d | **生产 `.env` 一键更新脚本**（`gen-nas-env-update.py` → `nas-update-env.sh`） | ✅ **已完成并实测**（含备份/校验/重启/闭环回读），见 README「生产 .env 怎么更新」 |
 | v3 | **硬链接农场**（1 条 dataDir 取代 49 条，顺带闭合状态机的嵌套包缺口） | ⬜ **未做** —— 设计已完成，见 §10.5 |
@@ -828,21 +829,20 @@ python scripts/gen-datadirs.py "//YOUR-NAS/video/download/movies/DC相关剧集�
    接入 DC 后 searchee 总数从 ~405 涨到 **~1000+**（49 个 dataDir × 各自子目录），
    一轮全量搜索的耗时和 API 次数都会成倍增长 —— **务必用 `--limit` 分批**（见 §11.7.1）。
 
-### 10.4 已知缺口：状态机还不支持嵌套包
+### 10.4 ~~已知缺口：状态机还不支持嵌套包~~ → **已解决（2026-09-11）**
 
-`scripts/reseed-state.py init` 目前是**单根、只扫一层**（`_list_dirs`），
-而 DC 的"单片"分散在 47 个根里。所以：
+`reseed-state.py init` 原本是**单根、只扫一层**，而 DC 的"单片"分散在 47 个根里。
+**现在已支持多根 + 深度**，DC 可以正常登记了（见 §10.6 的实现与实测）。
 
-- `sync --pack dc` 会把 DC 的 searchee 名**对不上任何目录**，报 `unresolved` 并跳过；
-- 也就是说 **cross-seed 会正常搜 DC，但状态机暂时看不到 DC**。
+改动：
 
-两种修法（都还没做，**详细优劣见 §10.5**）：
+- `init --root` / `--local-root` 改成**可重复**（多根包按序一一对应），新增 `--depth`；
+- `pack` 表新增 `roots` / `local_roots` / `max_depth` 三列（老库自动迁移，`root` 保留 = `roots[0]`）；
+- `dir_name_of()` 改成**对已登记路径做最长前缀匹配**，这样嵌套包的"季层"不会被塌回"容器层"；
+- 枚举规则**逐字复刻** cross-seed v6.13.7 的 `src/dataFiles.ts`（见 §10.6.1）。
 
-- **A. 多根 + 深度**：`init` 支持重复 `--root`/`--local-root` + `--depth N`，
-  枚举时套用 §10.2 那条 cross-seed 规则（含视频即叶子）。改动约 60 行，FRDS 流程不受影响。
-- **B. 硬链接农场**：建 `/volume1/video/download/reseed_farm/`（**不要**放进 `reseed_singles/`，原因见 §10.5.4），
-  里面按发布名建硬链接目录指向真实数据。这样 `dataDirs` 只 1 条、
-  `maxDataDepth` 保持默认、状态机也只要 1 个根 —— 三者全部归一。零磁盘开销，但要动 NAS 上的目录。
+> 原先写的两种修法（A 多根+深度 / B 硬链接农场）里，**A 已落地**。
+> B 仍然值得做（`dataDirs` 从 49 条归一成 1 条），见 §10.5。
 
 > 附带的待定策略：**未匹配的片子怎么处置**。
 > 现状是写进 `scripts/unmatched.tsv` 就不再管。建议用 cross-seed 的
@@ -951,10 +951,100 @@ maxDataDepth: 2                 # 默认值，不动全局
 
 - **现在（已落地）**：方案 A 的变体 —— 49 条 `dataDir`（FRDS + MBF + 47 个 DC 标签目录），
   `maxDataDepth` 保持默认 2。**这是最短路径，已经能跑，且不产生垃圾 searchee**（因为标签目录的直接子目录就是真发布名）。
+- **状态机侧的对应修法已实现**（§10.4 / §10.6）：`init` 支持多根 + 深度，
+  DC 47 根 → 115 单片已能正常登记。**所以 §10.4 的缺口不再是阻塞项。**
 - **建议下一步（v3）**：上方案 B。它的真正价值**不是省几条配置**，而是
   **把"N 个异构大包"归一成"一个扁平的、状态机原生支持的 searchee 集合"** ——
-  §10.4 的缺口、每次加包都要改 `.env`、包内结构变化要重算枚举规则，这三个问题一起消失。
+  每次加包都要改 `.env`、包内结构变化要重算枚举规则，这两个问题会一起消失。
 - **两者不冲突**：A 可以继续跑着，农场构建器做好后，把 `dataDirs` 从 49 条切成 1 条即可。
+
+### 10.6 ★ cross-seed 的 searchee 枚举规则（读源码定论）+ 多根已落地
+
+#### 10.6.1 规则（逐字读 cross-seed v6.13.7 `src/dataFiles.ts`）
+
+```js
+findSearcheesFromAllDataDirs = dataDirs.flatMap(dd =>
+    readdir(dd).flatMap(child => findPotentialNestedRoots(child, maxDataDepth)))
+
+findPotentialNestedRoots(root, depth):
+  if (depth <= 0 || shouldIgnore(root))  -> []
+  else if (isDir)                        -> [...递归(子项, depth-1), root]   // 自己也算
+  else /* 文件 */                        -> [root]
+
+shouldIgnore: 目录名 ∈ {sample, proof, bdmv, bdrom, certificate, video_ts}
+              文件扩展名 ∉ VIDEO_EXTENSIONS(.mkv/.mp4/.avi/.ts/… 共 35 个)
+```
+
+**⚠ 结论：规则是纯按深度，没有"目录里含视频才算 searchee、否则被穿透"这回事。**
+`maxDataDepth` 就是**从 dataDir 往下数几层**；第 1..N 层的**目录和视频文件**全都是
+searchee（非视频文件忽略，黑名单目录忽略且不再下钻）。
+
+> 我之前那个"含视频即叶子"的模型是**错的** —— 它在 FRDS 上预测 485、实际 405，
+> 差的那 80 个正是"第 2 层不含视频的目录"（比如 `X战警合集…/X战警1…`）。
+> **教训：涉及别人的枚举/匹配规则，必须读源码，别靠反推。**
+> 反推时"数据对不上"只会让你怀疑数据，读源码才会让你发现模型错了。
+
+#### 10.6.2 实测校验（三个包，0 垃圾名）
+
+| 包 | 根数 | `--depth 1` | `--depth 2` | 垃圾名 |
+|---|---|---|---|---|
+| FRDS | 1 | 382（含 `--exclude "0观影清单*"`） | **486** | 0 |
+| MBF | 1 | — | **4** | 0 |
+| DC 合集 | 47 | — | **115**（88 第 1 层 + 27 第 2 层） | 0 |
+
+- FRDS 多出的 104 个 = `Rocky.I~VI`、`Saw.I~VII`、`Creed`、`Jigsaw` ——
+  全是**合集里的单片真发布名**，104/104 都含年份/卷号。
+- DC 的 27 个第 2 层 = `Arrow.S01…Arrow.S08`、`Preacher.S01~S04`、`Titans.2018.S01~S04` ——
+  27/27 全是季级真发布名，**只有 5 个第 1 层目录有多季子项**。
+- DC 47 根、115 单片，**0 重名**。
+
+#### 10.6.3 回归实测：depth 从 1 提到 2，多捞回 3 个真匹配
+
+在真实库副本上跑（`hlink/state.db` 的 copy）：
+
+| | depth=1（原状） | depth=2 |
+|---|---|---|
+| 登记 | 382 部 | **486 部** |
+| `cross-seed.db` 认为搜过 | 95 | **105**（+10） |
+| 匹配到单种 | 48 | **51**（+3） |
+| **对不上目录的 searchee 名** | **10 个** ⚠ | **0** ✅ |
+
+那 10 个对不上的，正是 `X战警合集…/X战警1…` 这类第 2 层目录 ——
+**depth=1 让状态机对它们完全失明**。提到 2 之后 unresolved 归零，还多认了 3 个真匹配。
+
+#### 10.6.4 落地实现
+
+- `orchestrator/state.py`
+  - 新增 `VIDEO_EXTENSIONS` / `IGNORED_FOLDER_SUBSTRINGS` / `should_ignore_path()` /
+    `find_nested_roots()` / `find_searchee_paths()` / `scan_pack()`（含源码出处与版本注释）
+  - `dir_name_of(path, root, dir_paths=None)`：**最长前缀匹配**。DC 的
+    `…/01.绿箭侠…/Arrow.S01-S08…/Arrow.S02.Bluray…/xxx.mkv` 会正确归到**季层**
+    `Arrow.S02.Bluray…`，而不是塌回容器 `Arrow.S01-S08…`（后者是 DC 之前丢数据的根因）
+  - `scan_pack()` 输出的路径**一律规范成 `/`** —— Windows 上 `os.path.join` 会给反斜杠，
+    不归一的话做前缀替换会静默出错（这个是实测抓到的真 bug）
+  - `pack` 表加 `roots` / `local_roots` / `max_depth`；`upsert_pack()` / `roots()` /
+    `local_roots()` / `max_depth()`；`register_dirs()` 改成收 `[(名, 完整路径)]`；
+    新增 `dir_paths()`
+- `scripts/reseed-state.py`
+  - `init --root` / `--local-root` 可重复、新增 `--depth`（默认 2，**必须与 cross-seed 一致**）
+  - 新增 `_scan_pack()`：多根配对 + 本地路径→NAS 路径回写 + `--pattern`/`--exclude` 过滤；
+    返回 `(条目, 重名, 问题)`，重名与列不了目录都会**明确报出来**（不静默丢）
+
+**用法**（DC 47 根）：
+
+```bash
+# 先看（不写库）
+python scripts/reseed-state.py init --pack dc-collection --depth 2 \
+  --root /volume1/.../DC系列剧集/01.绿箭侠（2012.10-2019.10） \
+  --local-root //YOUR-NAS/.../DC系列剧集/01.绿箭侠（2012.10-2019.10） \
+  ...（47 组，按序一一对应）--dry-run
+
+# 真写
+python scripts/reseed-state.py init --pack dc-collection --depth 2 <同样的 47 组>
+```
+
+> 47 组参数太长，建议用 `scripts/gen-datadirs.py --level 2` 生成后再套壳，
+> 或直接在 `.env` 的 `DATA_DIRS` 基础上用脚本拼（见 §10.2 的生成器）。
 
 ---
 
