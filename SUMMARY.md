@@ -3,7 +3,8 @@
 > 最后更新：2026-09-11（§5.3 已修正：全量**没跑完**，只搜了 87/382，真实命中率 ~50%；
 > §6.1 SiteB 已恢复；§6.5 429 真因是站点 502；§6.6 indexerId 会变；
 > **§11 单片状态机已实现**，含 **§11.6 按站重搜周期（默认每站 7 天）** 与
-> **§11.8 `drive` 控速 + 退避闭环**；§11.10 说明 `orchestrator/main.py`；§10 多包规划）
+> **§11.8 `drive` 控速 + 退避闭环**；§11.10 说明 `orchestrator/main.py`；
+> **§10 多包支持已落地**，含 **§10.2 嵌套结构陷阱（DC 案例）**）
 > 本文件是给「下一次接手的人（或下一个会话）」看的。读完这一篇应当能直接接着干，
 > 不需要回翻聊天记录。
 
@@ -307,7 +308,8 @@ bash deploy.sh --rollback   # 回滚到最近一次备份
 | Phase 2.8 | **按站重搜周期**（默认每站 7 天，可 `--cadence "SiteA=7,SiteB=30"`，见 §11.6） | ✅ **已实现并验证** |
 | Phase 2.9 | **`drive` 控速 + 退避闭环**（`DriveSession`：`--interval` 节流、撞退避就等、打完自动 `sync` 回灌，见 §11.8） | ✅ **已实现**（默认 dry-run，`--apply` 才真发） |
 | Phase 3 | 编排器 build / preflight / run --dry-run / run / status | ⬜ 未开始（`run` 已非必要，见 §6.4；`status` 仍值得做；`main.py` 说明见 §11.10） |
-| v2 | 多包支持 | ⬜ 规划中，见 §10 |
+| v2-a | **多包接入**：MBF（剧集，每季）+ DC（嵌套，47 个 dataDir） | ✅ **配置已落地**，见 §10.1 / §10.2 |
+| v2-b | 状态机支持嵌套包（多根 + 深度） | ⬜ **未做** —— DC 目前 cross-seed 会搜、但状态机看不到，见 §10.4 |
 
 ### 5.1 Phase 2 验收结果
 
@@ -742,23 +744,103 @@ curl -s -H "X-Api-Key: <K>" http://<NAS_IP>:9696/api/v1/indexer \
 
 ---
 
-## 10. v2 规划：多包支持
+## 10. v2 多包支持（2026-09-11 部分落地）
 
-需求（2026-09-11 提出）：除了 `DouBan_IMDB.TOP250...FRDS`，**还有其它大包**也要拆包挂种。
-**本次不实现，只记录设计要点。**
+需求：除了 `DouBan_IMDB.TOP250...FRDS`，**还有其它大包**也要拆包挂种。
 
-1. **`DATA_DIRS`**（`.env`）是逗号分隔数组 → 追加新大包根目录即可，cross-seed 会把每个包的子目录都当 searchee。
-2. **`hlink/config.yml` 的 `jobs[]`** 是数组 → 复制一段、改 `name` / `source_dir`；
-   编排器的 `status` 需要支持**按 job 分组**汇报。
-3. **`LINK_DIR` 必须与源大包同卷**。新大包若落在**另一个物理卷**，就要为新卷再配一个 linkDir ——
+### 10.1 已接入的包
+
+| 包名（job） | 源目录 | 单片单位 | 结构 |
+|---|---|---|---|
+| `frds-top250-2024` | `/volume1/video/download/movies/DouBan_IMDB.TOP250…FRDS` | 一部电影 | ✅ 根目录子目录即发布名 |
+| `my-brilliant-friend-s01-s04` | `/volume1/video/download/TV/My.Brilliant.Friend.S01-S04…ADWeb` | **一季**（S01~S04） | ✅ 根目录子目录即发布名 |
+| `dc`（见 §10.2） | `/volume1/video/download/movies/DC相关剧集全系列大合集` | 一部电影 / 一季 | ⚠ **根下多一层中文标签，需特殊处理** |
+
+### 10.2 ★ 嵌套结构的陷阱（DC 案例，2026-09-11）
+
+**背景**：`DC相关剧集全系列大合集` 是**自己整理的合集**（不是单一 torrent），根目录下先分两类，
+再往下才是单片。实测有**四种形状**：
+
+```
+DC相关剧集全系列大合集/                 ← 包根（0）
+├── DC系列电影/                        ← 分类层（1）
+│   ├── 01.蝙蝠侠1：侠影之谜 (2005)/      ← ★中文标签层（2）
+│   │   └── Batman Begins 2005 …-CHD/  ← 发布名（3）→ 里面 1 个 .mkv
+│   └── 04.超人：钢铁之躯(2013.6.14)/    ← ★标签层（2）
+│       └── Superman…mkv               ← 裸文件，无发布名目录！
+└── DC系列剧集/                        ← 分类层（1）
+    ├── 01.绿箭侠（2012.10-2019.10）/    ← ★标签层（2）
+    │   └── Arrow.S01-S08…-FRDS/       ← 整季包（3）
+    │       └── Arrow.S01.Bluray…-FRDS/ ← 每季发布名（4）
+    └── 04.闪电侠（2014.10-2023.2）/     ← ★标签层（2）
+        └── 闪电侠 第一季.The.Flash.S01…-NTb/ ← 每季发布名（3）
+```
+
+**为什么不能直接把包根塞进 `DATA_DIRS`**：cross-seed 用**目录名**去站点搜索。
+若 dataDir = 包根，那层中文标签（`01.蝙蝠侠1：侠影之谜 (2005)`）会被当成 searchee 名 →
+**搜不到任何东西，却照样消耗查询额度**（正是 §5.3 里"白烧"的翻版）。
+
+实测两种接法（用已入库的 `cross-seed.db` 反推规则后测算）：
+
+| 接法 | 干净发布名 | 垃圾名 | 结论 |
+|---|---|---|---|
+| 包根作 dataDir + `maxDataDepth: 3` | 88 | **47**（全是中文标签） | 需配 `blockList: ["nameRegex:^\\d{2}\\."]` 兜底，属启发式 |
+| **47 个标签目录分别作 dataDir** | **86~113** | **0** | ✅ **采用** |
+
+**采用的接法**：把 `DATA_DIRS` 指到**标签层本身**（即每个 `DC系列电影/01.…` 目录），
+这样每个 dataDir 的**直接子目录才是发布名** —— 与 FRDS 的成功模式（§10.1）同构。
+`maxDataDepth` **保持默认 2**，不动全局，因此**不影响 FRDS 现有扫描行为**。
+
+```bash
+# 生成这 47 条路径（以后往 DC 里加片，重跑这条即可，幂等）
+python scripts/gen-datadirs.py "//YOUR-NAS/video/download/movies/DC相关剧集全系列大合集" \
+    --level 2 --nas-prefix /volume1/video --list          # 先核对
+python scripts/gen-datadirs.py "//YOUR-NAS/video/download/movies/DC相关剧集全系列大合集" \
+    --level 2 --nas-prefix /volume1/video --append-to .env # 追加（不覆盖已有）
+```
+
+**cross-seed 的 searchee 生成规则**（用 `cross-seed.db` 反推 + 官方文档校验）：
+
+- **dataDir 的直接子目录**：一律是 searchee（这正是我们要的）；
+- **更深层**：只有**直接含视频文件**的目录才是 searchee，容器目录会被**穿透**（不下钻的是"含视频"的那种）；
+- 深度上限由 **`maxDataDepth`** 控制，**默认 2**；调大会产生更多 searchee 和更多 indexer 请求（官方明确警告）；
+- 过滤器（`blockList` 的 `nameRegex:` / `folderRegex:`）在**每次搜索前**生效，可用来兜底拦名。
+
+> ⚠ **不要**为了让 DC 少写 47 条而把 `maxDataDepth` 调到 3~4：那是**全局**的，
+> FRDS 会跟着多出一批 searchee，且 DC 的中文标签照样进池子。
+
+### 10.3 其它设计要点
+
+1. **`hlink/config.yml` 的 `jobs[]`** 是数组 → 复制一段、改 `name` / `source_dir`。
+   注意 job 的 `source_dir` 语义是"**其子目录 = 各单片**"，所以 DC 这种嵌套包
+   不能只写一行 job（见 §10.4）。
+2. **`LINK_DIR` 必须与源大包同卷**。新大包若落在**另一个物理卷**，就要为新卷再配一个 linkDir ——
    cross-seed v6 的 `linkDirs` 是数组，它会按 searchee 所在 device 挑同卷的那个。
    ⚠ 不要图省事把 linkDir 指到 SSD：跨卷硬链接直接失败。
-4. **分类**：`QBIT_CATEGORY` 目前是单一分类 `reseed-singles`。多包时靠
+3. **分类**：`QBIT_CATEGORY` 目前是单一分类 `reseed-singles`。多包时靠
    `LINK_DIR/<包名>/<Tracker>/...` 的目录结构区分，或给每个包单独起一个 qB 分类。
-5. **磁盘**：新大包要占真实空间（§9）；硬链接侧依旧零开销。
-6. **站点压力**：包越多、搜索次数越多 → **按包分时段跑**，别同时开多个全量任务；`delay` 保持 30~45。
+4. **磁盘**：新大包要占真实空间（§9）；硬链接侧依旧零开销。
+5. **站点压力**：包越多、搜索次数越多 → **按包分时段跑**，别同时开多个全量任务；`delay` 保持 30~45。
+   接入 DC 后 searchee 总数从 ~405 涨到 **~1000+**（49 个 dataDir × 各自子目录），
+   一轮全量搜索的耗时和 API 次数都会成倍增长 —— **务必用 `--limit` 分批**。
 
-> 附带的待定策略（同样本次不实现）：**未匹配的片子怎么处置**。
+### 10.4 已知缺口：状态机还不支持嵌套包
+
+`scripts/reseed-state.py init` 目前是**单根、只扫一层**（`_list_dirs`），
+而 DC 的"单片"分散在 47 个根里。所以：
+
+- `sync --pack dc` 会把 DC 的 searchee 名**对不上任何目录**，报 `unresolved` 并跳过；
+- 也就是说 **cross-seed 会正常搜 DC，但状态机暂时看不到 DC**。
+
+两种修法（都还没做）：
+
+- **A. 多根 + 深度**：`init` 支持重复 `--root`/`--local-root` + `--depth N`，
+  枚举时套用 §10.2 那条 cross-seed 规则（含视频即叶子）。改动约 60 行，FRDS 流程不受影响。
+- **B. 硬链接农场**：建 `/volume1/video/download/reseed_farm/`，
+  里面按发布名建硬链接目录指向真实数据。这样 `dataDirs` 只 1 条、
+  `maxDataDepth: 1`、状态机也只要 1 个根 —— 三者全部归一。零磁盘开销，但要动 NAS 上的目录。
+
+> 附带的待定策略：**未匹配的片子怎么处置**。
 > 现状是写进 `scripts/unmatched.tsv` 就不再管。建议用 cross-seed 的
 > `searchCadence`（多久重扫一遍 dataDirs）+ `excludeRecentSearch`（多久内不重复搜同一部）
 > 做**低频自动重扫**，靠"等站点有人上传"自然补上；

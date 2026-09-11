@@ -57,6 +57,14 @@ jobs:
     include: ["*"]                   # 子目录(单片)筛选，glob，可选
     exclude: []                      # 例如 ["*sample*", "@eaDir"]
 
+  # 剧集包：根目录下直接就是"每季"的发布名目录（S01..S04），结构干净。
+  # 单种单位 = 一季（PT 站上通常也是按季发布，而非整包 S01-S04）。
+  - name: my-brilliant-friend-s01-s04
+    enabled: true
+    source_dir: /volume1/video/download/TV/My.Brilliant.Friend.S01-S04.2018.2160p.NowPlayer.WEB-DL.H265.DD5.1-ADWeb
+    include: ["*"]
+    exclude: []
+
     # ---- ★预留：未来大包 / 未来能力（本版本除 category 外均不生效）----
     category: null                   # 覆盖全局分类
     indexers: []                     # 限定只用某些 Prowlarr 索引器

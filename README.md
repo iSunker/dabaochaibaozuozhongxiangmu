@@ -49,7 +49,8 @@ prowlarr_cross-seed_autohardlink/   # NAS 部署目录（compose 就放这里，
 └─ README.md
 ```
 
-> 开发仓库里另有 `scripts/`（`run-batch.sh` 抽样脚本、`reseed-state.py` 状态机 CLI）。
+> 开发仓库里另有 `scripts/`（`run-batch.sh` 抽样脚本、`reseed-state.py` 状态机 CLI、
+> `gen-datadirs.py` 生成嵌套包的 `DATA_DIRS` 片段）。
 > 它们是**在 Windows 上跑**的工具，不必进容器。由状态机导出的 `unmatched.tsv` /
 > `todo.txt` 属运行时产物，已 gitignore。
 
@@ -249,20 +250,56 @@ python scripts/reseed-state.py todo   --pack $PACK --include-cooldown   # 忽略
 - 想跑"一次性批量作业"而不是长期增量维护，用 `python -m orchestrator.main`
   （`preflight` / `run` / `status` / `prestage`，见 SUMMARY §11.10）。
 
-### 多包支持（v2 规划，尚未实现）
+### 多包支持（已接入 3 个包）
 
-目标：同一套栈给**多个大包**拆包挂种。需要动的地方：
+| 包 | 单片单位 | 结构 |
+|---|---|---|
+| `frds-top250-2024` | 一部电影 | ✅ 根目录子目录即发布名 |
+| `my-brilliant-friend-s01-s04` | 一季（S01~S04） | ✅ 根目录子目录即发布名 |
+| DC 合集 | 一部电影 / 一季 | ⚠ 根下多一层中文标签，见下 |
 
-1. **`.env` 的 `DATA_DIRS`** 是逗号分隔数组 —— 直接追加新大包根目录，cross-seed 会把每个包的子目录都当 searchee。
-2. **`hlink/config.yml` 的 `jobs`** 是数组 —— 复制一段、改 `name` / `source_dir`；编排器的 `status` 要能按 job 分组汇报。
-3. **`LINK_DIR` 必须与源大包同一个物理卷**（硬链接不能跨卷）。新大包若在**另一个卷**上，
+#### ⚠ 嵌套结构：dataDir 要指到「发布名的那一层」
+
+cross-seed 用**目录名**去站点搜索。若大包根下还有一层分类/标签目录，那层名字会被当成 searchee 名 ——
+**搜不到任何东西，却照样消耗查询额度**。
+
+```text
+DC相关剧集全系列大合集/            ← ❌ 别把这里当 dataDir
+├── DC系列电影/                   ← ❌ 也别
+│   └── 01.蝙蝠侠1：侠影之谜 (2005)/ ← ❌ 更别（中文标签）
+│       └── Batman Begins 2005 …-CHD/  ← ✅ 这里才是发布名
+```
+
+正确做法：把 `DATA_DIRS` 指到**标签层的每个目录**，这样它的直接子目录才是发布名。
+用附带的生成器产出这段（幂等，加片后重跑即可）：
+
+```bash
+python scripts/gen-datadirs.py "//YOUR-NAS/video/download/movies/DC相关剧集全系列大合集" \
+    --level 2 --nas-prefix /volume1/video --list           # 先核对
+python scripts/gen-datadirs.py "//YOUR-NAS/video/download/movies/DC相关剧集全系列大合集" \
+    --level 2 --nas-prefix /volume1/video --append-to .env  # 追加
+```
+
+**不要**改用调大 `maxDataDepth` 来省这 47 条 —— 它是**全局**的，其它包会跟着多出一批 searchee，
+而中文标签照样进池子。实测两种接法的垃圾名数量：包根方案 **47 个**，本方案 **0 个**。
+完整分析与 cross-seed 的 searchee 生成规则见 SUMMARY §10.2。
+
+> 已知缺口：状态机（`reseed-state.py`）目前**单根、只扫一层**，所以 DC 能被 cross-seed 搜到，
+> 但状态机还看不到它（会报 `unresolved`）。修法见 SUMMARY §10.4。
+
+#### 其它要点
+
+1. **`hlink/config.yml` 的 `jobs`** 是数组 —— 复制一段、改 `name` / `source_dir`；
+   注意 job 的 `source_dir` 语义是「**其子目录 = 各单片**」。
+2. **`LINK_DIR` 必须与源大包同一个物理卷**（硬链接不能跨卷）。新大包若在**另一个卷**上，
    就要为新卷再配一个 linkDir —— cross-seed v6 的 `linkDirs` 是数组，它会按 searchee 所在设备挑同卷的那个。
    **不要**把 linkDir 指到 SSD 上图省事：跨卷建不了硬链接，会直接失败。
-4. **分类与汇报**：`QBIT_CATEGORY` 目前是单一分类 `reseed-singles`。多包时靠
+3. **分类与汇报**：`QBIT_CATEGORY` 目前是单一分类 `reseed-singles`。多包时靠
    `LINK_DIR/<包名>/<Tracker>/...` 的目录结构区分，或给每个包单独起一个 qB 分类。
-5. **磁盘**：新大包本身要占真实空间（NAS 的 `/volume1` 只剩约 20 GB，见 SUMMARY §9）；
+4. **磁盘**：新大包本身要占真实空间（NAS 的 `/volume1` 只剩约 20 GB，见 SUMMARY §9）；
    但**硬链接侧依旧零开销** —— 这正是本项目能在快满的卷上跑起来的原因。
-6. **站点压力**：包越多、搜索越多。建议**按包分时段**跑，别同时开多个全量任务。
+5. **站点压力**：接入 DC 后 searchee 总数从 ~405 涨到 **~1000+**，一轮全量搜索的耗时和 API 次数
+   都会成倍增长。**按包分时段跑、务必带 `--limit`**，别同时开多个全量任务。
 
 ### IYUU 扩散（本次不实现）
 
