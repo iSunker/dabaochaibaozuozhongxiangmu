@@ -1,0 +1,112 @@
+# =====================================================================
+# 大包拆包 · 单种保种  —— 服务栈
+#   prowlarr        : 把你的 PT 站变成 Torznab，供 cross-seed 搜索
+#   flaresolverr    : (可选) 过 Cloudflare，中文 NexusPHP 站常需要
+#   cross-seed      : 按内容匹配单种 → 在 linkDir 建硬链接 → 注入 :3060
+#   reseed-orchestrator : 我们写的编排器(一次性 CLI)，预检/驱动/汇报
+#
+# 注意：qbittorrent-reseed(:3060) 由它自己的 compose 单独运行，不在本栈内；
+#       本栈通过 NAS 局域网 IP(${NAS_IP}:3060) 访问它。
+#
+# 用法：
+#   docker compose up -d prowlarr flaresolverr        # Phase 1
+#   docker compose up -d cross-seed                   # Phase 2
+#   docker compose build reseed-orchestrator          # Phase 3
+#   docker compose run --rm reseed-orchestrator preflight
+#   docker compose run --rm reseed-orchestrator run --job frds-top250-2024 --dry-run
+# =====================================================================
+
+services:
+  prowlarr:
+    image: lscr.io/linuxserver/prowlarr:latest
+    container_name: reseed-prowlarr
+    env_file: [.env]
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+    volumes:
+      # ./ = compose 文件所在目录 = /volume2/docker_ssd/prowlarr_cross-seed_autohardlink
+      - ./prowlarr:/config
+    ports:
+      - "9696:9696"
+    networks: [reseed-net]
+    restart: unless-stopped
+
+  # 可选：中文站过 Cloudflare 用；不需要就删掉本段（并去掉 Prowlarr 里的代理设置）
+  flaresolverr:
+    image: ghcr.io/flaresolverr/flaresolverr:latest
+    container_name: reseed-flaresolverr
+    environment:
+      - LOG_LEVEL=info
+      - TZ=${TZ}
+    ports:
+      - "8191:8191"
+    networks: [reseed-net]
+    restart: unless-stopped
+
+  cross-seed:
+    image: ghcr.io/cross-seed/cross-seed:latest
+    container_name: reseed-cross-seed
+    # 以媒体属主身份运行，保证建出来的硬链接属主/权限与大包一致
+    user: "${PUID}:${PGID}"
+    env_file: [.env]
+    environment:
+      - TZ=${TZ}
+      - CONFIG_DIR=/config
+      # 供 cross-seed/config.js 读取（见该文件顶部说明）
+      # qbittorrent-reseed 在它自己 compose 栈的网络里（qbittorrent-reseed_default）。
+      # 本服务已接入该网络(qbit-net)，用服务名直连；不要改回 ${NAS_IP}，群晖上
+      # 「容器→宿主机 LAN IP→DNAT 回另一容器」的回环会 timeout（2026-09-11 实测）。
+      - QBIT_URL=http://qbittorrent-reseed:3060
+      - TORZNAB_URLS=${TORZNAB_URLS}
+      - DATA_DIRS=${DATA_DIRS}
+      - LINK_DIR=${LINK_DIR}
+      - LINK_TYPE=${LINK_TYPE}
+      - MATCH_MODE=${MATCH_MODE}
+      - SKIP_RECHECK=${SKIP_RECHECK}
+      - QBIT_CATEGORY=${QBIT_CATEGORY}
+      - CROSSSEED_API_KEY=${CROSSSEED_API_KEY}
+    command: daemon
+    volumes:
+      - ./cross-seed:/config
+      # ★大包源数据 + 建链接目录：两者必须在同一物理卷，且此处 1:1 挂载
+      - /volume1/video:/volume1/video
+    ports:
+      - "2468:2468"
+    depends_on: [prowlarr]
+    networks: [reseed-net, qbit-net]
+    restart: unless-stopped
+
+  # 一次性 CLI：默认只做只读预检；实际匹配请用 `docker compose run ... run`
+  reseed-orchestrator:
+    build:
+      context: .
+      dockerfile: orchestrator/Dockerfile
+    image: reseed-orchestrator:0.1.0
+    container_name: reseed-orchestrator
+    user: "${PUID}:${PGID}"
+    env_file: [.env]
+    environment:
+      - TZ=${TZ}
+      - NAS_IP=${NAS_IP}
+      - RESEED_CONFIG=/config/config.yml
+    volumes:
+      # 编排器(autohardlink)的配置目录 = ./hlink；把 config.yml 放进 hlink/ 即可。
+      # 注意：这里只放"配置/日志"等元数据，真正的硬链接数据在 LINK_DIR(/volume1/video 下)。
+      - ./hlink:/config
+      # 预检要 stat 源目录/校验同卷；prestage 要建链接 → 同样 1:1 挂载媒体卷
+      - /volume1/video:/volume1/video
+    depends_on: [cross-seed]
+    networks: [reseed-net, qbit-net]
+    restart: "no"
+
+networks:
+  reseed-net:
+    driver: bridge
+  # qbittorrent-reseed 由它自己的 compose 栈创建的网络，这里以 external 接入，
+  # 使 cross-seed / 编排器能用服务名直连 :3060（源 IP 为 172.x，已被 qB 的
+  # AuthSubnetWhitelist 172.16.0.0/12 覆盖）。
+  qbit-net:
+    external: true
+    name: qbittorrent-reseed_default

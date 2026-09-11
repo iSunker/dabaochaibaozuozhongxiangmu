@@ -1,0 +1,65 @@
+# =====================================================================
+# 大包拆包 · 单种保种  —— 编排器主配置（你主要编辑这个文件）
+# ---------------------------------------------------------------------
+# 语法说明：
+#   * 形如 ${XXX} 的值会在加载时用环境变量(来自 .env / compose)展开，
+#     未定义则原样保留。IP / 密码 / apiKey / 路径等"单点维护"放 .env。
+#   * 标 ★预留 的字段本版本(仅 cross-seed 单种保种)不生效，仅为将来
+#     "别的大包 / 别的匹配器 / IYUU 扩散"预留，可放心保留。
+# =====================================================================
+
+qbittorrent:
+  # 隔离的第三实例 qbittorrent-reseed。本栈已接入它所在的 docker 网络
+  # （compose 的 qbit-net = qbittorrent-reseed_default），故用服务名直连。
+  # 不要改回 http://${NAS_IP}:3060：群晖上「容器→宿主机 LAN IP→DNAT 回另一容器」
+  # 的回环会 timeout（2026-09-11 实测）。
+  url: "http://qbittorrent-reseed:3060"
+
+  # subnet_whitelist = 依赖 qB 局域网免密白名单（推荐，见 patches/reseed-qbit.conf.md）
+  # password         = 用户名/密码登录（密码放 .env 的 QBIT_PASSWORD）
+  auth_mode: "${QBIT_AUTH_MODE}"
+  username: admin
+  password: "${QBIT_PASSWORD}"
+
+  # 注入单种统一使用的分类，便于隔离 / 汇报 / 清理
+  category: "${QBIT_CATEGORY}"
+
+  # NAS 路径 <-> 容器路径映射；本环境 /volume1/video 是 1:1，保持默认即可
+  path_mapping:
+    "/volume1/video": "/volume1/video"
+
+matcher:
+  # ★预留: cross-seed(本版实现) | iyuu | custom
+  engine: cross-seed
+  # 容器网络内 cross-seed 守护进程地址（compose 服务名）
+  crossseed_url: http://cross-seed:2468
+  crossseed_api_key: "${CROSSSEED_API_KEY}"
+
+  # cross-seed 匹配宽松度；允许值随 cross-seed 版本变化，以官方文档为准
+  match_mode: "${MATCH_MODE}"
+  # 内容匹配(名称+大小)→ 建议 false：注入后做一次校验(recheck)确认数据一致再做种
+  skip_recheck: ${SKIP_RECHECK}
+  link_type: "${LINK_TYPE}"          # hardlink | symlink | reflink
+  # cross-seed 建链接(做种数据)的目录，★必须与各大包源目录在同一物理卷★
+  # 需与 .env 的 LINK_DIR、cross-seed/config.js 的 linkDirs 保持一致
+  link_dir: "${LINK_DIR}"
+
+  # 单次 run 内，触发匹配后最多等待做种确认的时间
+  wait_timeout_sec: 900
+  poll_interval_sec: 15
+
+jobs:
+  # 一个 job = 一个大包。将来加别的大包，复制一段、改 name/source_dir 即可。
+  - name: frds-top250-2024
+    enabled: true
+    # 大包根目录：其"子目录 = 各单片"。须与 cross-seed 的 dataDirs 之一一致。
+    source_dir: /volume1/video/download/movies/DouBan_IMDB.TOP250.Movies.Mixed.Collection.20240501.FRDS
+    include: ["*"]                   # 子目录(单片)筛选，glob，可选
+    exclude: []                      # 例如 ["*sample*", "@eaDir"]
+
+    # ---- ★预留：未来大包 / 未来能力（本版本除 category 外均不生效）----
+    category: null                   # 覆盖全局分类
+    indexers: []                     # 限定只用某些 Prowlarr 索引器
+    matcher_engine: null             # 单任务覆盖匹配器
+    iyuu_handoff: false              # 做种成功后触发 IYUU 扩散（预留，不实现）
+    tags: []

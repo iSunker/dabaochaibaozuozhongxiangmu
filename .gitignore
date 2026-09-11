@@ -1,0 +1,37 @@
+# ===== 切勿提交：密钥 / 运行时数据 =====
+# 注意：.gitignore 不支持行尾注释，注释必须独占一行（否则会被当成路径规则）。
+
+# .env 含 NAS IP / cross-seed apikey / (经 TORZNAB 携带的) PT passkey
+.env
+
+# Prowlarr 配置目录含各站 cookie/passkey/apikey —— 忽略全部内容，只保留占位 .gitkeep
+prowlarr/*
+!prowlarr/.gitkeep
+
+# cross-seed 运行时数据（config.js 需提交，故只忽略下列 db/日志/缓存）
+cross-seed/*.db
+cross-seed/*.db-*
+cross-seed/logs/
+cross-seed/torrent_cache/
+
+# 我们自己的单片状态库（运行时数据，含包内片名清单）+ 由它导出的待办清单
+hlink/state.db
+hlink/state.db-*
+scripts/todo.txt
+
+# 由状态机导出的派生数据（含真实片名/站点名，属运行时产物）
+scripts/*.tsv
+
+# 本地 NAS 地址（真实主机名 / 内网 IP）—— 各人自建，不入库
+scripts/.nasrc
+
+# 本地分析用的临时目录（复制 cross-seed.db 出来读）
+.tmp-db/
+
+# Python
+**/__pycache__/
+**/*.pyc
+
+# deploy.sh 覆盖生产前留下的备份
+.deploy-backup/
+  

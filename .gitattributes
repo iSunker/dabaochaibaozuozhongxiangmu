@@ -1,0 +1,3 @@
+# 统一以 LF 存储/检出。本仓库要部署到 Linux/NAS 的 Docker，
+# 若被转成 CRLF 会导致 .env 值尾带 \r、shell/脚本解析出错。
+* text=auto eol=lf

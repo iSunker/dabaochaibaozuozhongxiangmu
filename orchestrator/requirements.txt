@@ -1,0 +1,3 @@
+# 编排器唯一的第三方依赖（HTTP 走标准库 urllib，故不需要 requests/httpx）。
+# 只用 PyYAML 以最大化在 NAS(ARM64) 上的构建可靠性。
+PyYAML>=6.0,<7.0

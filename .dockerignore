@@ -1,0 +1,12 @@
+# 编排器镜像构建上下文 = 本目录；下列内容与构建无关或含密钥，排除掉。
+.env
+prowlarr/
+cross-seed/
+hlink/
+data/
+patches/
+README.md
+**/__pycache__/
+**/*.pyc
+.git/
+.gitignore
