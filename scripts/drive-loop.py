@@ -760,6 +760,23 @@ def _redact(s: str) -> str:
 #:   而且是那种"这次抹了、下次才发现"的抹法。宁可多一个文件。
 RECONCILE_FILE = HERE / ".reconcile.state"
 
+#: `.reconcile.state` 里存「声明点基线」的保留键。
+#: ★ 它**不是一格读数** —— 读数是「本次读到了什么」，基线是「**现状**（已接受的差集）」。
+#:   前缀 `_` 是给未来的自己看的：`n/a` 记账那一圈只遍历 `metrics` 里的键，
+#:   碰不到它，所以它会被原样带过去，不会被误当成"某个格子从没读到过"。
+PACKS_BASELINE_KEY = "_packs_baseline"
+
+
+def _packs_norm(d) -> dict:
+    """把基线/本次读数归一成可比较的形状（缺字段补空、排序）。
+
+    ★ 归一在**读**这一侧做，而不是在**写**那侧 —— 老版本写下的文件可能是
+      `{"undriven": ["mbf"]}` 而没有 `unreg` 键，读的时候不补就会 KeyError。
+    """
+    d = d if isinstance(d, dict) else {}
+    return {"undriven": sorted(d.get("undriven") or []),
+            "unreg": sorted(d.get("unreg") or [])}
+
 
 def _reconcile_read() -> dict:
     try:
@@ -842,6 +859,7 @@ def reconcile_watch(args) -> tuple[str, dict]:
                "packs_undriven": "n/a", "packs_unreg": "n/a"}
     lines: list[str] = []
     prev_ok = _reconcile_read()             # #34：每一格上次真的读到数是什么时候
+    packs_baseline = None                   # 本次算出的新基线（没算就保持 None，别抹掉旧的）
 
     log_path = (getattr(args, "log", None) or [None])[0]
     text = None
@@ -988,9 +1006,17 @@ def reconcile_watch(args) -> tuple[str, dict]:
     #                            就是不排它，它的片子**永远不会被搜到**
     #      `--packs` − pack 表 = 在名单里但库里没登记 → 更糟：状态机看不见它的片子，
     #                            整包会被判成「别的包」（other_pack）而静默降级
-    # ★ 基线 1（就是 `mbf`），跟上面那条「无人认领」一个写法：非空就发 alert、
-    #    key 固定、12h 冷却交给 notify。**别把基线写进代码** —— 写进去就分不清
-    #    「回到基线」和「判据死了」（§18.19 的教训）。
+    # ★ 这条**只报变化，不报现状**（2026-09-12 深夜改）。现状（例如 `mbf` 登记了
+    #    却一直没被驱动）是**已接受**的，每天喊一次只会把告警喊成噪音 ——
+    #    而噪音的代价是**真的出问题时没人看**。
+    #      · 差集里出现了**基线里没有**的 → 发 alert（有新问题）
+    #      · 与基线一致、或**缩回**基线之内 → **不发**（修好了不必喊）
+    #    无论发不发，都把它采纳为新基线 —— 所以同一个差集只喊一次。
+    #    ★ 缩也采纳：不然「删掉 mbf 打的那一行」之后基线还是旧的，
+    #      将来它再被加回来时，「又冒出来了」这件事就没人报（那才是真要抓的）。
+    # ★ 基线**不进代码、进状态文件**（`.reconcile.state` 的 `_packs_baseline`）：
+    #    写进代码就分不清「回到基线」和「判据死了」（§18.19 的教训）。
+    # ★ 但**日报正文照旧每天打印**完整差集 —— 不告警 ≠ 看不见。
     # ★ 「没给 `--packs`」必须给 `n/a` 而不是 0：调用方没传和名单对得上是两件事，
     #    TSV 里两者长得一样就没法事后分开（同上面 `fa`/`unclaimed` 的规矩）。
     try:
@@ -1007,6 +1033,47 @@ def reconcile_watch(args) -> tuple[str, dict]:
             undriven = [p for p in reg if p not in driven]
             unreg = [p for p in driven if p not in reg]
             m.update(packs_undriven=len(undriven), packs_unreg=len(unreg))
+            cur = {"undriven": sorted(undriven), "unreg": sorted(unreg)}
+            packs_baseline = cur          # 无论告不告警都采纳
+            prev_b = _packs_norm(prev_ok.get(PACKS_BASELINE_KEY))
+
+            if PACKS_BASELINE_KEY not in prev_ok:
+                # 第一次读数：现状不是新闻 → 记基线，**不告警**。
+                # ★ 这一步同时是「mbf 这种躺着的老问题不再每天喊」的开关。
+                note = ("   ★ 首次读数 → 已记为基线，**不告警**"
+                        "（现状不是新闻；往后只报变化）。")
+            else:
+                grew = []
+                for dim, label in (("undriven", "登记了却没被驱动"),
+                                   ("unreg", "在名单里但库里没登记")):
+                    new = [x for x in cur[dim] if x not in prev_b[dim]]
+                    if new:
+                        grew.append(f"{label}：新增 {'、'.join(new)}")
+                if grew:
+                    note = "   ★ 与基线相比**有变化** —— 已告警。"
+                    emit(
+                        "alert",
+                        f"声明点对账：差集**变了**（{len(grew)} 类有新增）",
+                        body=("`pack` 表登记的包，和 `--packs` 驱动的名单，"
+                              "**差集变了**。\n"
+                              "（本判据只报**变化**：与基线一致的现状不再每天喊。）\n\n"
+                              + "\n".join("  ★ " + g for g in grew) + "\n\n"
+                              f"  登记了却没被驱动（{len(undriven)}）："
+                              f"{'、'.join(undriven) or '(无)'}\n"
+                              "     ★ 白登记。它的片子永远不会被搜到，也不会有人报。\n"
+                              "      要驱动它：把名字加进 `run.sh` 的 `--packs`（或改 "
+                              f"`drive-loop.py` 的 `PACKS_DEFAULT`）；\n"
+                              "      不想驱动它：在 `state.db` 里删掉那一行。\n\n"
+                              f"  在名单里但库里没登记（{len(unreg)}）："
+                              f"{'、'.join(unreg) or '(无)'}\n"
+                              "     ★★ 更糟的一头 —— `--packs` 里的名字必须有 `pack` 表行，\n"
+                              "      否则状态机看不见它的片子，整包会被判成别的包而静默降级。\n\n"
+                              f"  当前名单：{PACKS_DEFAULT}（`--packs` 的默认值）\n"),
+                        key="packs-mismatch",
+                        metrics={"packs_undriven": len(undriven),
+                                 "packs_unreg": len(unreg)})
+                else:
+                    note = "   ★ 与基线一致 —— 不告警（只报变化，不再每天喊）。"
             lines.append(
                 f"声明点对账〔--packs〕：登记 {len(reg)} 个 / 驱动 {len(driven)} 个\n"
                 f"   登记了却没被驱动（{len(undriven)}）："
@@ -1015,25 +1082,8 @@ def reconcile_watch(args) -> tuple[str, dict]:
                 f"{'、'.join(unreg) or '(无)'}\n"
                 f"   ★ 前者是「白登记」：状态机有它、农场有它、**就是不排它** ——"
                 f"它的片子永远不会被搜到，\n"
-                f"     而它在 unclaimed / report / trend 上全是绿的。基线 1。")
-            if undriven or unreg:
-                emit(
-                    "alert", f"声明点对账：{len(undriven) + len(unreg)} 个包的名单对不上",
-                    body=("`pack` 表里登记的包，和 `--packs` 实际驱动的名单**不是同一批**。\n"
-                          "这个差集没有任何别的判据看得见 —— 两边各自看起来都正常。\n\n"
-                          f"  登记了却没被驱动（{len(undriven)}）："
-                          f"{'、'.join(undriven) or '(无)'}\n"
-                          "     ★ 白登记。它的片子永远不会被搜到，也不会有人报。\n"
-                          "      要驱动它：把名字加进 `run.sh` 的 `--packs`（或改 "
-                          f"`drive-loop.py` 的 `PACKS_DEFAULT`）；\n"
-                          "      不想驱动它：在 `state.db` 里删掉那一行，或把基线记下来。\n\n"
-                          f"  在名单里但库里没登记（{len(unreg)}）："
-                          f"{'、'.join(unreg) or '(无)'}\n"
-                          "     ★★ 更糟的一头 —— `--packs` 里的名字必须有 `pack` 表行，\n"
-                          "      否则状态机看不见它的片子，整包会被判成别的包而静默降级。\n\n"
-                          f"  当前名单：{PACKS_DEFAULT}（`--packs` 的默认值）\n"),
-                    key="packs-mismatch",
-                    metrics={"packs_undriven": len(undriven), "packs_unreg": len(unreg)})
+                f"     而它在 unclaimed / report / trend 上全是绿的。\n"
+                f"{note}")
     except Exception as e:                  # noqa: BLE001
         LOG.debug("--packs 对账失败", exc_info=True)
         lines.append(f"声明点对账〔--packs〕：算不出（{type(e).__name__}: {e}）")
@@ -1069,6 +1119,11 @@ def reconcile_watch(args) -> tuple[str, dict]:
         lines.append("观测对账〔本轮 n/a 的格子〕：" + "、".join(marks)
                      + "\n   ★ 括号里是**这个格子最后一次真的读到数**是什么时候 ——"
                        "刚抖一下 vs 长期读不到，差别全在这里。")
+    if packs_baseline is not None:
+        # ★ 只在**本轮真的算了差集**时才写。`--packs` 没给、或库读不到的那几轮，
+        #   必须保留旧基线 —— 否则一次抖动就把「已接受的现状」抹成空，
+        #   下一轮会把 `mbf` 这个老问题当成「新变化」再喊一遍（正是要避免的噪音）。
+        live[PACKS_BASELINE_KEY] = packs_baseline
     _reconcile_write(live)
     return "\n".join(lines), m
 

@@ -6671,6 +6671,43 @@ py_compile                                          OK
 | 仓库污染 | 新增 `scripts/.reconcile.state` 已进 `.gitignore`；两个测试改向到临时目录才发得出去 |
 | 部署 | ⏳ **待办**：`drive-loop.py` / `reseed-state.py` **是受管脚本**，须在**空闲窗口** `deploy.sh --apply`。★ 这一轮**是热路径的行为变更**（错 `--db` 从静默烧额度 → 响亮 abort 并把 `consec_abort` 推向告警阈值 3） |
 
+#### 18.21.6 部署后追加：`packs-mismatch` 改成**只报变化**（2026-09-12 23:20）
+
+> ★ 触发点是部署后的一句追问：「`packs-mismatch` 每天会响 —— 它不是『待办被点名』，
+> 是**会变成噪音的判据**。」这个判断是对的，而且理由比"烦"更硬：
+> **噪音的代价是真的出问题时没人看。**
+
+`pack` 表 3 行（`dc-collection` / `frds-top250-2024` / `mbf`）而 `--packs` 只驱动前两个
+→ 差集恒为 `{mbf}` → 旧代码 `if undriven or unreg:` **每天都发一条 alert**。
+
+改法（判据本体一个字没动，动的是**出口的触发条件**）：
+
+| 情形 | 旧 | 新 |
+|---|---|---|
+| 差集里出现**基线里没有**的 | 报警 | **报警** |
+| 与基线一致（`mbf` 躺着） | 每天报 | **不报** |
+| 缩回基线之内（修好了） | 每天报 | **不报**，且**采纳为新基线** |
+
+* 基线存在 **`.reconcile.state` 的 `_packs_baseline`**（**不进代码** —— 写进代码就分不清
+  「回到基线」和「判据死了」，§18.19 的教训）。
+* **缩也采纳新基线**：否则删掉 `mbf` 那行之后基线还留着它，将来它再被加回来时
+  「又冒出来了」就没人报 —— 而那才是真要抓的**回归**。
+* 只在**本轮真的算了差集**时才写基线（`packs_baseline is not None`）：`--packs` 没给 /
+  库读不到的那几轮必须保留旧基线，否则一次抖动就把现状抹成空，下一轮把老问题当新变化再喊一遍。
+* ★ **不告警 ≠ 看不见**：日报正文照旧每天打印完整差集。
+
+**阴性对照**：把 `if grew:` 退回 `if undriven or unreg:` → `test_reconcile.py`
+**恰好红 3 条**，全是守新语义的（「与基线一致 → 不发 alert」两处 + 「正文说明了为什么不喊」）。
+备份 `D:/tmp/dl-pre-negctl2.bak`，md5 `63771cba…` 两侧一致。
+
+**也记一条部署流程的缺口**（同一轮发现，已写进 README）：
+`deploy.sh` 末尾那句「下一步 `docker compose up -d --force-recreate cross-seed`」
+**不是每次都适用**。本轮 4 个目的地里只有 `<compose>/drive-loop/**` 3 个是热路径
+（NAS 宿主机上跑，**拷完即生效**）；第 4 个 `orchestrator/state.py` 是**构建上下文**副本，
+而 `reseed-orchestrator` 是**一次性 CLI**（`ENTRYPOINT python -m orchestrator.main`，无 daemon）、
+`cross-seed` 用官方镜像**不吃我们的文件** —— **要更新它得 `docker compose build`**，
+`--force-recreate` 不带 `--build` 只是拿旧镜像重启，等于白掀一次容器。
+
 ---
 
 ## 19. 原理技术与风险须知（2026-09-12 夜）
