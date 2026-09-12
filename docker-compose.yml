@@ -5,8 +5,13 @@
 #   cross-seed      : 按内容匹配单种 → 在 linkDir 建硬链接 → 注入 :3060
 #   reseed-orchestrator : 我们写的编排器(一次性 CLI)，预检/驱动/汇报
 #
-# 注意：qbittorrent-reseed(:3060) 由它自己的 compose 单独运行，不在本栈内；
-#       本栈通过 NAS 局域网 IP(${NAS_IP}:3060) 访问它。
+# 注意：qbittorrent-reseed(:3060) 由它自己的 compose 单独运行，不在本栈内。
+#       本栈**接入它所在的 docker 网络**(qbit-net = qbittorrent-reseed_default)，
+#       用服务名直连 http://qbittorrent-reseed:3060。
+#       ★ 不要改回 http://${NAS_IP}:3060 —— 群晖上「容器 → 宿主机 LAN IP → DNAT 回
+#         另一容器」会 timeout（2026-09-11 实测）。
+#       （宿主机上跑的 drive-loop.py 走的是另一条路：LAN IP + 端口映射；
+#         两边是**故意不同**的，别互相纠正。）
 #
 # 用法：
 #   docker compose up -d prowlarr flaresolverr        # Phase 1

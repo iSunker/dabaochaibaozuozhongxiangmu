@@ -257,16 +257,17 @@ docker compose run --rm reseed-orchestrator status                          # �
 > 看到 `403` + 挑战页 HTML / 日志里出现 `Cloudflare` → 需要；
 > 看到 `500/502/520/522/timeout`（站点后端挂了）或 `429`（限流）或能正常返回结果 → **不需要**。
 
-> ⚠ **Cloudflare**：中文 NexusPHP 站常需要 FlareSolverr，但本项目从 GHCR 拉镜像失败（见 SUMMARY §7）。
-> 解法：改用 Docker Hub 的官方镜像 —— 把 `compose.yaml` 里的
-> `ghcr.io/flaresolverr/flaresolverr:latest` 换成 `flaresolverr/flaresolverr:latest`，
-> 然后**在 Prowlarr 里给那个站挂一个名为 `flaresolverr` 的 tag**（Prowlarr 是按**索引器挂 tag**
-> 启用的，**没有全局开关** —— 「Settings → Indexers 里填个 URL」这个说法是错的）。
+> ⚠ **Cloudflare**：中文 NexusPHP 站常需要 FlareSolverr。真要给某个站启用，做法是
+> **在 Prowlarr 里给那个站挂一个名为 `flaresolverr` 的 tag**（Prowlarr 按**索引器挂 tag**
+> 启用，**没有全局开关** —— 「Settings → Indexers 里填个 URL」这个说法是错的）。
+>
+> ★ **「从 GHCR 拉镜像失败」那条已经过时**：SUMMARY §7 记的是**早期**的情况；2026-09-12
+> 那次 `up -d` 已经把 `ghcr.io/flaresolverr/flaresolverr:latest` 成功拉了 12 层，
+> 现在容器跑的就是它。`compose.yaml` 里的镜像名**不用**换成 Docker Hub 那个。
 >
 > ★ **现状（2026-09-12 17:15 实测）：FlareSolverr 装了、容器在跑（v3.5.2、健康），
 > 但一次都没被用上** —— Prowlarr 的 tag 列表是**空的**，四个索引器**一个 tag 都没挂**。
-> 而且现在**四个站都不需要它**。判定见 SUMMARY **§18.12**，别照着下面那句"配一下就完事"去补，
-> 先看那一节。
+> 而且现在**四个站都不需要它**。判定见 SUMMARY **§18.12**。
 
 ### 单片状态机（已实现）—— 记录每部片子走到哪一步了
 
