@@ -90,8 +90,13 @@ fi
 echo "[$(date '+%F %T')] start  py=$PY" >> "$ATTEMPTS"
 
 # ★ --once 配合计划任务：一次唤醒只跑一批。
-#   跨进程节流（上一批还在跑 / 距上次结束不足 30 分钟）+ 包轮换都在
-#   drive-loop.py 的 once_round() 里，靠 scripts/.drive-loop.state 持久化。
+#   跨进程节流 + 包轮换都在 drive-loop.py 的 once_round() 里，靠
+#   scripts/.drive-loop.state 持久化。闸门有两项：
+#     ① 上一批还在跑（pid + 心跳）→ 跳过
+#     ② 距上次结束不足 max(30 分钟, 上一批算出的间隔) → 跳过
+#   ★ ②这一项里「上一批算出的间隔」是 2026-09-12 接上的：站点被限流时
+#     next_sleep() 会给 1.5~2 小时，这里就真的会等那么久（状态文件里的
+#     last_sleep_sec）。在那之前它只是日志里的一行字，没人用。
 #
 # ★ 这里刻意**不写** --url / --qbit-url：
 #   那两个默认值就是 NAS 的局域网 IP（http://192.168.0.7:2468 / :3060），
@@ -99,11 +104,55 @@ echo "[$(date '+%F %T')] start  py=$PY" >> "$ATTEMPTS"
 #   重复写一份只会多一个「改了代码默认值但这边还是旧的」的漂移点。
 #
 # `"$@"` 放最后：用户在命令行给的参数覆盖上面的。
+#
+# ★ --indexers 是**手工维护**的名单，加了站却忘了改这里 = 新站永远搜不到。
+#   状态机只认这份名单：名单里没有的站，对每部片子来说「那个站从没搜过」
+#   这件事根本不会被表达出来 → 那些片子永远不会因为「来了新站」而被重新
+#   排期，而 Prowlarr / cross-seed 那边看起来一切正常。2026-09-12 就是这么
+#   卡住的：HDtime 早就在 Prowlarr(id=1) 和 .env 的 TORZNAB_URLS 里了，
+#   但这里只有两个站，224 部 UNMATCHED 一部都没往新站上重搜。
+#
+# ★ 加站的正确顺序（缺一步都会静默错记）：
+#     ① Prowlarr 里启用 + Test 通过
+#     ② .env 的 TORZNAB_URLS 加上该站的 /N/api，然后
+#        cd <compose 目录> && sudo docker compose up -d --force-recreate cross-seed
+#        —— 容器不重建，env_file 的改动不会生效
+#     ③ 确认 cross-seed.db 的 timestamp 表里开始出现该站的行。那是「真的搜
+#        出去了」的硬证据，比翻日志靠谱（失败的搜索不会留下 timestamp 行）
+#        —— 这一步别手敲 SQL：python scripts/check-indexer-timestamps.py \
+#             --expect <新名单>   （只读；退出 0 = 闸门开。--wait 可等下一批跑完）
+#     ④ 最后才改这一行
+#   ★ 顺序颠倒的代价：站还没通就把名字写进来 → 状态机把片子记成"在那站搜过
+#     了"并压上 14 天冷却，实际一次都没发出去。而「来了新站」的触发是**一次
+#     性**的（due_indexers 里「从没搜过 → 该搜」），白烧一次就得再等一个周期。
+#   drive-loop.py 的 check_indexers() 会拿 cross-seed.db 做自检，
+#   对不上时只在日志里吭一声，不拦。
+#
+# ★ HDtime（Prowlarr id=1）已**于 2026-09-12 17:00 加进名单**。四步全部走完：
+#     ① ✅ 已在 Prowlarr 换新 cookie；`POST /api/v1/indexer/test` 返回 `{}`（= 通过，
+#        失败会回 400 带 errorMessage）。
+#     ② ✅ 已在生产 .env 的 TORZNAB_URLS 加回 `/1/api`（用 scripts/add-torznab-indexer.py
+#        —— apikey 从同文件现有条目**原样抄来**，与 PROWLARR_API_KEY 同一个值，
+#        全程没有经过人眼；写回已做字节级校验），并于 16:29 `--force-recreate` 重建容器
+#        —— 启动日志里 `http://prowlarr:9696/1/api failed to respond` 那一条**反而是**
+#        「`/1` 已经进了容器」的证据（报错是按容器内实际的索引器列表逐个报的）。
+#     ③ ✅ `cross-seed.db` 的 `timestamp` 表里 HDtime **已有 60 行**（本行改动前实测）。
+#        `timestamp` 主键是 (searchee_id, indexer_id) 且**失败的搜索不记行** ——
+#        有行 = 真的发出去并被应答了。复核命令（只读、只打计数与站名）：
+#            python scripts/check-indexer-timestamps.py \
+#              --expect HDtime,HDFans,NanyangPT,BTSCHOOL
+#        它顺带回答另一个常被问的问题：`indexer.status == RATE_LIMITED` **不代表**
+#        还在被限流 —— 那个字段限流窗口过去后不会被擦掉。真判据是 `retry_after`
+#        （epoch 毫秒）：2026-09-12 17:00 实测四个站的 retry_after **全部已过期**，
+#        所以那三个 RATE_LIMITED 是**陈旧标记**（BTSCHOOL 的 status 已自己翻回 OK）。
+#     ④ ✅ 就是下面这一行。
+#   ★ 顺序颠倒的代价（上面「加站的正确顺序」已写）：站还没通就把名字写进来 →
+#     状态机把片子记成"在那站搜过了"并压上 14 天冷却，实际一次都没发出去。
 RC=0
 "$PY" "$SCRIPT" \
   --once \
   --env "$COMPOSE_DIR/.env" \
-  --indexers HDFans,NanyangPT \
+  --indexers HDtime,HDFans,NanyangPT,BTSCHOOL \
   --limit 50 \
   "$@" || RC=$?
 
