@@ -1,0 +1,431 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""NAS 漂移哨兵 —— **只读**。回答两个「有没有我不知道的东西」：
+
+  A. NAS 上  有没有**既不在部署白名单、也不在已知生产独有清单**里的文件？
+  B. 仓库里  有没有**既没进部署白名单、也没被明确标为「不部署」**的已跟踪文件？
+
+为什么需要它
+------------
+`deploy.sh` 是**白名单式、单向**（本地 → NAS）的：它保证白名单里那些文件两边
+一致，**白名单之外的一律不碰、也不报告**。于是两个方向都会悄悄长东西：
+
+  A 方向（NAS 上冒出来的）：手工拷上去的脚本、忘了删的一次性补丁、某次调试
+     留下的产物。风险是它**不在任何同步机制里** —— 既不会被更新，也不会被
+     发现，只会在某天以「NAS 上跑的行为和仓库里这份不一样」的形式咬人。
+     前车之鉴：`build-farm.sh`、`fix-statedb-farm-root.py`、`nas-update-env.sh`
+     这三个都是这么手工躺在 NAS 上的，2026-09-12 才逐个收进白名单。
+
+  B 方向（仓库里没登记的）：新写了个脚本，忘了加进 `deploy.sh` 的 FILES，
+     于是「git 提交里有它、NAS 上没有它」—— 而没有任何东西会提醒你。
+     这正是「git 提交时是不是 NAS 拿一部分、电脑拿一部分」那个问题的答案。
+
+★★ 受管集合**从 `deploy.sh` 的 FILES 数组解析出来，绝不在这里复制一份** ——
+   复制就是又造一个漂移源，还会和 deploy.sh 各自漂到不同的地方去。
+   解析一旦对不上（有 `::` 的行没解析出目的地）直接 exit 2：**宁可吵，也不误报**。
+   因为解析悄悄失败会让受管集合变空，于是「全部文件都不认识」这场假警报
+   会把真信号淹掉 —— 一个会误报的哨兵，两次之后就没人看了。
+
+用法
+----
+    python scripts/check-deploy-drift.py              # DST 取自 --dst / 环境变量 / scripts/.nasrc
+    python scripts/check-deploy-drift.py --all        # 连已知生产独有的一并列出（默认只报数）
+    python scripts/check-deploy-drift.py --cleanup    # 额外打一份"整理杂物"的 mv 计划（**仍然只读**）
+    python scripts/check-deploy-drift.py --no-nas     # 只做 B 方向（NAS 不可达时也有用）
+
+★ `--cleanup` 只**打印**计划，自己不写任何东西：本脚本的契约是只读。
+  计划里只有 `mv`、没有 `rm` —— 对 NAS 的 UNC 路径跑 `rm` 是禁止的（见禁止清单）。
+
+退出码
+------
+    0 = 干净   1 = 有未登记的（需要人看一眼）   2 = 环境问题（NAS 不可达 / 解析失败）
+"""
+import datetime
+import os
+import pathlib
+import re
+import subprocess
+import sys
+
+# ★ 输出**无条件**强制 UTF-8。别试图做得更"聪明"—— 第一版写成
+#   `if not _s.isatty(): _s.reconfigure(...)`，想"管道用 UTF-8、tty 交给控制台"，
+#   结果在 Windows 上直接炸：**NUL 是字符设备，`isatty()` 对它返回 True**，
+#   于是 `>/dev/null` 时反而跳过 reconfigure，按 GBK 编码 ✓★⚠ 抛
+#   UnicodeEncodeError —— 而那是个**未捕获异常，退出码也是 1**，
+#   和"发现漂移"的 1 长得一模一样；traceback 又跟正常输出去了同一个 /dev/null。
+#   症状：40/40 次 `>/dev/null` 都"报漂移"，而所有测试跑法（管道/落文件）全绿。
+#   → 判据自己要先被验证一遍（同 SUMMARY §18.10.1）；仓库另外 7 个脚本用的
+#     就是这里这个无条件写法，别改。
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
+REPO = pathlib.Path(__file__).resolve().parent.parent
+DEPLOY = REPO / "deploy.sh"
+
+# NAS 上**已知合理**的、不在白名单里的东西。每一条都要写清"为什么它该在 NAS 上"。
+# 判据用正则匹配 **POSIX 相对路径**（不含开头的 ./），比 fnmatch 的 `**` 语义更可控。
+KNOWN_NAS = [
+    # ---- 生产独有：含凭据 / 运行时状态，**故意**不进白名单（deploy.sh 原则第 2 条）----
+    (r"^\.env$",                                  "真实凭据"),
+    (r"^prowlarr/",                               "站点 cookie + Prowlarr 库"),
+    (r"^cross-seed/cross-seed\.db.*",             "cross-seed 库（含 -wal/-shm）"),
+    (r"^cross-seed/cross-seeds/",                 "cross-seed 硬链接产物"),
+    (r"^cross-seed/logs/",                        "cross-seed 日志"),
+    (r"^cross-seed/torrent_cache/",               "cross-seed 种子缓存"),
+    (r"^drive-loop/hlink/",                       "从本地一次性迁移过去的 state.db"),
+    (r"^drive-loop/attempts\.log$",               "批次台账（NAS 上追加写）"),
+    (r"^drive-loop/scripts/drive-loop\.log$",     "驱动日志"),
+    (r"^drive-loop/scripts/\.[^/]+\.state$",      "心跳 / --once 闸门 / 巡检状态"),
+    (r"^hlink/\.reseed_farm\.manifest\.tsv.*",    "农场清单及其名字侧写"),
+    (r"^notify/notify\.conf$",                    "含收件人邮箱"),
+    (r"^notify/archive/",                         "已发出的通知归档"),
+    (r"^notify/log/",                             "通知日志"),
+    # ---- 杂物：已知、合理、但**该定期清**（哨兵只报数，不删）----
+    (r"^\.env\.bak\..*",                          "杂物·.env 备份"),
+    (r"^build-farm\.sh\.bak\..*",                 "杂物·旧脚本备份"),
+    (r"^notify/probe-artifacts-[^/]*/",           "杂物·一次性探测产物"),
+    (r"(^|/)__pycache__/",                        "杂物·python 字节码"),
+    (r"^_cleanup-[0-9]{8}/",                      "杂物·本哨兵 --cleanup 暂存区（确认后在 NAS 上整个删掉）"),
+]
+CLUTTER = re.compile(r"^杂物·")
+
+# 仓库里**已跟踪、但明确不该部署**的文件。同样每条都写清理由 ——
+# 这是一份"公开声明"，不是"懒得管的兜底"：没登记的东西会被 B 方向报出来。
+LOCAL_ONLY = [
+    (r"^\.gitattributes$",                        "仓库元数据"),
+    (r"^\.gitignore$",                            "仓库元数据"),
+    (r"^\.env\.example$",                         "模板；生产用真实 .env，白名单**故意**不含它"),
+    (r"^README\.md$",                             "文档"),
+    (r"^SUMMARY\.md$",                            "文档"),
+    (r"^patches/",                                "在 NAS 上**手工**应用的操作说明"),
+    (r"^tests/",                                  "离线自测（在 Windows 上跑，不进容器）"),
+    (r"^deploy\.sh$",                             "同步工具本身（在 Windows 上跑）"),
+    (r"^scripts/check-deploy-drift\.py$",         "本哨兵（在 Windows 上跑）"),
+    (r"^prowlarr/\.gitkeep$",                     "占位符；生产的 prowlarr/ 是**不许碰**的"),
+    (r"^scripts/(add-indexers|add-torznab-indexer|check-indexer-timestamps"
+     r"|gen-datadirs|gen-nas-env-update|migrate-reseed-dirs|run-batch|wait-for-checks)"
+     r"\.(py|sh)$",                               "在 Windows 上跑的工具/生成器（对着 NAS 的端口或 UNC 干活）"),
+]
+
+# 受管、但**不在 git 里**的本地源（正常情况只有生成物）。没列在这里的会被 B 方向报出来 ——
+# 「deploy.sh 会把它拷到 NAS，可它没有版本历史」这件事必须有人明确认过。
+GENERATED_OK = {
+    "scripts/nas-update-env.sh":
+        "生成物（scripts/gen-nas-env-update.py 产出，故被 gitignore）；只带 DATA_DIRS/LINK_DIR 两个路径键",
+}
+
+
+def parse_deploy_files(text):
+    """从 deploy.sh 解析 FILES 数组。返回 (entries, unparsed, err)。"""
+    lines = text.splitlines()
+    start = None
+    for i, ln in enumerate(lines):
+        if re.match(r"^\s*FILES=\(", ln):
+            start = i
+            break
+    if start is None:
+        return None, None, "deploy.sh 里找不到 `FILES=(` 这一行"
+
+    entries, unparsed = [], []
+    for ln in lines[start + 1:]:
+        s = ln.strip()
+        if s == ")":
+            break
+        if not s or s.startswith("#"):
+            continue
+        v = s
+        if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+            v = v[1:-1]
+        if "::" not in v:
+            unparsed.append(s)          # 形如 `::` 的行却没给目的地 → 解析器坏了
+            continue
+        src, dst = v.split("::", 1)
+        entries.append((src.strip(), dst.strip()))
+    return entries, unparsed, None
+
+
+def walk_nas(root):
+    """返回 NAS 上的相对 POSIX 路径集合。"""
+    out = set()
+    for dirpath, dirnames, filenames in os.walk(root):
+        rel = os.path.relpath(dirpath, root)
+        for fn in filenames:
+            out.add(fn if rel == "." else f"{rel}/{fn}".replace("\\", "/"))
+    return out
+
+
+def split_missing(dst, missing):
+    """把「走查说 NAS 上没有」的目的地分成 (确实没有, 其实在)。
+
+    ★ 单独提出来是因为这条判据**必须能被直接测**：它是整个哨兵里唯一可能产生
+      假警报的地方（枚举只会漏文件、不会凭空造文件）。抽成纯函数才能在对照里
+      构造"走查漏了、stat 却在"的场景 —— 真实 SMB 抖动复现不了。
+    """
+    gone, phantom = [], []
+    for d in missing:
+        (phantom if os.path.isfile(os.path.join(dst, *d.split("/"))) else gone).append(d)
+    return gone, phantom
+
+
+def print_cleanup_plan(dst, clutter_items):
+    """把"杂物"整理成一份可直接执行的 `mv` 计划。
+
+    ★ 三条硬约束，都是环境逼出来的：
+      ① **只用 `mv`，绝不用 `rm`** —— 对 NAS 的 UNC 路径跑 `rm` 是明确禁止的
+         （SMB 上没有回收站，glob 打错一次不可逆）。mv 是同文件系统内的 rename，
+         原子且可逆，东西一件不少地进暂存区。
+      ② **一次只搬一个显式路径**，不用通配符 —— 通配符 + 变量展开是这类脚本
+         出事的经典姿势。
+      ③ 整理完不留常驻文件在 NAS 上：暂存区是个**目录**，用户确认后
+         在 NAS 上（或 DSM File Station，那边有回收站）一次删掉即可。
+
+    ★ 搬的**单位**要挑最大的那层：`notify/probe-artifacts-*/` 底下 12 个文件
+      是一条 mv（搬目录），不是 12 条；`__pycache__/` 同理。
+      判据是"命中的那条规则是否以 `/` 结尾"—— 以 `/` 结尾的规则描述的是**目录**，
+      于是把路径截到那次匹配的末尾，就是该搬的目录。
+    """
+    stamp = datetime.date.today().strftime("%Y%m%d")
+    stage = f"_cleanup-{stamp}"
+    units = set()
+    for rel, rule in clutter_items:
+        rx = rule[0]
+        m = re.search(rx, rel) if rx.endswith("/") else None
+        units.add(rel[:m.end() - 1] if m else rel)   # 去掉匹配末尾那个 `/`
+
+    print(f"\n       ── 清理计划（--cleanup）：{len(units)} 项，全部 **mv** 到暂存区 ──")
+    if not units:
+        print("         没有杂物需要搬。")
+        return
+    print(f"         暂存区: {dst}/{stage}/")
+    print(f"         下面 {len(units)} 项各自都是同一文件系统内的 rename（可逆、原子）。")
+    print(f"         跑完确认无碍后，在 NAS 上删掉整个 `{stage}/` 目录即可。")
+    print("         正在跑批次时不必等 —— 搬走的都是日志/备份/字节码，不在运行路径上。")
+    print()
+    print(f'         DST="{dst}"')
+    print(f'         STAGE="$DST/{stage}"')
+    print('         mkdir -p "$STAGE" \\')
+    # 只对**去重后**的上级目录 mkdir，根目录下的则不生成（dirname 会给 "."）
+    parents = sorted({os.path.dirname(u) for u in units} - {""})
+    for i, p in enumerate(parents):
+        tail = " \\" if i < len(parents) - 1 else ""
+        print(f'           "$STAGE/{p}"{tail}')
+    for u in sorted(units):
+        print(f'         mv -- "$DST/{u}" "$STAGE/{u}"')
+    print()
+    print("         ★ 不要把这个计划里的任何一条改成 rm；要删请在 NAS 上删暂存区那一个目录。")
+
+
+def resolve_dst(argv):
+    for i, a in enumerate(argv):
+        if a == "--dst" and i + 1 < len(argv):
+            return argv[i + 1]
+        if a.startswith("--dst="):
+            return a.split("=", 1)[1]
+    if os.environ.get("DST"):
+        return os.environ["DST"]
+    nasrc = REPO / "scripts" / ".nasrc"
+    if nasrc.is_file():
+        for ln in nasrc.read_text(encoding="utf-8", errors="replace").splitlines():
+            s = ln.strip()
+            if s.startswith("#") or "=" not in s:
+                continue
+            k, v = s.split("=", 1)
+            if k.strip() == "DST":
+                return v.strip().strip('"').strip("'")
+    return None
+
+
+def classify(rel, managed, rules):
+    """→ (kind, rule)。rule 是命中的那条 (正则, 说明)，方便调用方知道**为什么**命中。"""
+    if rel in managed:
+        return "managed", None
+    for rule in rules:
+        if re.search(rule[0], rel):
+            return "known", rule
+    return "unknown", None
+
+
+def main():
+    argv = sys.argv[1:]
+    show_all = "--all" in argv
+    no_nas = "--no-nas" in argv
+    cleanup = "--cleanup" in argv
+    fail = 0
+
+    # ---------- 0) 解析 deploy.sh（受管集合的唯一来源）----------
+    if not DEPLOY.is_file():
+        print(f"✗ 找不到 {DEPLOY}", file=sys.stderr)
+        return 2
+    entries, unparsed, err = parse_deploy_files(
+        DEPLOY.read_text(encoding="utf-8", errors="replace"))
+    if err:
+        print(f"✗ {err}", file=sys.stderr)
+        return 2
+    if unparsed:
+        print(f"✗ FILES 里有 {len(unparsed)} 行没解析出目的地（口径变了？）：", file=sys.stderr)
+        for s in unparsed[:10]:
+            print(f"    {s}", file=sys.stderr)
+        return 2
+    if len(entries) < 5:
+        print(f"✗ FILES 只解析出 {len(entries)} 条 —— 明显不对，拒绝据此判定"
+              f"（受管集合变空会把所有文件误报成「未知」）", file=sys.stderr)
+        return 2
+
+    managed = {d for _, d in entries}          # 生产侧相对路径
+    local_managed = {s for s, _ in entries}    # 本地侧相对路径
+    print(f"NAS 漂移哨兵（只读）   受管集合解析自 deploy.sh：{len(entries)} 条")
+    dup = len(entries) - len(local_managed)
+    print(f"  生产目的地 {len(managed)} 个 / 本地源 {len(local_managed)} 个"
+          + (f"（{dup} 条是同一源部署到多个目的地，如 orchestrator/__init__.py "
+             f"既进构建上下文又进 drive-loop/）" if dup else ""))
+
+    # ---------- A 方向：NAS ----------
+    if not no_nas:
+        dst = resolve_dst(argv)
+        if not dst:
+            print("✗ 没有 DST（--dst / 环境变量 / scripts/.nasrc 三处都没找到）", file=sys.stderr)
+            return 2
+        print(f"\n[ A ]  NAS: {dst}")
+        if not os.path.isdir(dst):
+            print(f"✗ NAS 目录不可达（SMB 断了？）: {dst}", file=sys.stderr)
+            return 2
+
+        nas = walk_nas(dst)
+        groups = {"managed": [], "unknown": [], "known": []}
+        known_why = {}
+        clutter_items = []           # [(相对路径, 命中的规则)]，只收"杂物"那几条
+        for rel in sorted(nas):
+            kind, rule = classify(rel, managed, KNOWN_NAS)
+            groups[kind].append(rel)
+            if kind == "known":
+                why = rule[1]
+                known_why.setdefault(why, []).append(rel)
+                if CLUTTER.match(why):
+                    clutter_items.append((rel, rule))
+
+        clutter = {w: v for w, v in known_why.items() if CLUTTER.match(w)}
+        n_clutter = sum(len(v) for v in clutter.values())
+        n_known = len(groups["known"])
+
+        print(f"       NAS 上共 {len(nas)} 个文件：")
+        print(f"         ✓ 受管（在白名单里）        {len(groups['managed']):>6}")
+        print(f"         ✓ 已知生产独有              {n_known - n_clutter:>6}")
+        print(f"         ✓ 杂物（已知，但该清）      {n_clutter:>6}")
+        print(f"         ★ 未知                      {len(groups['unknown']):>6}")
+
+        missing = sorted(managed - nas)
+        if missing:
+            # ★ 复核「NAS 上没有」这个结论：SMB 枚举**偶尔会漏**文件 ——
+            #   实测碰到过一次 exit=1，随后复跑 15 次却次次干净，文件集基线也纹丝不动(1322)。
+            #   枚举只会漏、不会凭空造，所以唯一可能的**假警报**就是这条"白名单文件不见了"。
+            #   于是这里不认一次快照：直接 stat 复核，stat 说在 → 那是"看不清"，不是"漂移"。
+            gone, phantom = split_missing(dst, missing)
+            if phantom:
+                print(f"\n       ⚠ NAS 枚举**不完整**：{len(phantom)} 个白名单文件第一次没列出来、"
+                      f"直接 stat 却在（例：{phantom[0]}）。")
+                print("         这是 SMB 读取抖动，不是漂移 —— 本次**不做**「文件不见了」的判断，请复跑一次。")
+                return 2
+            print(f"\n       ⚠ 白名单里有 {len(gone)} 个目的地 NAS 上**不存在**"
+                  f"（deploy.sh 会把它们标成 [新]）：")
+            for d in gone:
+                print(f"           {d}")
+            fail = 1
+
+        if groups["unknown"]:
+            print(f"\n       ★ 未知文件 {len(groups['unknown'])} 个 —— "
+                  f"既不在 deploy.sh 白名单、也不在 KNOWN_NAS 清单里：")
+            for rel in groups["unknown"][:60]:
+                print(f"           {rel}")
+            if len(groups["unknown"]) > 60:
+                print(f"           …（还有 {len(groups['unknown']) - 60} 个）")
+            print("         → 三种可能，逐个定性：① 该收进 deploy.sh 的 FILES；"
+                  "② 该加进本脚本的 KNOWN_NAS（并写清理由）；③ 该删。")
+            fail = 1
+
+        if show_all:
+            print("\n       ── 已知生产独有 / 杂物 明细（--all）──")
+            for why in sorted(known_why):
+                v = known_why[why]
+                print(f"         [{why}] {len(v)} 个")
+                for rel in v[:8]:
+                    print(f"             {rel}")
+                if len(v) > 8:
+                    print(f"             …（还有 {len(v) - 8} 个）")
+        elif clutter:
+            print("\n       ── 杂物（--all 看明细，本脚本**只报不删**）──")
+            for why, v in sorted(clutter.items()):
+                print(f"         [{why}] {len(v)} 个")
+
+        if cleanup:
+            print_cleanup_plan(dst, clutter_items)
+
+    # ---------- B 方向：本地仓库 ----------
+    print("\n[ B ]  本地仓库：已跟踪、但没进白名单 / 也没声明「不部署」的")
+    try:
+        r = subprocess.run(["git", "-C", str(REPO), "ls-files"],
+                           capture_output=True, text=True, check=True)
+    except (OSError, subprocess.CalledProcessError) as e:
+        print(f"✗ git ls-files 失败: {e}", file=sys.stderr)
+        return 2
+    tracked = [f for f in r.stdout.split("\n") if f.strip()]
+
+    rows = []
+    for rel in tracked:
+        if rel in local_managed:
+            rows.append(("managed", rel, None))
+            continue
+        why = next((w for rx, w in LOCAL_ONLY if re.search(rx, rel)), None)
+        rows.append(("local", rel, why) if why else ("unknown", rel, None))
+
+    n_m = sum(1 for k, _, _ in rows if k == "managed")
+    n_l = sum(1 for k, _, _ in rows if k == "local")
+    n_u = sum(1 for k, _, _ in rows if k == "unknown")
+    print(f"       已跟踪 {len(tracked)} 个文件：")
+    print(f"         ✓ 会部署（在 FILES 里）     {n_m:>6}")
+    print(f"         ✓ 明确不部署                {n_l:>6}")
+    print(f"         ★ 未登记                    {n_u:>6}")
+
+    # 受管、但不在 git 里的本地源：deploy.sh 照样会把它拷上 NAS，可它没有版本历史。
+    # 生成物属于这一类，但要**逐条认过**才放行（见 GENERATED_OK）。
+    untracked_src = sorted(local_managed - set(tracked))
+    if untracked_src:
+        declared = [s for s in untracked_src if s in GENERATED_OK]
+        undeclared = [s for s in untracked_src if s not in GENERATED_OK]
+        print(f"\n       ── 受管、但不在 git 里的本地源：{len(untracked_src)} 个"
+              f"（deploy.sh 仍会拷，但无版本历史）──")
+        for s in declared:
+            print(f"         ✓ {s}\n             {GENERATED_OK[s]}")
+        for s in undeclared:
+            print(f"         ★ {s}   ← 没登记过：它凭什么不在 git 里？")
+            fail = 1
+
+    if n_u:
+        print(f"\n       ★ 未登记 {n_u} 个 —— "
+              f"`git push` 会把它们带走，但它们**不会**上 NAS：")
+        for k, rel, _ in rows:
+            if k == "unknown":
+                print(f"           {rel}")
+        print("         → 二选一：① 该上 NAS 就加进 deploy.sh 的 FILES；"
+              "② 不该上就加进本脚本的 LOCAL_ONLY（写明理由）。")
+        fail = 1
+
+    if show_all:
+        print("\n       ── 明确不部署 明细（--all）──")
+        for k, rel, why in rows:
+            if k == "local":
+                print(f"           {rel:<52} {why}")
+
+    # ---------- 结论 ----------
+    print()
+    if fail == 0:
+        print("✓ 两个方向都干净：NAS 上没有未知文件，仓库里没有未登记的已跟踪文件。")
+    else:
+        print("★ 有需要人看一眼的东西（上面 ★ 标出的）。")
+    return fail
+
+
+if __name__ == "__main__":
+    sys.exit(main())
