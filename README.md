@@ -31,7 +31,8 @@
 | 从零部署一台 | **部署步骤**（Phase 0→3，每步可独立验证）+ **验证清单** |
 | 跑起来 / 继续跑 | **当前状态与下一步** ← 最常用，先看这个 |
 | 我卡住了（报错 / 搜不到 / 不动了） | **常见问题** + **交接必读的坑** |
-| **想从电脑上手动跑点什么** | **⛔ 电脑端已不参与** ← 电脑现在只剩 `deploy.sh` 一个用途 |
+| **想从电脑上手动跑点什么** | **⛔ 电脑端已不参与** ← 电脑只剩 `deploy.sh`（推代码）和 `check-deploy-drift.py`（查漂移）两个用途 |
+| **想知道 NAS 上有没有我不知道的文件** | **漂移哨兵** ← `python scripts/check-deploy-drift.py` |
 | 加站 / 换站 | **多站点** → SUMMARY §13.3（完整流程，可复用） |
 | 让它出事了主动通知我 | **通知 / 告警（NAS 侧发信）** |
 | **下一步该做什么** | **当前状态与下一步** 的「🔴 下一步（按优先级）」 |
@@ -79,9 +80,12 @@ prowlarr_cross-seed_autohardlink/   # NAS 部署目录（compose 就放这里，
 > 〔2026-09-12 新增，见 SUMMARY §18〕、`add-torznab-indexer.py` 往生产 `.env` 加索引器
 > 或摘索引器（`--remove`，换站用〔apikey 从同文件现有条目**原样抄**，不经过人眼〕）、
 > `check-indexer-timestamps.py` **只读**查「哪个站真的搜出去过 + 到底有没有在被限流」
-> 〔加站流程第 ③ 步的闸门，见 SUMMARY §18.11〕。
+> 〔加站流程第 ③ 步的闸门，见 SUMMARY §18.11〕、
+> `check-deploy-drift.py` **只读**的**漂移哨兵**（NAS 上有没有没登记的文件 / 仓库里有没有
+> 该部署却没进白名单的文件，见「漂移哨兵」一节，SUMMARY §18.14）。
 > 其余工具要么跑在 NAS 上，要么是**手动**用的（不必进容器）。
-> ★ 2026-09-12 起电脑端只留 **`deploy.sh`** 一个用途，见「⛔ 电脑端已不参与」。
+> ★ 2026-09-12 起电脑端只留 **`deploy.sh`** 与 **`check-deploy-drift.py`** 两个用途，
+> 见「⛔ 电脑端已不参与」。
 > `tests/` 是**离线自测**（7 个脚本 / 204 条断言）—— 原先散在 `D:/tmp` 里**没有版本管理**，
 > 2026-09-12 搬进仓库。不联网、不碰生产、不碰真库，`python tests/<名字>.py`
 > **任一 cwd** 都能跑（路径按 `__file__` 解析），全过退出码 0。见 `tests/README.md`。
@@ -514,6 +518,47 @@ sh build-farm.sh --verify           # 只校验农场 vs 源
 
 ---
 
+## 漂移哨兵 —— NAS 和仓库到底一不一致
+
+`deploy.sh` 是**白名单式、单向**的：它保证**白名单里**那些文件两边逐字节一致，
+**白名单之外的一律不碰、也不报告**。于是有两个方向会悄悄长东西：
+
+| 方向 | 长出什么 | 后果 |
+|---|---|---|
+| **A（NAS 上冒出来的）** | 手工拷上去的脚本、忘了删的一次性补丁、调试产物 | **不在任何同步机制里** —— 既不会被更新也不会被发现，只会在某天以「NAS 上跑的行为和仓库里这份不一样」的形式咬人 |
+| **B（仓库里没登记的）** | 新写了脚本，忘了加进 `deploy.sh` 的 FILES | `git push` 把它带走了，但**它永远上不了 NAS**，而且没有任何东西会提醒你 |
+
+两个方向都有前车之鉴：`build-farm.sh`、`fix-statedb-farm-root.py`、`nas-update-env.sh`
+三个文件都曾长期**靠手工拷**，2026-09-12 才逐个收进白名单。
+
+```bash
+python scripts/check-deploy-drift.py              # 两个方向都查（DST 取自 --dst / 环境变量 / scripts/.nasrc）
+python scripts/check-deploy-drift.py --all        # 连已知生产独有的一并列出
+python scripts/check-deploy-drift.py --cleanup    # 额外打一份「整理杂物」的 mv 计划（仍然只读）
+python scripts/check-deploy-drift.py --no-nas     # 只查 B 方向（NAS 不通时也有用）
+```
+
+**退出码**：`0` 干净 · `1` 有需要人看一眼的 · `2` 环境问题（NAS 不可达 / `.env` 解析失败）。
+
+> ★ **受管集合是从 `deploy.sh` 的 FILES 数组解析出来的，没有第二份拷贝** ——
+> 复制一份就是又造一个漂移源。解析对不上（有 `::` 的行没解析出目的地）时**直接退出码 2**：
+> 受管集合一旦悄悄变空，所有文件都会被误报成「未知」，那种假警报会把真信号淹掉。
+
+**只有三种东西会出现在 NAS 上**：白名单里的（受管）、`KNOWN_NAS` 里逐条写明了理由的
+（`.env`/`prowlarr/`/库/日志/缓存…）、以及**杂物**。第 4 种——没登记过的——才会报警，
+提示二选一：**收进白名单**，或**加进 `KNOWN_NAS` 并写清它凭什么在那儿**。
+
+> **杂物**（`.env.bak.*`、`build-farm.sh.bak.*`、`notify/probe-artifacts-*/`、`__pycache__/`）
+> 只**报数**，不自动删。`--cleanup` 会打一份**只含 `mv`、不含 `rm`** 的计划 ——
+> 搬进 `<compose>/_cleanup-<日期>/`（同文件系统内的 rename，原子且可逆），
+> 确认无碍后在 NAS 上（或 DSM File Station，那边有回收站）删掉那一个目录即可。
+> ⚠ **对 NAS 的 UNC 路径跑 `rm` 是禁止的** —— SMB 上没有回收站，glob 打错一次不可逆。
+>
+> ★ 杂物搬走**不等于**消失，哨兵的杂物计数**不会因此下降** —— 要等那一整个目录被删掉。
+> 哨兵量的是「NAS 上有什么」，不是「看着乱不乱」。
+
+---
+
 ## 通知 / 告警（NAS 侧发信）
 
 无人值守最怕的不是出错，是**出错了没人知道**。这套东西负责在出问题时主动发邮件。
@@ -750,6 +795,12 @@ COMPOSE_DIR="$D" FARM="//iSunker-DS423/video/download/reseed/reseed_farm" \
   sh "$D/build-farm.sh" --verify --map "/volume1=//iSunker-DS423"
 ```
 
+回**电脑上**再跑一条（这条查的不是农场，是「NAS 与仓库」本身）：
+
+```bash
+python scripts/check-deploy-drift.py      # 0 干净 / 1 有要看的 / 2 够不着 NAS
+```
+
 日报里**自动**带「每日台账」（额度 + 趋势），每 24 小时最多一条；
 「某站此刻正在退避」会**立刻**发告警（按站 12 小时冷却）。
 
@@ -887,7 +938,8 @@ python scripts/reseed-state.py drive --pack dc-collection --indexers HDFans,Nany
 
 ### ⛔ 电脑端已不参与（2026-09-12 退役）
 
-**一句话**：跑批、发信、建农场全在 NAS 上；Windows 只剩 `deploy.sh` 一个用途 —— 把代码推上去。
+**一句话**：跑批、发信、建农场全在 NAS 上；Windows 只剩 **`deploy.sh`**（把代码推上去）
+和 **`check-deploy-drift.py`**（查两边一不一致）两个用途。
 
 为什么单独写一节：代码里**到处**都有"Windows 也能跑"的痕迹（UNC 路径兜底、
 `tasklist` 判活、计划任务包装器、git-bash 路径转换的告警……），
@@ -922,11 +974,15 @@ schtasks /Delete /TN "reseed-drive-loop" /F
 
 **③ 明确保留的东西**
 
-- ✅ **`deploy.sh`** —— Windows Git Bash 跑的，**唯一**还从电脑发起的操作。别删。
+- ✅ **`deploy.sh`** —— Windows Git Bash 跑的，**唯一**还从电脑发起的**写**操作。别删。
+- ✅ **`scripts/check-deploy-drift.py`** —— Windows Git Bash 跑的，**只读**。它回答
+  「NAS 上有没有我不知道的文件 / 仓库里有没有该部署却没进白名单的文件」，见「漂移哨兵」一节。
 - ✅ **`scripts/run-batch.sh`** —— 手动试跑工具，不是调度的一部分。
-- ⚠ `scripts/nas-update-env.sh` 是**手工放在** `<compose>/nas-update-env.sh` 的，
-  **不在 `deploy.sh` 白名单里**（和 `build-farm.sh` 原先的情况一样，后者已于 2026-09-12 进白名单）。
-  改它记得单独拷。
+- ✅ **`scripts/nas-update-env.sh`** —— **2026-09-12 晚已进 `deploy.sh` 白名单**（映射到
+  `<compose>/nas-update-env.sh`），跟着 `deploy.sh --apply` 走，**不用再单独拷**。
+  它是**生成物**（`scripts/gen-nas-env-update.py` 产出，故本地被 gitignore）——
+  之所以能进白名单，是因为它只装载 `DATA_DIRS` + `LINK_DIR` 两个**路径**键、不含任何凭据。
+  ⚠ 若哪天它开始携带别的键，**先回看 `deploy.sh` 里那段注释**再同步。
 
 ### ⚠ 交接必读的坑
 
