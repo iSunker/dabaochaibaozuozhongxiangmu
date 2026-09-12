@@ -31,11 +31,12 @@
 | 从零部署一台 | **部署步骤**（Phase 0→3，每步可独立验证）+ **验证清单** |
 | 跑起来 / 继续跑 | **当前状态与下一步** ← 最常用，先看这个 |
 | 我卡住了（报错 / 搜不到 / 不动了） | **常见问题** + **交接必读的坑** |
+| **想从电脑上手动跑点什么** | **⛔ 电脑端已不参与** ← 电脑现在只剩 `deploy.sh` 一个用途 |
 | 加站 / 换站 | **多站点** → SUMMARY §13.3（完整流程，可复用） |
 | 让它出事了主动通知我 | **通知 / 告警（NAS 侧发信）** |
 | **下一步该做什么** | **当前状态与下一步** 的「🔴 下一步（按优先级）」 |
 | 下一步还能自动化什么 | **还没做** 第 7 条 → **SUMMARY §16**（四条预案 + **两条前提被推翻**） |
-| 状态机说没做种、qB 里明明在做种 | **常见问题** 最后两条 → **SUMMARY §17.3** |
+| 状态机说没做种、qB 里明明在做种 | **常见问题** → **SUMMARY §17.5.1**（已修） |
 | 接手这个项目 | **当前状态与下一步** → **SUMMARY §13**（全过程 + 坑单）→ **§13.11**（最新进度与唯一待办） |
 
 > **两份文档怎么分工**（照日志分级来）：
@@ -73,9 +74,16 @@ prowlarr_cross-seed_autohardlink/   # NAS 部署目录（compose 就放这里，
 
 > 开发仓库里另有 `scripts/`（`run-batch.sh` 抽样脚本、`reseed-state.py` 状态机 CLI、
 > `drive-loop.py` 自动续跑、`add-indexers.py` 加站、`gen-datadirs.py` 生成嵌套包的 `DATA_DIRS` 片段、
-> `build-farm.sh` 构建硬链接农场〔NAS 本机**或** Windows 经 SMB 都能跑，见「扩展 → 硬链接农场」〕）。
-> 其余都是**在 Windows 上跑**的工具，不必进容器。由状态机导出的 `unmatched.tsv` /
-> `todo.txt` 属运行时产物，已 gitignore。
+> `build-farm.sh` 构建硬链接农场〔NAS 本机**或** Windows 经 SMB 都能跑，见「扩展 → 硬链接农场」〕、
+> `migrate-reseed-dirs.py` 目录搬迁（qB `setLocation`）+ `wait-for-checks.py` 等它校完
+> 〔2026-09-12 新增，见 SUMMARY §18〕、`add-torznab-indexer.py` 往生产 `.env` 加索引器
+> 或摘索引器（`--remove`，换站用〔apikey 从同文件现有条目**原样抄**，不经过人眼〕）、
+> `check-indexer-timestamps.py` **只读**查「哪个站真的搜出去过 + 到底有没有在被限流」
+> 〔加站流程第 ③ 步的闸门，见 SUMMARY §18.11〕。
+> 其余工具要么跑在 NAS 上，要么是**手动**用的（不必进容器）。
+> ★ 2026-09-12 起电脑端只留 **`deploy.sh`** 一个用途，见「⛔ 电脑端已不参与」。
+> 由状态机导出的 `unmatched.tsv` /
+> `todo-paths.txt` 属运行时产物，已 gitignore。
 
 三大服务的配置目录一一对应：`prowlarr/`→Prowlarr、`cross-seed/`→cross-seed、`hlink/`→编排器。
 `.env` 是**唯一密钥/IP/路径来源**：`hlink/config.yml` 用 `${VAR}` 引用它，`cross-seed/config.js` 从环境变量读它。三处保持一致，只需改 `.env`。
@@ -179,8 +187,16 @@ docker compose run --rm reseed-orchestrator status                          # �
   print('状态机认的:', c.execute('SELECT COUNT(*) FROM movie WHERE seeding_count>0').fetchone()[0])"
   ```
   ★ **补救（幂等、不发任何站点请求）**：补跑一次带 `--qbit-url` 的 `sync`。
-  ⚠ 2026-09-12 实测过一次 **qB 160 / 状态机 13**，而且 `attempts.log` 与 cross-seed 日志
-  全都正常 —— 排查过程、已排除的可能（cross-seed 季包不搜单集是**正常行为**）与未解项见 **SUMMARY §17.3**。
+  ✅ **2026-09-12 上午已定位并修复**：真根因是 **v3 农场切换后 cross-seed 报的是农场路径**，
+  而 `pack.roots` 还是原路径 → searchee 全被判成「别的包」**静默跳过** → `matched_hashes` 空。
+  修法（`pack.farm_root` 列 + `reseed-state.py farm` 子命令）与验证（**`SEEDING` 21 → 201**）见 **SUMMARY §17.5.1**。
+  ⚠ 光补跑 `sync` **治不了这个** —— 实测只从 13 回到 21。当时的误判过程见 §17.3。
+- **`backoff_hits` 一直是 0，但索引器状态明明是 `RATE_LIMITED`**：
+  检查间隔（`--check-every` × `--interval` = 10 × 30s = **300 秒**）**比实测的退避窗口（30~60 秒）还长**，
+  窗口整段落在两次检查之间 → 既不等待也不计数。
+  ✅ 已修：加 `--backoff-check-secs`（默认 60）**按秒**触发检查，并按 `retry_after` 变化认定「新发生了一次退避」。
+  ★ 连带修掉一个更隐蔽的：`next_sleep()` 的在 `--once` 模式下**压根没接线**（结论只进日志），
+  所以「站点在退避就缓一缓」这条策略**从来没生效过**。见 **SUMMARY §17.5.2~§17.5.4**。
 - **`attempts.log` 里出现 `exit=127 (no python: /usr/bin/python3)`，但同一批的 python 明明跑完了**：
   **那是假象** —— `deploy.sh` 曾在脚本**运行中**覆盖它（`sh` 边读边执行，会从旧偏移读到新内容）。
   `deploy.sh` 已改成**原子替换**（写 `.new` 再 `mv`，换 inode），并在检测到批次在跑时给出告警。
@@ -234,7 +250,13 @@ docker compose run --rm reseed-orchestrator status                          # �
 > ⚠ **Cloudflare**：中文 NexusPHP 站常需要 FlareSolverr，但本项目从 GHCR 拉镜像失败（见 SUMMARY §7）。
 > 解法：改用 Docker Hub 的官方镜像 —— 把 `compose.yaml` 里的
 > `ghcr.io/flaresolverr/flaresolverr:latest` 换成 `flaresolverr/flaresolverr:latest`，
-> 然后在 Prowlarr 的 Settings → Indexers 里把 FlareSolverr 指向 `http://flaresolverr:8191`。
+> 然后**在 Prowlarr 里给那个站挂一个名为 `flaresolverr` 的 tag**（Prowlarr 是按**索引器挂 tag**
+> 启用的，**没有全局开关** —— 「Settings → Indexers 里填个 URL」这个说法是错的）。
+>
+> ★ **现状（2026-09-12 17:15 实测）：FlareSolverr 装了、容器在跑（v3.5.2、健康），
+> 但一次都没被用上** —— Prowlarr 的 tag 列表是**空的**，四个索引器**一个 tag 都没挂**。
+> 而且现在**四个站都不需要它**。判定见 SUMMARY **§18.12**，别照着下面那句"配一下就完事"去补，
+> 先看那一节。
 
 ### 单片状态机（已实现）—— 记录每部片子走到哪一步了
 
@@ -254,7 +276,7 @@ python scripts/reseed-state.py sync --pack $PACK \
   --log "$N/cross-seed/logs/info.current.log" --log "$N/cross-seed/logs/verbose.current.log" \
   --qbit-url http://NAS_IP:3060 --indexer-alias "http://prowlarr:9696/1/api=SiteB"
 python scripts/reseed-state.py report --pack $PACK
-python scripts/reseed-state.py todo  --pack $PACK --indexers SiteA,SiteB --out scripts/todo.txt
+python scripts/reseed-state.py todo  --pack $PACK --indexers SiteA,SiteB --out scripts/todo-paths.txt
 python scripts/reseed-state.py drive --pack $PACK --indexers SiteA,SiteB --limit 50 --apply \
   --url http://NAS_IP:2468 --api-key <CROSSSEED_API_KEY> --db-path "$N/cross-seed/cross-seed.db" \
   --qbit-url http://NAS_IP:3060
@@ -300,8 +322,10 @@ DC 那种 47 个根的包也一行搞定。另有显式 `--root/--local-root`（
 > 代价只是未命中的片子多等一周。**账号比命中率重要** —— 站点查限额见 SUMMARY §11.6。
 
 **`drive` 已经会控速、会等退避、会回灌**（SUMMARY §11.8）：
-`--interval 30` 对齐 cross-seed 的 `delay`；每 `--check-every 10` 条读一次 cross-seed.db 的
-`indexer` 表，撞上 `RATE_LIMITED` 就**睡到解禁**（超过 `--max-wait 1800` 秒则中止，不硬刚）；
+`--interval 30` 对齐 cross-seed 的 `delay`；读 cross-seed.db 的 `indexer` 表检查退避 ——
+**双触发**：每 `--check-every 10` 条、以及每 `--backoff-check-secs 60` 秒
+（★按秒那一路是 2026-09-12 加的：实测退避窗口只有 30~60 秒，只按条数 300 秒才看一眼会**整段错过**）。
+撞上 `RATE_LIMITED` 就**睡到解禁**（超过 `--max-wait 1800` 秒则中止，不硬刚）；
 打完自动 `sync` 回灌，直接告诉你 `newly_seeding`（这轮真赚到几部）和 `still_skipped`（又被退了几部）。
 **默认 dry-run**，不加 `--apply` 不会发任何请求。
 
@@ -406,7 +430,7 @@ sh nas-update-env.sh --no-restart    # 只改不重启
 指向真实数据（不占数据块，只多 inode + 目录项）：
 
 ```text
-/volume1/video/download/reseed_farm/          ← 唯一的 dataDir
+/volume1/video/download/reseed/reseed_farm/     ← 唯一的 dataDir
 ├── Arrow.S01-S08.2012-2020.Bluray.1080p.MNHD-FRDS/   ← 硬链接副本
 ├── 守望者S01.Watchmen…@FRDS/
 └── …（实测 475 条）
@@ -439,11 +463,13 @@ sh build-farm.sh --apply --prune    # 顺带删掉"源已经没了"的条目
 sh build-farm.sh --verify           # 只校验农场 vs 源
 ```
 
-> ⚠ **`--verify` 在 `DATA_DIRS` 切到农场之后会失效**（2026-09-12 发现，**尚未修**）：
-> 它取「期望集」的方式是**从 `.env` 的 `DATA_DIRS` 派生**（脚本第 108 行），
+> ⚠ ~~**`--verify` 在 `DATA_DIRS` 切到农场之后会失效**~~ ✅ **2026-09-12 已修，不再是问题**：
+> 当时的毛病是它取「期望集」的方式**从 `.env` 的 `DATA_DIRS` 派生**（脚本第 108 行），
 > 而 v3 的全部意义正是把 `DATA_DIRS` 改成农场这一条 —— 于是它**拿农场校验农场，永远 PASS**。
-> ★ 在修好之前**别把它挂成定期巡检**：它会每天如期报「一切正常」，实际什么都没检查。
-> 修法（新增 `FARM_SOURCES` 等三个方案）与前置条件见 **SUMMARY §16.2.1**。
+> 现在期望集改由独立的 `FARM_SOURCES` 给出，并加了一道**自指闸**（期望集里出现农场自身
+> 就拒绝执行），`--verify` 也补齐了退出码与漂移明细（0=无漂移 / 1=有漂移 / 其它=没跑成）。
+> 详见 **SUMMARY §16.2.1**。
+> ✅ **它已经挂成定期巡检了**，且已在生产跑过一次 —— 见 **SUMMARY §16.2.2 / §16.2.2.1**。
 
 > ★ **也能直接从 Windows 跑**（走 SMB）—— 2026-09-11 实测：这个 NAS 上
 > `os.link()` / `cp -al` 经 SMB 过来是**服务端真硬链接**（同 inode、`nlink=2`、
@@ -452,7 +478,7 @@ sh build-farm.sh --verify           # 只校验农场 vs 源
 >
 > ```bash
 > COMPOSE_DIR="//iSunker-DS423/docker_ssd/prowlarr_cross-seed_autohardlink" \
-> FARM="//iSunker-DS423/video/download/reseed_farm" \
+> FARM="//iSunker-DS423/video/download/reseed/reseed_farm" \
 > sh scripts/build-farm.sh --map "/volume1=//iSunker-DS423"          # 先 dry-run
 > # 确认 → 同一行末尾加 --apply
 > ```
@@ -489,15 +515,19 @@ sh build-farm.sh --verify           # 只校验农场 vs 源
 
 无人值守最怕的不是出错，是**出错了没人知道**。这套东西负责在出问题时主动发邮件。
 
-### 分工：Windows 只写文件，NAS 才发信
+### 分工：跑批只写文件，发信才碰凭据
 
 ```
-drive-loop.py ──写纯文本事件──▶ //NAS/…/notify/spool/*.txt ──▶ notify-spool.sh ──▶ 你的邮箱
-   (Windows，零凭据)                 (SMB 共享目录)                (NAS，读 DSM 自己的 SMTP 配置)
+drive-loop.py ──写纯文本事件──▶ <compose>/notify/spool/*.txt ──▶ notify-spool.sh ──▶ 你的邮箱
+   (NAS，零凭据)                    (NAS 上的普通目录)            (NAS，读 DSM 自己的 SMTP 配置)
 ```
 
-**Windows 侧一行凭据都没有**（不 import smtplib、不读密码）—— 邮件配置只在 DSM 里，
-发信在 NAS 上完成。代价是推送有延迟（NAS 侧定时轮询），收益是**凭据从没离开过 NAS**。
+**跑批那一侧一行凭据都没有**（不 import smtplib、不读密码）—— 邮件配置只在 DSM 里，
+发信由 `notify-spool.sh` 在 NAS 上完成。代价是推送有延迟（NAS 侧定时轮询），
+收益是**凭据从没离开过 DSM**。
+
+> ★ 2026-09-12 电脑端退役前，这张图写的是「Windows 只写文件、NAS 才发信」，
+> 中间那一跳走 SMB。现在跑批也在 NAS 上，spool 就是本机的一个目录（见上节）。
 
 ### 两条通道：坏消息立刻发，好消息进日报
 
@@ -622,7 +652,7 @@ spool 积压: 0 条告警
 > 或换 Entware 的 `python3`（`opkg install python3`，3.11+）。
 > 你的 NAS 未必一样：`--selftest` 会打印实际探测结果。
 
-### Windows 侧开关
+### 通知开关（跑批那一侧）
 
 ```bash
 python scripts/drive-loop.py --once --no-notify                  # 本次不发任何通知
@@ -633,9 +663,12 @@ python scripts/drive-loop.py --once --notify-spool "D:/tmp/x"    # 换个 spool
 启动日志第四行会打 `通知: ✓ 启用 → <spool 路径>` / `✗ 已禁用` / `试运行（只打印，不写文件）`
 —— 一眼看出通知通没通。环境变量 `NOTIFY_DISABLE=1` 等价于 `--no-notify`。
 
-> ⚠ 从 git-bash 传 `--notify-spool` 时**别用 POSIX 路径**（如 `/tmp/x`）：
+> ⚠ 电脑端退役后这些开关**主要是手动调试用**（正常路径是 DSM 计划任务跑 `run.sh`，
+> 参数在 `run.sh` 里）。在 NAS 上直接跑就用 NAS 原生路径，没有 git-bash 那一层。
+
+> 从 git-bash 传 `--notify-spool` 时**别用 POSIX 路径**（如 `/tmp/x`）：
 > MINGW 会把它改写成 `\tmp\x`，Python 按当前盘解析成 `D:\tmp\x`。
-> 用 `D:/tmp/x` 或 UNC。**默认值（UNC 指向 NAS）不受影响**，计划任务走的就是默认值。
+> 用 `D:/tmp/x` 或 UNC。（退役前默认值就是 UNC 指向 NAS；现在默认值是 NAS 原生路径。）
 
 > 通知坏了**不会拖垮跑批**：`notify.py` 吞掉所有异常，只是打一行
 > `投递通知失败（忽略，不影响跑批）`。NAS 没挂上时批次照跑，只是没有通知。
@@ -659,26 +692,67 @@ python scripts/drive-loop.py --once --notify-spool "D:/tmp/x"    # 换个 spool
 **调度**：✅ **已完全迁到 NAS** —— DSM 三个任务已建，**2026-09-12 00:17 首次由计划任务自动跑完一批**
 （23:51 那批，26 分钟，`成功 50 / 失败 0`），跨进程节流与 60s 心跳都正常。见下「把调度挂到 NAS 上」·
 **通知**：✅ **端到端打通并实测收到邮件**（`--test-mail` → QQ 收件箱；批次通知也真的写进 spool 并被取走）·
-**生产 NAS 磁盘上的 `.env`**：`DATA_DIRS` ✅ 49 条 · `TORZNAB_URLS` ✅ **2 条**（HDFans `/2` + NanyangPT `/4`）·
-**跑着的容器**：⚠ `DATA_DIRS` 仍是 49 条、`TORZNAB_URLS` 里还留着已删的 `/3`（BTSCHOOL）——
-两者都只差**一次 `--force-recreate`**（见下面「收尾命令」）。
-索引器 HDFans ✅ / NanyangPT ✅ · 状态机 `hlink/state.db` ✅ 605 部 ·
-农场 `/volume1/video/download/reseed_farm` ✅ **已建好 475/475**（本地 `.env` 已切，生产未切）。
+**生产 NAS 磁盘上的 `.env`**：`DATA_DIRS` ✅ **1 条（已切农场）** · `LINK_DIR` ✅ **1 条** · `TORZNAB_URLS` ✅ **4 条**（HDtime `/1` + HDFans `/2` + BTSCHOOL `/3` + NanyangPT `/4`）·
+**跑着的容器**：✅ **已重建过**（2026-09-12 上午实测改判）—— 容器内的 `DATA_DIRS` **就是农场那条**、
+★ 但 `.env` 下午又改过（见 §18.9）：`/3`（BTSCHOOL）**又加回来了**，并且新加了 HDtime `/1` —— 所以容器**要再重建一次**才读得到 `/1`。
+索引器 HDFans ✅ / NanyangPT ✅ / BTSCHOOL ✅ / **HDtime ⏳（cookie 已换、Prowlarr Test 通过，卡在重建容器）**。
+状态机 `hlink/state.db` ✅ 605 部 ·
+农场 `/volume1/video/download/reseed/reseed_farm` ✅ **475/475**（2026-09-12 15:50 复核，退出码 0）· qB :3060 的 **509/509 全部落在新根下** ✅（2026-09-12 16:25 复核：旧根 **0** 条、异常状态 **0** 条；新根下 BTSCHOOL 23 / HDFans 318 / NanyangPT 168，与站点侧种子数逐个吻合）。见 SUMMARY §18.9.2 / §18.10。
+
+> ★ **改判（2026-09-12 上午）**：本节此前写的是「容器 `DATA_DIRS` 仍是 49 条、`/3` 还在 ——
+> 只差一次 `--force-recreate`」。实际核对下来**那一步已经做过了**，三条独立证据：
+> ① `.env` 的 `DATA_DIRS` 已是 **1 条**，而 cross-seed 日志里**实际出现**
+>    `/volume1/video/download/reseed/reseed_farm` 路径 → 容器确实在扫农场；
+> ② 近 3000 行 cross-seed 日志里 `410/401/403` **0 条**（此前 `/3/api` 会持续报 410）；
+> ③ `drive-loop` 的「索引器自检」连续 **31 次通过**（若容器里还留着 `/3`，这里会警告）。
+> 所以下面「收尾命令」**无需再执行** —— 保留仅作流程记录。
+> 若与你的记忆不符，请优先复核 ①。
+>
+> ★ **2026-09-12 12:42 补：推断已变成直接证据。** 这一条原本靠日志**推断**（今天重搜日志里没有 410），
+> 现在有了一次**主动的** `--force-recreate`，重建后新容器的启动日志里索引器**恰好两个**
+> （`HDFans`、`NanyangPT (南洋)`），`/3/api` 在当日日志里 **0 次**，
+> 且 `docker inspect` 回读到 `logging` 段生效。**再无疑点。**
 
 > ★ **磁盘 vs 容器**是本项目头号复发坑：`.env` 改了不会自动生效，
 > 必须 `up -d --force-recreate`（`restart` **不重新注入环境变量**）。
 > `drive-loop.py` 的「索引器自检」（⑧）会在启动时扫日志自动喊出来，见 SUMMARY §13.10。
 
-### 🔴 下一步（按优先级，2026-09-12 凌晨排）
+### 🔴 下一步（按优先级，2026-09-12 上午更新）
 
 | 优先 | 做什么 | 为什么 | 详见 |
 |---|---|---|---|
-| **1** | **修「状态机把在做种的片子降级」** —— 先补跑一次带 `--qbit-url` 的 `sync`（**幂等**，看 `SEEDING` 能否回到 ~160）；再查 `blocking_backoffs` 为什么不认 `RATE_LIMITED` | qB 里 **160** 部在做种，状态机只认 **13** 部 → 过重搜周期会被**重复搜、白烧站点额度**（额度是本项目最高优先） | §17.3 |
-| **2** | **给四个容器加 `logging:` 上限** | 全走默认 `json-file`，**没有任何上限**；`/volume1` 只剩 ~20 GB | §16.4.2 |
-| **3** | **一次 `--force-recreate` 同时办完两件事**（清掉容器里的 `/3/api`、`DATA_DIRS` 切农场） | 「收尾命令」已全部备好，只差执行。⚠ **会打断正在跑的 drive，务必等批次跑完** | 本节的「收尾命令」 |
-| **4** | **换一个站替换 BTSCHOOL** | 加站流程已沉淀成可复用步骤 | §13.3 |
-| **5** | 四个新功能（额度感知 / 农场巡检 / 趋势 / 日志轮转） | ⬜ **只写了设计，均未实现**；其中**两条的前提被探针推翻** | §16 |
-| — | **人工**：删掉 Windows 计划任务 `reseed-drive-loop`（现在只是 `/DISABLE`，**没删**） | 两边同时驱动会打出成片 429 | §14.6 |
+| — | ~~修「状态机把在做种的片子降级」~~ ✅ **已完成（2026-09-12 上午）** —— `SEEDING` 13 → 21（只补跑 sync）→ **201**（修掉真根因后 = 理论上限）；同批的退避检测、退避分级、`next_sleep` 接线一并修掉 | 原后果是过重搜周期会被**重复搜、白烧站点额度**（额度是本项目最高优先）—— 已消除 | §17.5 |
+| — | ~~**容器日志上限**~~ ✅ **已完成（2026-09-12 12:42）** —— 批次间隙里跑了 `sudo docker compose up -d --force-recreate cross-seed prowlarr flaresolverr`，`docker inspect` 回读 = `{"Type":"json-file","Config":{"max-file":"3","max-size":"10m"}}`。★ 同一枪顺带清掉了 `/3/api` 的 410（当日日志 0 次）、新容器认得**恰好两个**索引器 | 原先全走默认 `json-file`，**没有任何上限**；`/volume1` 只剩 ~20 GB。★ 正因如此才只动容器日志 —— `drive-loop.log` 与 `cross-seed/logs/*` **都已在自我轮转** | §16.4.2 |
+| — | ~~一次 `--force-recreate` 同时办完两件事（清 `/3/api`、`DATA_DIRS` 切农场）~~ ✅ **已完成** —— 2026-09-12 上午核对发现容器早已重建（证据见上「系统现状」的改判说明） | — | 本节的「收尾命令」（仅存流程） |
+| **1** | **目录搬迁收尾** —— ✅ 搬迁（**509/509 在新根**）✅ 容器已重建（4 个索引器全通）✅ drive-loop 已重新启用 ✅ 旧根已删。**只剩最后 1 步（我做）**：`drive-loop-nas.sh` 的 `--indexers` **已改成 `HDtime,HDFans,NanyangPT,BTSCHOOL`（2026-09-12 17:00）** —— 还差 `deploy.sh --apply` 推上去（顺带带上 `orchestrator/config.py` 的 `link_dir` 默认值修正），**要等当前批次跑完** | 闸门（第 ③ 步）= `cross-seed.db` 的 `timestamp` 表里 HDtime **有行**，实测 **60 行** —— 已开 | §18.10 / §18.11 |
+| ~~**2**~~ | ~~**换一个站替换 BTSCHOOL**~~ ✅ **已关闭（2026-09-12 17:15）—— 是「当初的判据失效了」，不是「换好了」**：BTSCHOOL 现在**搜得出去、也匹配得到** —— `matched_indexers` = **23 部**，命中率 **23/46 = 50%**（四个站里最高），且这 23 部**全在 DC 包里、是那个包的最大贡献者**（压过 HDFans 的 21 部）；实时搜 `The Dark Knight 2008` 回 **24 条**、`Spider-Man No Way Home 2021` 回 **40 条**，Prowlarr 日志里它的 warn/error = **0**。要换它是因为 2026-09-11 它在 Prowlarr 出 CF 挑战页 → 后来重新启用、`/3/api` 加回 `.env`、容器重建，**那道坎过了，只是没人回来销账**。下站工具 `add-torznab-indexer.py --remove` 留着备用 | **真要换，按数据该换的是 `NanyangPT`（4/452 = 0.9%），不是它** —— 不过南洋可能只是片库对不上这批包，得先看目录 | §18.11.6 |
+| ~~**3**~~ | ~~四个新功能~~ ✅ **四条全部实现并部署**（农场巡检的**前置**、额度感知、趋势、**把农场巡检挂成定期任务**）；★ 最后一条已于 **2026-09-12 14:30 在生产实跑验证**——见 **SUMMARY §16.2.2.1「已在生产验证」** | ~~⬜ 只写了设计，均未实现~~ | §16 |
+| — | ~~**人工**：删掉 Windows 计划任务 `reseed-drive-loop`~~ ✅ **已确认根本不存在（2026-09-12 傍晚）** —— `schtasks /Query /TN "reseed-drive-loop"` 报「系统找不到指定的文件」，且全表 **375 个任务**里 `grep reseed` 命中 **0**。**不用删了** | ~~两边同时驱动会打出成片 429~~（风险已随退役消失） | §14.6 + §18.11.3 |
+
+### 🆕 日常看板（2026-09-12 新增，都在 NAS 上跑）
+
+```bash
+D="//iSunker-DS423/docker_ssd/prowlarr_cross-seed_autohardlink"
+
+# 新增做种趋势：按 (周, 站) —— 换站决策看这个，别看某个瞬间的快照
+python scripts/reseed-state.py --db "$D/drive-loop/hlink/state.db" trend --weeks 8 -v
+
+# 站点额度台账：滚动 24h 的各站搜过多少「部」（★不是查询次数，也★不是站点余额）
+python scripts/reseed-state.py --db "$D/drive-loop/hlink/state.db" \
+  quota --db-path "$D/cross-seed/cross-seed.db"
+
+# 农场漂移：有漂移会返回退出码 1（以前恒返回 0，等于永远不报警）
+# ★ 环境变量必须写在命令**前面** —— 写在后面会被当成脚本的参数
+COMPOSE_DIR="$D" FARM="//iSunker-DS423/video/download/reseed/reseed_farm" \
+  sh "$D/build-farm.sh" --verify --map "/volume1=//iSunker-DS423"
+```
+
+日报里**自动**带「每日台账」（额度 + 趋势），每 24 小时最多一条；
+「某站此刻正在退避」会**立刻**发告警（按站 12 小时冷却）。
+
+> **趋势里的两个口径别搞混**：`本周新增做种 N 部` 的 N 是**按片去重**的，
+> 而下面按站列的数字之和**会比它大** —— 一部片同时在两个站做种时，两个站各记一次
+> （渲染里会自动补一行说明，只在"和 > 总数"时出现）。
 
 ### 三个包（**数字会变，别信写死的**）
 
@@ -712,13 +786,15 @@ python scripts/drive-loop.py --once --indexers HDFans,NanyangPT --limit 50
 python scripts/drive-loop.py --indexers HDFans,NanyangPT
 ```
 
-> `drive-loop` 已内置 `--db-path` / `--qbit-url` 的**候选探测**（`CROSSSEED_DIRS`：
-> 先 NAS 原生路径、再 UNC），所以同一份代码在 Windows 和 NAS 上都能跑，
-> 不需要两套参数，**回灌不会漏参数**。
+> `drive-loop` 已内置 `--db-path` / `--qbit-url` 的**候选探测**（`CROSSSEED_DIRS`），
+> 所以**回灌不会漏参数**。
+> ★ 2026-09-12 电脑端退役后 `CROSSSEED_DIRS` 只剩 NAS 原生路径一条 ——
+> 原来还有一条 UNC 兜底（Windows 经 SMB 跑时用），现已注释。
 >
 > **★ 2026-09-11 起，调度跑在 NAS 上**：DSM 任务计划每 15 分钟执行
 > `sh /volume2/docker_ssd/prowlarr_cross-seed_autohardlink/drive-loop/run.sh`。
-> Windows 计划任务已停用。原因不是性能，是 Windows 侧**批次会静默消失**，
+> ★ **2026-09-12 电脑端彻底退役**（包装器与 PC 侧状态已删，见「⛔ 电脑端已不参与」）。
+> 当初搬走的原因不是性能，是 Windows 侧**批次会静默消失**，
 > 查下去是**两个独立的坑**（完整证据与复现见 SUMMARY §14）：
 >
 > * **`<StopOnIdleEnd>true`**（当场读任务定义确认）：你一动鼠标/键盘，
@@ -735,12 +811,13 @@ python scripts/drive-loop.py --indexers HDFans,NanyangPT
 > 所以 15 分钟一次**不会**和 24 分钟一批重叠。这也是没有改用
 > 「常驻容器跑自带循环」的原因 —— 常驻进程卡死就没人接管了。
 > 真实进度一律以 `drive-loop.log` 为准，**别看终端**（输出会被块缓冲吞掉，SUMMARY §13.8）：
-> NAS 上是 `<compose>/drive-loop/scripts/drive-loop.log`，
-> Windows 上是 `scripts/drive-loop.log`。
+> `<compose>/drive-loop/scripts/drive-loop.log`。
+> （退役前 Windows 侧那份是 `scripts/drive-loop.log`，**已删**。）
 >
-> ⚠ 万一要**回退到 Windows 跑**，`scripts/drive-loop-once.cmd` 包装器有两个必须守住的点：
+> ⚠ 万一要**回退到 Windows 跑** —— 包装器 `scripts/drive-loop-once.cmd` **已删**，
+> 但它踩过的两个点必须守住，否则回退会原样再踩一遍（脚本本体在 git 历史里）：
 > 1. **别把包装器换成直接指向 `python.exe`** —— python 路径里有中文用户名，
->    经 `schtasks` / MINGW 传递会被搞坏；包装器用 `%USERPROFILE%` 让 cmd.exe
+>    经 `schtasks` / MINGW 传递会被搞坏；包装器要用 `%USERPROFILE%` 让 cmd.exe
 >    在**运行时**展开，任务定义本身保持纯 ASCII。
 > 2. **包装器必须是 CRLF 行尾** —— LF-only 会让 cmd.exe 解析错位、整行命令失效
 >    （现象：`exit=9009` 且 `attempts.log` 里没有 `start` 行）。改完包装器务必确认：
@@ -748,6 +825,9 @@ python scripts/drive-loop.py --indexers HDFans,NanyangPT
 >    python -c "b=open('scripts/drive-loop-once.cmd','rb').read(); print('CRLF',b.count(b'\r\n'),'LF',b.count(b'\n')-b.count(b'\r\n'))"
 >    # 要 CRLF 59 / LF 0
 >    ```
+> 3. ★ 还有 `os.kill(pid, 0)` 那一支 —— 它在 POSIX 上是"探测存活"，
+>    在 Windows 上**会真的把进程杀掉**，必须切回 `tasklist` 分支
+>    （代码在 `pid_alive()` 里，连 `import subprocess` 一起打开）。
 
 ### 把调度挂到 NAS 上（✅ 已完成 —— 2026-09-12 凌晨）
 
@@ -802,6 +882,49 @@ python scripts/reseed-state.py drive --pack dc-collection --indexers HDFans,Nany
 
 **一批做完重跑同一条命令就自动推进**，不用记批次号。**先 `--plan` 确认再加 `--apply`**。
 
+### ⛔ 电脑端已不参与（2026-09-12 退役）
+
+**一句话**：跑批、发信、建农场全在 NAS 上；Windows 只剩 `deploy.sh` 一个用途 —— 把代码推上去。
+
+为什么单独写一节：代码里**到处**都有"Windows 也能跑"的痕迹（UNC 路径兜底、
+`tasklist` 判活、计划任务包装器、git-bash 路径转换的告警……），
+不写清楚的话，下一个人会以为这条路还活着，然后照着它去配、去调、去踩已经踩过的坑。
+
+**① 退役了什么**
+
+| 东西 | 处置 |
+|---|---|
+| `scripts/drive-loop-once.cmd` | **已删**（原 Windows 计划任务的入口） |
+| Windows 计划任务 `reseed-drive-loop` | 已 `/DISABLE`，**目标文件已删 → 现在是个悬空任务**。彻底删需要管理员权限，见下 |
+| `scripts/drive-loop.{log,attempts.log,task.err}`、`.drive-loop.state`、`.notify.state` | **已删**（PC 侧运行时残留） |
+| `drive-loop.py` 的 `CROSSSEED_DIRS` UNC 兜底 | **已注释**（标记 `[电脑端已退役 2026-09-12]`） |
+| `drive-loop.py` 的 `pid_alive()` tasklist 分支 + `import subprocess` | **已注释**（同上标记） |
+| `notify.py` 的 `SPOOL_CANDIDATES` UNC 兜底 | **已注释**（同上标记） |
+
+> 注释保留而不是删除，是因为它们各记着一个**反直觉的坑**，值钱的不是代码是那句话：
+> `os.kill(pid, 0)` 在 POSIX 上是"探测存活"，搬到 Windows 上就变成**"探测即击杀"**；
+> 以及 UNC 兜底在 NAS 上不报错、只是**悄悄绕一圈 SMB 连自己**（慢，且难查）。
+> 要回退就取消注释 —— **`subprocess` 那行要一起打开**，否则 tasklist 分支会 NameError。
+
+**② 还剩两件要你手动做的**
+
+```bash
+# 1) 彻底删掉那个悬空计划任务（必须**管理员** PowerShell/cmd，普通权限会「拒绝访问」）
+schtasks /Delete /TN "reseed-drive-loop" /F
+#    不删也不影响 —— 它是"已禁用"状态，而且目标 .cmd 已经没了，永远不会跑。
+
+# 2) scripts/run-batch.sh 仍然保留（它是一次性的**手动**命中率试跑，不是调度）
+#    但它从 Git Bash 跑，照样要读 scripts/.nasrc。
+```
+
+**③ 明确保留的东西**
+
+- ✅ **`deploy.sh`** —— Windows Git Bash 跑的，**唯一**还从电脑发起的操作。别删。
+- ✅ **`scripts/run-batch.sh`** —— 手动试跑工具，不是调度的一部分。
+- ⚠ `scripts/nas-update-env.sh` 是**手工放在** `<compose>/nas-update-env.sh` 的，
+  **不在 `deploy.sh` 白名单里**（和 `build-farm.sh` 原先的情况一样，后者已于 2026-09-12 进白名单）。
+  改它记得单独拷。
+
 ### ⚠ 交接必读的坑
 
 1. **`drive` 忘给 `--qbit-url` → `SEEDING` 被误降级成 `MATCHED`。**
@@ -824,41 +947,189 @@ python scripts/reseed-state.py drive --pack dc-collection --indexers HDFans,Nany
 
 ### 还没做
 
-★ **下面第 1、4 条现在合并成同一次容器重建** —— 已全部准备好，见本节的「收尾命令」。
+★ **下面第 1、4 条已合并成同一次容器重建，并于 2026-09-12 12:42 执行完毕** —— 见本节的「收尾命令」。
 
-1. ~~从 `TORZNAB_URLS` 移除 BTSCHOOL `/3/api`~~ ✅ **文件侧早已完成** ——
-   查下来生产 `.env` 里**只有 2 条**（`/2`、`/4`），`/3/api` 早就不在文件里了。
+1. ~~从 `TORZNAB_URLS` 移除 BTSCHOOL `/3/api`~~ ✅ **已完成（2026-09-12 12:42）** ——
+   文件侧早已完成：生产 `.env` 里**只有 2 条**（`/2`、`/4`），`/3/api` 早就不在文件里了；
    那些 410 **纯粹是容器没重建**（磁盘上的 `.env` 是对的，跑着的容器用的是旧环境变量）。
-   所以不用跑 `add-indexers.py --remove`，**只差 `--force-recreate`**。
+   所以不用跑 `add-indexers.py --remove`，**只差 `--force-recreate`** —— 这一步已在批次间隙做完：
+   新容器启动日志认得**恰好两个**索引器（`HDFans`、`NanyangPT (南洋)`），
+   当日日志里 `/3/api` **0 次**、`410/401/403` **0 条**。
    ⚠ 重建会打断正在跑的 drive，务必等当前批次跑完。
-2. ~~挂 Windows 计划任务~~ ✅ 已完成过一次，但 **2026-09-11 晚已迁到 NAS**
-   （`reseed-drive-loop` 这个 Windows 任务**请停用**，否则两边同时驱动
-   cross-seed → 成片的 429）。现在挂的是 DSM 任务计划，见 SUMMARY §14。
-3. **换一个站替换 BTSCHOOL**（已在计划中）——加站流程见 SUMMARY §13.3。
+   ★ 重建后第一次启动会打两条 `HDFans/NanyangPT failed to respond ... fetch failed` ——
+   **那是竞态常态**（cross-seed 比 Prowlarr 先起来），不是故障，判据见 SUMMARY §16.4.2。
+2. ~~挂 Windows 计划任务~~ ✅ 已完成过一次，但 **2026-09-11 晚已迁到 NAS**。
+   ★ **2026-09-12 电脑端彻底退役**：包装器 `.cmd` 与 PC 侧日志/状态**已删**，
+   代码里的 Windows 分支**已注释**（`[电脑端已退役 2026-09-12]`），详见上面
+   「**⛔ 电脑端已不参与**」那一节。
+   ✅ **残留任务已删除（2026-09-12 中午）** —— `schtasks /Query /TN "reseed-drive-loop"`
+   报「系统找不到指定的文件」、`Get-ScheduledTask` 也返回空，**两把工具独立确认**。
+   ⚠️ 记一个方向容易看反的坑：**`拒绝访问`= 没提权**（要管理员），
+   而 **`找不到指定的文件` / `ObjectNotFound` = 已经没有了**（是成功信号，不是失败）。
+   删的时候如果先跑的是没提权的那条，会先吃一个 `拒绝访问` —— 别以为"删不掉"，
+   换个管理员窗口重跑就好。
+3. ~~**换一个站替换 BTSCHOOL**~~ ✅ **已定并已改 `.env`（2026-09-12 13:09）** ——
+   第三个 cross-seed 源站选 **HDtime**。理由见 **SUMMARY §16.6.3**：它在 Prowlarr 里
+   **已配好且启用**（`id=1`，零新凭据）、**IYUU 也管它**、而且 **IYUU 还没对它扩散成功**
+   （qB 里那 8 个外来 tracker 没有 hdtime）—— 正好落在「cross-seed 先做上种、
+   IYUU 再扩散」的位置上。
+   `.env` 的 `TORZNAB_URLS` 已从 2 条改为 **3 条**（备份 `.env.bak.hdtime-20260912-130915`）。
+   ✅ **已完成（2026-09-12 13:12）** —— 批次间隙里 `sudo docker compose up -d --no-deps
+   --force-recreate cross-seed`，回读容器内 `TORZNAB_URLS` 条目数 = **3**；
+   启动日志 `Your configuration is valid!`，**三个索引器一条错都没报**。
+   ⚠ **首搜爆发**：新索引器对库里每部片子都是「从没搜过」，接下来几批会补搜积压 ——
+   收到 `indexer-blocked:HDtime` 告警就说明它吃不住。加站流程见 SUMMARY §13.3。
 4. v3 **硬链接农场**：**农场已建好（475/475）并通过独立复核**，
    切换前的**等价性也已在真实数据上验过**：按 cross-seed 真正用的指纹
    （名字 + 每个文件的相对路径与尺寸）比，49 条 dataDir 与农场**逐条完全相同**
    （1888 = 1888，双向 0 差异）。见 SUMMARY §10.5.7 / §10.5.9。
-   ⬜ 只差把 `DATA_DIRS` 切过去 —— **与第 1 条同一次重建**。
-5. 编排器 `status` 子命令（见 SUMMARY §11.9）；IYUU 扩散（本范围外）。
+   ✅ **已在生产生效** —— NAS 磁盘上的 `.env` `DATA_DIRS` 已是农场那 **1 条**，
+   容器里也是。★ 2026-09-12 12:42 那次 `--force-recreate` 把这件事**从"日志推断"变成了直接证据**。
+5. ~~编排器 `status` 子命令~~ ✅ **2026-09-12 下午已做** —— 但**原待办的名字是错的**：
+   缺的是 **`state`**，`status` **早就有了**。两者名字像、含义完全不同：
+   `status` 看 **qB 快照**，`state` 看**我们自己的 sidecar 状态库**；
+   它们对不上恰好是 §17.5.1 那类 bug 的症状。实现与四个决定见 **SUMMARY §11.10**，
+   测试 `D:/tmp/test_orchestrator_state.py`（21 条）。
+   ✅ 容器里要用的那一步也做完了：给 compose 补了 `./drive-loop/hlink:/state:ro`
+   （+ `RESEED_STATE_DB=/state/state.db`）。挂 **`ro`** 是必须的 —— `StateStore`
+   打开库时会跑 schema 迁移（`ALTER TABLE`），rw 等于让一个**只读语义**的子命令
+   具备**写坏生产库**的能力。这一行**不用重建容器**，下次跑编排器就生效。
+   IYUU（本范围外）—— 但它可能不只是在"扩散"，见第 9 条。
+9. ~~⬜ ★ **查清是否有第二套系统在共用同一个 qB**~~ ✅ **已查清（2026-09-12 13:00）**——
+   见 **SUMMARY §16.6**。`.env` 只配了 **2 个** Torznab 索引器，
+   而 qB 里的 tracker 域名**明显更多**（keepfrds / btschool / m-team / hdarea / pterclub …），
+   首要嫌疑是 **IYUU**。
+   **不是故障**，但它动摇的是 §16.1 额度台账的**前提**（"只有我们在用这些站"）：
+   那些数字可能**系统性偏低**，而站点那边看到的是**两边之和**。
+   ★ 当天下午**已排除一条错路**：原本以为"点亮来源 B 就能发现它"，
+   **是错的** —— 那些站**在 Prowlarr 里一个都没有**，说明第二套系统**绕开 Prowlarr 直连站点**，
+   A/B 互校**看不见它**。（"视角 ≠ 全景"：B 只能看见**经过 B 的**东西。）
+   ⬜ 仍未查：IYUU 在不在跑、注入到哪个分类/目录、查不查我们这两个站。
+   ✅ **已查清（2026-09-12 13:00，全文见 SUMMARY §16.6.3）**：
+   **是 IYUU Plus**（容器 `iyuuplus_ssd`，UI `:8787/app/admin`），就在这台 NAS 上；
+   ★ **2026-09-11 21:08 起**它把**我们的 qB（`192.168.0.7:3060`）加为下载器**（`id=6`）；
+   其任务 `QB-docker-reseed辅种`（**每天 02:34**）向我们这个 qB 辅种、
+   并查询 **16 个站**（**含 HDFans 与南洋**）。
+   ★★ **但它抓的是网页**（`details.php` / `download.php`），**不是 Torznab** ——
+   所以 A/B 量的是「我们的 Torznab 搜索」、IYUU 走 HTML，**两条通道不同**，
+   台账的分母**没有被污染**。⚠️ 唯一没闭环的：**站点是否把「API 查询额度」与
+   「网页浏览」分开计** —— 那只能人去规则页看。
+   ★ 副产物：**Prowlarr 里其实有 4 个索引器**（`1=HDtime`、`2=HDFans`、
+   **`3=BTSCHOOL`（只是被停用，从未删除）**、`4=NanyangPT`）——
+   §13.10 那句「410 = 索引器已被删除」**需要复核**。
+   ★ 由此定下的**分工**（用户当天拍板，见 §16.6.3 与上面第 3 条）：
+   **cross-seed 只在 3 个源站把种做上，其余十余站交给 IYUU 扩散。**
+10. ✅ **来源 B 已点亮（2026-09-12 下午）** —— 用真响应核对过字段名
+   （`{"indexers":[{"indexerName","numberOfQueries",...}]}`，与解析一致），
+   并接进每日台账。**但它的用途和原先记的不一样**：
+   它能发现的是**「有别的工具在用我们的 Prowlarr」**，而**发现不了**直连站点的 IYUU（见第 9 条）。
+   ★ 真就抓到一个：**HDtime**（Prowlarr 里启用、被查 8 次含 4 次失败，而我们只用 `/2` `/4`）
+   —— **这 8 次不是我们发的，是谁发的还没查**，见 SUMMARY §16.6.1。
+   顺带修掉一个结构性盲点：台账原先**看不见"不是我们的站"**（§16.6.2）。
+   `.env` 里补了 `PROWLARR_URL=http://<NAS_IP>:9696`（备份 `.env.bak.prowlarrurl-20260912-122140`）。
+11. ✅ **`.dockerignore` 的 `.env` → `.env*`（2026-09-12 下午，顺手救火）** ——
+   `.env` 是**精确匹配**，拦不住 `.env.bak.20260911-204109` 这类**含密钥的完整副本**，
+   而仓库根目录**确实躺着一份**。只写 `.env` 的话 `docker build` 会把它打进镜像层，
+   而**镜像层是删不掉的**（删了也还在历史层里）。`.gitignore` 里本来就是两条，这里一条通配。
+12. ✅ **`[inject] Failed to parse ... ENOENT` 已查清（2026-09-12 13:30）—— 是虚惊，不是丢种。**
+   原判断「每一条都等于一个跨种没注入成」**是错的**。真相是 cross-seed **自己的事后清理**
+   与**它自己的并发**打架：
+
+   * cross-seed 在注入成功、且该种在 qB 里**已完整**之后，会删掉 `/config/cross-seeds/` 里
+     那份存档 `.torrent`。这行**只写在 verbose 级**（今天 info 里 `Deleting` **0** 条、
+     verbose 里 **384** 条）—— 所以光看 info 根本看不见，才显得像"文件凭空消失"。
+   * 而 webhook 会触发**并发的**新一轮 inject 阶段：它在**开头**就把目录扫成一个文件清单
+     （`[inject] Found N torrent file(s) to inject`），之后**逐个**打开处理。
+     清单里的某个文件若在这期间被另一路删掉 → `open()` → **ENOENT**。
+   * 实测配对：未麻的部屋 `[787075f7]` 在 `09:40:07.016` 被删，
+     ENOENT 出现在 `09:40:07.336` —— **相差 320 ms**，同一文件还被删了两次
+     （09:40:07 与 09:40:11），正是两路并发各删一次。
+
+  **结论：ENOENT 的种子早已注入且已完整，丢的只是一份已经没用的存档。**
+  ★ 顺带纠正一个更早的猜测：**NanyangPT 的跨种一直在正常工作** ——
+  09-12 单日 webhook 路径 `- injected`：HDFans **121** 次、NanyangPT **105** 次。
+  「只有红豆饭拆包成功」**不是 cross-seed 这一层的问题**，是台账的问题 —— 见第 13 条。
+  ⬜ 唯一还值得做的：`Deleting` 只记 verbose，等于这条清理路径在 info 级是隐形的；
+  可以在 `config.js` 里给它留个 info 级的汇总（低优先）。
+13. ✅ **★ 台账「只有红豆饭」是解析 bug，不是事实（2026-09-12 13:25 定位并修复）** ——
+  **这直接就是你看到的「只有红豆饭拆包成功」。**
+
+  `orchestrator/state.py:264` 的 `_RE_FOUND` 用 `on (\S+) by (\w+)` 取站名。
+  而 Prowlarr 里的站点显示名**可以带空格和括号** —— 我们的南洋就叫
+  **`NanyangPT (南洋)`**。于是 `(\S+)` 只吃到 `NanyangPT`，紧跟着要求 ` by `、
+  实际却是 ` (南洋) by `，**整行静默不匹配**。HDFans / HDtime 名字没空格，所以毫发无伤。
+
+  | 日志 | Found 行总数 | 现有正则认出 | 漏掉 |
+  |---|---|---|---|
+  | `info.2026-09-11.log` | 399 | 308 | **91，全部是南洋** |
+  | `info.2026-09-12.log` | 770 | 492 | **278，全部是南洋** |
+
+  **后果链**：`parse_log` 丢掉这些行 → `facts.found` 里没有南洋 →
+  `state.py:1947` 的 `matched = [(h, "|".join(found_idx)) for h in hashes]` 拿不到南洋标签 →
+  `movie.matched_indexers` **永远只有 HDFans**。
+  据库实测：605 部里 **215 部标着 HDFans，标着南洋的 0 部** —— 而
+  `indexer_seen`（452）和 `attempt.indexers` 里南洋**都在**，因为那两处走的是
+  cross-seed.db 和搜索记录，**不经过这个正则**。所以是"一个字段瞎了"，不是"南洋不行"。
+
+  ★ **影响面**：只影响 `matched_indexers` 这一列 → `report` 的站点归属、
+  `trend` 的**按周×按站**换站决策表。**不影响 `stage`**（`compute_stage` 只看计数），
+  也**不影响重搜**（`next_retry_at` 走 `indexer_seen`）。也就是说：
+  **做种一直在做，只是台账把它记成了红豆饭的。**
+  ⚠️ 它还会**反向污染**：一部在南洋匹配到的片，因为 HDFans 那一行解析成功，
+  整条 `matched_indexers` 会被写成 `["HDFans"]` —— **把南洋的功劳记到红豆饭头上**。
+
+  修法：`on (\S+) by` → `on (.+?) by`（后面 ` by (\w+) from dataDir \(` 是硬锚点，
+  非贪婪不会越界）。已过：
+  * 复跑上表 → **漏 0 条**；
+  * 用真实 `parse_log` 跑全天日志 → `found` 里 HDFans 399 / **NanyangPT (南洋) 255**，
+    且同一目录能同时归到两个站（如「寻梦环游记」）；
+  * `py_compile` 通过。
+  ✅ **已 `deploy.sh --apply` 落 NAS**（备份 `.deploy-backup/20260912-132505`），
+  `orchestrator/state.py` 与 `drive-loop/orchestrator/state.py` 两个目标都已回读一致。
+  **drive-loop 下一批次 import 时即生效，不需要重建容器。**
+
 6. ~~**通知：NAS 侧还没部署**~~ ✅ **已完成（2026-09-12 凌晨）** —— 三个任务计划已建，
    **实测收到邮件**（`--test-mail` → QQ 收件箱），spool→发信整条链路打通。
    踩坑全过程见 SUMMARY §15（DSM 的 ssmtp 读的是 `synosmtp.conf`、`MAIL_FROM` 必须等于认证账号、
    计划窗口小时位存错导致"手动能跑、计划不跑"）。
-7. ⬜ **四个自动化的设计预案（只是记下来，未实现）** —— 见 **SUMMARY §16**：
+7. ⬜ **四个自动化的设计预案** —— 见 **SUMMARY §16**：
    站点额度感知 / 农场巡检自动化 / 命中率趋势 / 日志轮转。
-   ★ 探完之后**两条的前提被推翻**：日志**其实已经在自我轮转**（真正无上限的是**容器的
-   docker 日志**），而 `build-farm.sh --verify` 在 `DATA_DIRS` 切到农场后会
-   **自己和自己比、永远通过**。动这四条之前**先读 §16**，里面还给了优先级。
-8. 🔴 **状态机把"其实在做种"的片子降级了（2026-09-12 凌晨实测，未修）** —— 首次 NAS 真跑后
-   回灌打出 `新增做种 -26`（**负数**），现在全库只剩 **13** 部 `SEEDING` 而 qB 里**有 160 部在做种**。
-   后果是这些片子过了重搜周期会被**重复搜、白烧站点额度**。同批还查出
-   `backoff_hits=0` 但 HDFans 状态是 `RATE_LIMITED`（退避检测没触发）。
-   **优先级高于上面第 7 条。** 证据与下一步见 **SUMMARY §17.3**。
+   ✅ **"日志轮转"那条已实施（2026-09-12 上午）** —— 但**不是**按原假设做的：
+   探完之后发现**两条前提被推翻**：`drive-loop.log` 与 `cross-seed/logs/*` **其实都已在自我轮转**，
+   真正没有上限的是**容器的 docker 日志**。所以改的是 `docker-compose.yml` 的 `logging` 段
+   （四个服务共用一份锚点），✅ **已于 2026-09-12 12:42 在 NAS 上 `--force-recreate` 生效**
+   （`docker inspect` 回读 `max-file=3` / `max-size=10m`）。详见 §16.4.2。
+   剩下三条里：
+   * ✅ **"农场巡检"也已实施（2026-09-12 下午）** —— 先修掉了它的前置条件
+     （`--verify` 在 `DATA_DIRS` 切到农场后会**自己和自己比、永远通过**，§16.2.1），
+     再把巡检挂进 `drive-loop`（`check_farm()`：漂移发 `alert`、干净进日报、
+     **绝不自动 `--prune`**）。见 §16.2.2。**代码待部署。**
+   * ★ 而"挂上去"这一步**自己又长出两个 bug**，都是只在**自动跑起来之后**才暴露的：
+     `.env` 行尾的 CR 让 `--verify` 报**假漂移**（§16.2.1.2），
+     `--verify` 收尾漏删一个 115 KB 的 `.tmp`（§16.2.1.1）。
+     **一个只在"自动跑"时才暴露的问题，只有真的自动跑起来才会暴露** ——
+     所以"先挂上去"不是收尾动作，是**发现手段**。
+     ✅ **已部署（2026-09-12 12:12，备份 `.deploy-backup/20260912-121218`）。**
+     ★ 首次真正跑到 `check_farm()` 是**下一批跑完**（约 13:40）——
+     被闸门跳过的 tick 只在跑闸门那几行，走不到它。
+   * ⬜ 还剩**站点额度感知**（已实施，§16.1）与**命中率趋势**（已实施，§16.3）之外的
+     两条**已知残留**，见 §16.5 优先级表。
+   动之前**先读 §16**，里面还给了优先级。
+8. ~~🔴 状态机把"其实在做种"的片子降级了（2026-09-12 凌晨实测，未修）~~ ✅ **2026-09-12 上午已修** ——
+   首次 NAS 真跑后回灌打出 `新增做种 -26`（**负数**），当时全库只剩 **13** 部 `SEEDING` 而 qB 里**有 160 部在做种**。
+   真根因**不是**回灌链路，是 **v3 农场切换后 cross-seed 报的是农场路径、`pack.roots` 还是原路径**
+   → searchee 全被判成「别的包」**静默跳过**。`SEEDING` 13 → 21（只补跑 sync）→ **201**（= 理论上限）。
+   同批的 `backoff_hits=0` 也一并修掉（真根因：**检查间隔 300s 比退避窗口 55s 还长**），
+   并顺带发现 `next_sleep()` 在 `--once` 模式下**压根没接线**。
+   根因、修法、三层验证见 **SUMMARY §17.5**；当时的误判过程见 §17.3。
    （另：`attempts.log` 里可能看到一行**假的** `exit=127 (no python)` —— 那是部署覆盖了
    正在运行的 `run.sh` 造成的，**不是真的没有 python**，见 §17.2。）
 
-#### 收尾命令（一次重建同时办完两件事）
+#### 收尾命令（一次重建同时办完两件事）—— ✅ **已执行过，此节仅存流程**
+
+> ★ **2026-09-12 上午改判**：核对发现**这一步已经做完了**（容器内的 `DATA_DIRS` 已是农场那条、
+> `/3` 已不在 `TORZNAB_URLS` 里，三条独立证据见上文「系统现状」的改判说明）。
+> **不需要再跑下面的命令** —— 保留是因为将来改 `DATA_DIRS`/`LINK_DIR` 还要走同一条路。
 
 本地已把 `.env` 的 `DATA_DIRS` 切成农场那一条，并生成/拷好了更新脚本。
 **在 NAS 上**（SSH 或 Container Manager「终端」）：
