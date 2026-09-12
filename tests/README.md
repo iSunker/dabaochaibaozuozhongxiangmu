@@ -12,7 +12,7 @@ python tests/test_backoff.py        # 任一 cwd 都行
 路径按 `__file__` 解析（不是 cwd），所以从哪儿跑都一样。
 每个脚本自己打印 `ok` / `FAIL`：**全过退出码 0，有失败退出码 1**，可以直接接 CI。
 
-2026-09-12 实测：**7 个脚本、204 条断言、0 失败**。
+2026-09-12 实测：**8 个脚本、229 条断言、0 失败**。
 
 ## 各测什么
 
@@ -25,6 +25,7 @@ python tests/test_backoff.py        # 任一 cwd 都行
 | `test_orchestrator_state.py` | 24 | `state` 子命令：**库不存在时绝不许把文件建出来**；且必须在读 `config.yml` **之前**分派（配置坏了它还得能用） |
 | `test_quota_trend.py` | 96 | 额度台账（A 来源滚动 24h + B 来源 Prowlarr + 两者互校）+ 趋势（按周按站）+ 农场巡检判断（**argv 里绝不出现 `--prune`**） |
 | `test_remove_indexer.py` | 8 | `add-torznab-indexer.py --remove` 的**字节保真**与安全闸（合成样本 + 假 key，绝不碰生产 `.env`） |
+| `test_scan_secrets.py` | 25 | 推前凭据扫描器 `scripts/scan-secrets.py`：阳性拦得住（值指纹 + 形状两条路）、阴性不误报；**形状层必须参与退出码**、**只拦「本次新引入」**、三类假阳性（读变量 / 英文短语 / 同字符重复）必须被规则认出来 |
 
 ## 写测试时踩过的坑（别再踩）
 
@@ -39,6 +40,16 @@ python tests/test_backoff.py        # 任一 cwd 都行
 - ★ **"生产会写文件"的路径，测试里必须改向到临时目录** —— `STATE_FILE` /
   `FARM_CHECK_FILE` / `DAILY_FILE` / spool。否则跑一次测试就往**仓库**里留产物：
   `test_once_gate.py` §⑤ 就是这么把 `.farm-check.state` 写进 `scripts/` 过的（已清掉）。
+- ★ **闸门自己的对照集，必须先过闸门自己。** `test_scan_secrets.py` 里那些"凭据样本"
+  一律由**变量拼出来**（`"-".join([...])`、`"y" * 16`），源码里不留字面量 ——
+  否则推前扫描会扫到这个测试文件本身，"防凭据入库"的工具先给自己报红。
+  同理，沙箱是 `tempfile.mkdtemp()`（**仓库之外**）：曾经把探针写成
+  `<repo>/.ctl-secret-probe.txt`（随即删掉），那是错的 —— 往待推目录里塞一个
+  凭据形状的文件，本身就是这件事要防的。
+- ★ **别用"按某个标记切源码再 exec 前半段"的取巧办法**（`src.split("hits = []")[0]`）
+  去拿被测文件里的正则/函数：切点一改就**静默失效**，切出来的前半段照样能跑，
+  只是少了后半个文件的定义。用 `importlib` 把**真的那份**载进来（吞掉 `SystemExit`、
+  重定向 `stdout`）。
 
 ## 约定
 
