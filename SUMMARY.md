@@ -6294,3 +6294,114 @@ b−c 第一版把**整条路径**当 searchee **名字**传给了
 （现在还有这两个对账脚本）。这类**同一个事实写在两处**的漂移，正是
 「唯一出处」那条约定要防的 —— 这次是顺手撞见，不是查出来的。
 
+---
+
+### 18.19 三条观测判据进生产（2026-09-12 夜）
+
+三轮论证收敛到一句：**瓶颈不在输入侧（枚举/识别），在观测侧（对账）。**
+落地的是**三条**，顺序 ①→②→③ 不能换（③ 依赖 ①）。
+
+#### 18.19.0 共同的落点：为什么判据本体搬进了 `orchestrator/state.py`
+
+三条判据本体原先（或本来会）写在 `scripts/audit-found-*.py` 里。搬家的理由只有一个，但是硬的：
+
+| | `scripts/audit-found-*.py` | `orchestrator/state.py` |
+|---|---|---|
+| 在 NAS 上吗 | **不在** —— `deploy.sh` 的 `FILES` 里没有，`check-deploy-drift.py` 把它俩标成 LOCAL_ONLY（Windows 侧诊断） | **在**，且被部署**两次**（构建上下文 + `drive-loop/orchestrator/`） |
+| 路径 | 写死 `//iSunker-DS423/...`，**NAS 宿主机上不存在这个路径** | 无路径依赖，只收文本/连接 |
+
+而要跑这些判据的是 `drive-loop.py`，它跑在 **NAS 宿主机**上
+（`drive-loop-nas.sh`：`PY=/usr/bin/python3`，DSM 自带 3.8.15，**不是容器**）。
+
+⇒ `orchestrator/state.py` 是两侧**唯一都能到达**的地方。两个脚本因此降级成**薄壳**：
+手工随时能跑，核的是**同一份实现**。
+
+★ 顺带更正一条先前的错话：曾说过「`sync_pack` 只拿得到一个包，**物理上算不出**三包并集」。
+**错了** —— `sync_pack(store, ...)` 第一个参数就是 `store`，`store.packs()` 就能取全部。
+真正的问题是**放哪**：它一包一调，一轮会算 3 次、发 3 条通知，所以放收尾
+（`after_batch_reports()` 之后）。
+
+#### 18.19.1 ① 口径改名 —— 一个名字盖了两种模型
+
+`audit-found-resolve.py` 的历史 `other_pack = 0` 被当成过「干净」。**实测（NAS 只读）**：
+
+```
+Found 行共 1011 条
+〔全量口径〕所有包一起试、命中即停   → in_pack 1011  other_pack 0
+〔生产口径〕一次一个包（sync_pack）  → dc-collection  other_pack 865
+                                     frds-top250    other_pack 146
+                                     mbf            other_pack 1011
+```
+
+**根因**：三个包**共用一个 `farm_root`**（`fix-statedb-farm-root.py`：迁移 SQL 一次改
+3 行 `pack.farm_root`）。cross-seed 扫的是那**一个**农场，所以对任一包来说，
+**别的包的 searchee 天然就是 `other_pack`**。
+
+⇒ 两个口径**都在输出里**，每个数都**绑定自己的口径名**，不出现裸的 `other_pack`。
+这跟 `NanyangPT` vs `NanyangPT (南洋)` 是**同一个形状**。
+
+★ **更重的一句**：那个 `other_pack = 0` 是**该脚本自己循环构造的产物**
+（所有包一起试、命中即停），**不是日志的性质**。所以 §18.18.2 那句
+「b−c=0 覆盖不到农场」底下还必须垫一句：**这个 0 本身换过口径，它跟生产口径下的数不可比**。
+
+#### 18.19.2 ② 全场无人认领 —— 期望值指回一条真实记录
+
+加的不是 `other_pack` 计数器（见 18.19.1：那在生产口径下是个大常数），而是
+**「三个包合起来都认不出」** 的 searchee。实测：
+
+```
+库里 searchee 名数 : 1888        （searched 941 / decisions 608）
+归属分布           : in_pack 1887   other_pack 1   unresolved 0
+★ 唯一无人认领的那条：
+   /volume1/video/download/reseed/reseed_farm/0观影清单chrlee整理
+       └─ 里面只有一个文件：豆瓣&IMDB电影TOP250_20240501_chrlee整理.xlsx
+```
+
+它在农场里、源还在（`build-farm.sh --verify` 抓不到）、三包都不认它，
+`searched`/`decisions` 里**都没有它** —— 所以它今天不烧额度，是**潜伏**的。
+
+★ 它的价值不在「要删」：**它是一个判据之外的真实记录。** 新判据今天应当报 **1** 并
+指名这一条 —— 报得出这个 1，计数器才可信。这正是收敛判据要的
+「**期望值能指回一条判据之外的真实记录**」的第一个具体实例。
+
+★ 判据**必须带名**：只报数就是「换了个地方藏」（告警正文里点名路径）。
+
+#### 18.19.3 ③ a−b / b−c 进 metrics，`b > 0` 作硬判据
+
+- 判据 = 六个**独立字面量的合取**（`state.FOUND_LITS`），**不是** `] Found ` 单字面量
+  —— 后者会吃到 `Found 0 torrents for {` 与 `Found N torrent file(s) to inject`，
+  实测 **2231 vs 靶心 1011**，正是 §18.18.1 那个假差。
+- 接线：`drive-loop.py` 的 `reconcile_watch()` → 每日台账 `metrics`
+  （`fa/fb/fd/fb_c_all/fb_c_farm/unclaimed`），并**立刻**发 alert：
+  `log-parse-miss`（差不为 0，正文带留证行）/ `reconcile-empty`（**b == 0 = 空转，
+  不是干净**，§18.17.3）/ `reconcile-controls` / `unclaimed-searchee`。
+- 读不到时 metrics 给 **`n/a`**（不是 0）—— 否则 TSV 里「这次读失败了」和
+  「那天根本没跑」长得一模一样。
+
+★ **实测抓到的一处真形状**：第一版合成用例把组 4 写成了 `webhook`/`inject`，
+而生产日志里 **组 4 是判定**（`MATCH` / `MATCH_PARTIAL` / `MATCH_SIZE_ONLY`），
+组 1 = searchee 名、组 3 = 站名、组 5 = searchee **路径**。合成形状对不上生产 =
+自说自话，已改正并按真实行形写死在 `tests/test_reconcile.py`。
+
+★ **基线比正则松恰好一个词**：六个字面量**没有**钉住 `[webhook]|[inject]` 标签，
+而 `_RE_FOUND` 钉了 ⇒ 基线是正则的**超集**。今天 `a == b == 1011`，但那是**实测**、
+不是**结构保证**；`tests/test_reconcile.py` 里有一格专门拿 `[search] Found …` 钉这个差。
+
+#### 18.19.4 验收
+
+```
+12 个脚本 / 373 条断言 / 0 失败           （+test_reconcile.py，41 条）
+scan-secrets.py            rc=0
+check-deploy-drift.py      rc=0   A: 未知 0   B: 未登记 0
+audit-found-lines.py       a 1011 / b 1011 / 差 0，三道控制全过
+audit-found-resolve.py     〔全量〕b−c = 0；〔生产〕865 / 146 / 1011（与预期一致）
+```
+
+#### 18.19.5 仍未做（按决定推迟）
+
+| # | 动作 | 为什么推迟 |
+|---|---|---|
+| 4 | `check_farm_mirror` 拆「源侧缺 / 农场侧缺」两格，挂进 `check_farm()` | 方向和不对称证据都成立（源侧缺 → 农场照搜 → 白烧额度；农场侧缺 → 白等一轮），但**今天没有这两侧的实例** —— 先等它出现，别拿合成数据当「已验证」。★ 附一条做之前要查的：`dir_paths` 是推导式建的 dict、`farm_dir_paths` 用 `setdefault`，**两个单片同路径时谁赢不一样** |
+| 5 | `.farm-check.state` 存「上次全绿时刻 + 缺失集合」，绑事件名 | 依赖第 4 条存在 |
+| 6 | 把「动态递归遍历 / 媒体类型分类器 / 智能命名正则库」三条**不做**的理由写成一节 | ★ 顺序理由其实**不成立**：那三条的理由全来自**当下代码**（`Season\|S\d` 在整个 `orchestrator/`+`scripts/` 里**零命中**、`matcher.py:138-139` 写明「仅供人看，不作准」、`STAGE_UNMATCHED` 已在），**不依赖 ①②③**。放最后是纯延迟，不是依赖 |
+

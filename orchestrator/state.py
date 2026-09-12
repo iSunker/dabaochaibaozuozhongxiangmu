@@ -1760,6 +1760,281 @@ def _resolve_searchee_to_pack(
 
 
 # --------------------------------------------------------------------------- #
+# 观测对账：a − b / b − c / 全场无人认领 —— ★ **判据只有这一份**
+# --------------------------------------------------------------------------- #
+# 为什么这些判据住在 state.py，而**不**在 scripts/audit-found-*.py 里
+# ---------------------------------------------------------------
+# 生产里要跑它们的是 `drive-loop.py`，而它跑在 **NAS 宿主机**上
+# （`drive-loop-nas.sh`: `PY=/usr/bin/python3`，DSM 自带 3.8.15，**不是容器**）。
+# 而那两个脚本在 `check-deploy-drift.py` 的 **LOCAL_ONLY** 里（注明"在 Windows
+# 上跑"），`deploy.sh` 的 FILES 里根本没有它们 —— 也就是说 **NAS 上没有这两个
+# 文件**；就算手工拷上去，它们写死的 `//iSunker-DS423/...` UNC 路径在 NAS
+# 宿主机上也不存在（那边是 `/volume1/...`）。
+#
+# 本模块被部署**两次**（`orchestrator/state.py` 进构建上下文、`drive-loop/
+# orchestrator/state.py` 进运行时 —— 见 deploy.sh FILES 里两处注释），
+# 是两侧**唯一都能到达**的地方。于是判据放这边，两个脚本降级成薄壳：
+# 手工随时能跑，但核的是**同一份实现**。
+#
+# ★ "抄一份"在这里的代价不是重复劳动，是**把被测对象复制成判据**：正则改了、
+#   副本照旧报绿。见 `audit-found-lines.py` 头部的教训。
+#
+# ★★ 口径：**两个口径的名字必须跟着数一起走**
+#   同一批 Found 行，按"几个包一起试"还是"一次一个包"去归置，得到的
+#   `other_pack` 是两个完全不同的数（实测 0 vs 865/146/1011 —— 三包共用
+#   一个 farm_root，见下）。历史上这里出过一次事：全量口径报出的
+#   `other_pack = 0` 被当成"干净"，而生产口径下根本不是这个数。
+#   这跟 `NanyangPT` 与 `NanyangPT (南洋)` 是同一个形状 —— **一个名字盖了
+#   两种模型**。所以下面每个数都**绑定自己的口径名**，不出现裸的 `other_pack`。
+#
+# 目标消息形状，用**独立字面量**描述（无捕获组、无量词、无锚点）。
+# ★ 每个字面量**单独报数** —— "是哪个词把行数砍下来的"一眼可见。
+# ★ 第一版的教训：拿 `] Found ` 当基线 → 数到 2200，a − b 报了 1189 的**假差**。
+#   因为那个字面量同时吃到 `[webhook] Found 0 torrents for {`（662 行）与
+#   `[webhook] Found N torrent file(s) to inject`（527 行）。
+#   基线**既不能带锚点**（那等于把被测正则抄一遍 = 循环论证），**也不能太松**。
+#
+# ★ 基线与正则会差**恰好一个词**：这六个字面量**没有**钉住 `[webhook]|[inject]`
+#   那个标签，而 `_RE_FOUND` 钉了 —— 所以基线是正则的**超集**。
+#   实测（2026-09-12）a == b == 1011，没有别的标签的 Found 行；但那是**实测**，
+#   不是**结构保证**。`tests/test_reconcile.py` 里有一格专门钉这个差
+#   （拿 `[search] Found …` 造一条），好让"恰好相等"一直有人看着。
+FOUND_LITS = (
+    ("L1 `] Found `",        "] Found "),
+    ("L2 `[8hex...]`",       None),          # None = 用 _HEX8 数
+    ("L3 `] on `",           "] on "),
+    ("L4 ` by `",            " by "),
+    ("L5 ` from dataDir (`", " from dataDir ("),
+    ("L6 ` - `",             " - "),
+)
+L1_LABEL = FOUND_LITS[0][0]
+_HEX8 = re.compile(r"\[[0-9a-f]{8}\.\.\.\]")
+_LOG_LINE = re.compile(r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d+ \w+: (?P<msg>.*)$")
+
+
+@dataclass
+class FoundLineCount:
+    """a − b：a 是**形状**（六个字面量的合取），b 是**生产正则** `_RE_FOUND` 命中数。"""
+    total_lines: int = 0
+    a: int = 0
+    b: int = 0
+    lit_counts: dict = field(default_factory=dict)
+    other_found: dict = field(default_factory=dict)   # 被 L1 吃到、但不是目标形状
+    unparsed: list = field(default_factory=list)      # 目标形状、`_RE_FOUND` 却没吃下
+    group4: dict = field(default_factory=dict)
+    group3_odd: int = 0
+
+    @property
+    def delta(self) -> int:
+        return self.a - self.b
+
+    @property
+    def controls_ok(self) -> bool:
+        """两道正向控制：读到行 + 基线数到了。
+
+        ★ **刻意不含 `b > 0`** —— `b == 0` 是「空转」（一条 Found 都没有），
+          它要报的是一条**告警**，不是"控制没过"。混在一起就分不清
+          「判据坏了」和「真的没发生」（§18.17.3）。
+        """
+        return self.total_lines > 0 and self.lit_counts.get(L1_LABEL, 0) > 0
+
+
+def count_found_lines(text: str) -> FoundLineCount:
+    """日志全文 → a/b 对账。`scripts/audit-found-lines.py` 核的就是这一个函数。"""
+    r = FoundLineCount()
+    for raw in text.splitlines():
+        r.total_lines += 1
+        if FOUND_LITS[0][1] not in raw:
+            continue
+        hit = {k: (v in raw if v else bool(_HEX8.search(raw))) for k, v in FOUND_LITS}
+        for k, ok in hit.items():
+            if ok:
+                r.lit_counts[k] = r.lit_counts.get(k, 0) + 1
+        if all(hit.values()):
+            r.a += 1
+            m = _LOG_LINE.match(raw)
+            msg = m.group("msg") if m else raw
+            mm = _RE_FOUND.search(msg)
+            if mm:
+                r.b += 1
+                r.group4[mm.group(4)] = r.group4.get(mm.group(4), 0) + 1
+                if re.search(r"[ ()(]", mm.group(3)):
+                    r.group3_odd += 1
+            elif len(r.unparsed) < 8:
+                r.unparsed.append(raw)
+        else:
+            head = raw.split("] Found ", 1)[1][:60] if "] Found " in raw else raw[:60]
+            k = re.sub(r"\d+", "N", head.split("{")[0].strip())[:48]
+            r.other_found[k] = r.other_found.get(k, 0) + 1
+    return r
+
+
+@dataclass
+class PackCtx:
+    """一个包的归属判据三件套。★ 与 `sync_pack` 里那四行**同源** ——
+    口径只在这里拼一次，生产与全量两个口径都从它派生。"""
+    roots: list = field(default_factory=list)
+    dirs: set = field(default_factory=set)
+    dpaths: dict = field(default_factory=dict)
+    farm: str = ""
+
+
+def pack_contexts(store) -> dict:
+    """{包名: PackCtx}，一次取齐。
+
+    ★ 为什么不放在 `sync_pack` 里算：它是**一包一调**的，一轮要算三次、
+    发三条通知。观测收尾（`after_batch_reports`）才是"一轮一次"的地方。
+    """
+    out: dict = {}
+    for p in store.packs():
+        pk = p["name"]
+        dpaths = dict(store.dir_paths(pk))
+        dpaths.update(store.farm_dir_paths(pk))     # v3：农场镜像键并进来
+        out[pk] = PackCtx(roots=store.roots(pk),
+                          dirs={r["dir_name"] for r in store.movies(pk)},
+                          dpaths=dpaths, farm=store.farm_root(pk))
+    return out
+
+
+@dataclass
+class FoundResolve:
+    """b − c，**两种口径各一份**。字段名自带口径，不出现裸的 `other_pack`。"""
+    b: int = 0
+    c: int = 0                                  # 真归到某个单片的行数
+    belong_all: dict = field(default_factory=dict)   # 全量口径（所有包一起试、命中即停）
+    belong_prod: dict = field(default_factory=dict)  # 〔生产口径〕逐包：{包名: {归属: 数}}
+    farm_lines: int = 0
+    orig_lines: int = 0
+    samples: dict = field(default_factory=dict)      # 非 in_pack 的样本（带路径）
+    paths: list = field(default_factory=list)
+
+    @property
+    def delta(self) -> int:
+        """全量口径的 b − c。★ 这个数**不能**解释成"生产里没有静默丢行" ——
+        生产口径见 `belong_prod`（同一批行、另一个数）。"""
+        return self.b - self.c
+
+
+def resolve_found_lines(text: str, store) -> FoundResolve:
+    """Found 行的组5（= searchee 路径）走**生产代码本身**能不能归到单片。
+
+    ★ 组5 是**路径**、组1 是 searchee **名**（实测确认）。第一版把整条路径当
+      名字传进去 → `.get()` 永远取到 "" → 静默退化成"只按名字猜"的兜底分支，
+      报出来的数看着合理、全不算数。别重犯。
+
+    ★★ 两种口径都算，这是本函数存在的理由：
+      · **全量口径**（`belong_all`）：所有包一起试、命中即停。它回答的是
+        「这条 searchee 是不是**某个**包的」。`other_pack` 在这个口径下
+        按构造就接近 0 —— 别把它念成"干净"。
+      · **生产口径**（`belong_prod`）：一次只给一个包 —— `drive-loop.py` 的
+        `S.sync_pack(st, pack, crossseed_db=<同一个库>)` 就是这么调的。
+        三包**共用一个 farm_root**，所以对任一包来说，别的包的 searchee
+        天然就是 `other_pack`；实测 dc-collection 865 / frds 146 / mbf 1011。
+        → 在这个口径下 `other_pack` 恒非零、大体恒定，**它没有信息量**。
+          要看"真丢了什么"，判据是 `unclaimed_searchees()`，不是这个数。
+    """
+    ctx = pack_contexts(store) if hasattr(store, "packs") else {}
+    r = FoundResolve()
+    for pk in ctx:
+        r.belong_prod[pk] = {}
+
+    for raw in text.splitlines():
+        if "] Found " not in raw:
+            continue
+        m = _LOG_LINE.match(raw)
+        if not m:
+            continue
+        mm = _RE_FOUND.search(m.group("msg"))
+        if not mm:
+            continue
+        r.b += 1
+        p = _norm_path(mm.group(5))
+        r.paths.append(p)
+        is_farm = any(c.farm and p.startswith(_norm_path(c.farm) + "/")
+                      for c in ctx.values())
+        r.farm_lines += 1 if is_farm else 0
+        r.orig_lines += 0 if is_farm else 1
+
+        # ── 全量口径：所有包一起试，命中即停 ──
+        hit = None
+        for pk, c in ctx.items():
+            got, belong = _resolve_one(p, c)
+            if got:
+                hit = (pk, got, belong)
+                break
+        key = hit[2] if hit else "other_pack"
+        if hit:
+            r.c += 1
+        r.belong_all[key] = r.belong_all.get(key, 0) + 1
+        if key != "in_pack" and len(r.samples.get(key, [])) < 3:
+            r.samples.setdefault(key, []).append(p[:120])
+
+        # ── 生产口径：一次一个包（sync_pack 的调法）──
+        for pk, c in ctx.items():
+            _, belong = _resolve_one(p, c)
+            d = r.belong_prod[pk]
+            d[belong] = d.get(belong, 0) + 1
+    return r
+
+
+def unclaimed_searchees(store, snap) -> list:
+    """★ 全场无人认领：库里每条 searchee，**三个包合起来都认不出**的。
+
+    返回 `[(searchee 名, 规范化路径)]`，按路径排序。
+
+    为什么这是对的判据（而不是给 `sync_pack` 加个 `other_pack` 计数器）
+    ------------------------------------------------------------------
+    三包共用一个 `farm_root`，所以**生产口径下的 `other_pack` 恒非零**
+    （实测 865 / 146 / 1011）—— 加出来就是一个人人会无视的常数。
+    真正想知道的只有一件事：**有没有哪条 searchee，哪个包都不认它**。
+    这个数才恒为 0，且非零时**每一条都指得出名字**。
+
+    ★ 期望值可指回判据之外的真实记录：2026-09-12 实测 1888 条里**恰好 1 条**
+      无人认领 —— `reseed/reseed_farm/0观影清单chrlee整理`（农场里只含一个
+      `.xlsx` 清单文件、三包都不认、`searched`/`decisions` 里都没有它）。
+      报不出这一条，就说明这个判据又自说自话了。
+
+    ★ 它**不是** `other_pack` 的改名：`other_pack` 说的是"这条不归我"，
+      这里是"这条不归任何人"。
+    """
+    ctx = pack_contexts(store)
+    out: list = []
+    for name, path in snap.searchee_paths.items():
+        p = _norm_path(path)
+        for c in ctx.values():
+            got, _belong = _resolve_searchee_to_pack(
+                name, _OneSnap({name: path}), c.roots, c.dirs, c.dpaths, c.farm)
+            if got:
+                break
+        else:
+            out.append((name, p or "(无路径)"))
+    out.sort(key=lambda kv: kv[1])
+    return out
+
+
+def _basename(path: str) -> str:
+    """路径 → 末段。`searchee_paths` 的**键是名**、值是路径（`snap_for()` 的坑）。"""
+    return path.rstrip("/").rsplit("/", 1)[-1]
+
+
+@dataclass
+class _OneSnap:
+    """只含一条 searchee 的快照 —— 形状与 `read_crossseed_db()` 的返回一致。
+
+    ★ 必须是**带属性**的东西，不能是裸 dict：`_resolve_searchee_to_pack` 走的是
+      `snap.searchee_paths.get(name, "")`。
+    """
+    searchee_paths: dict
+
+
+def _resolve_one(path: str, c: PackCtx) -> tuple:
+    """拿**库自己那一套** roots/dirs/dpaths/farm 去归一条路径。"""
+    b = _basename(path)
+    return _resolve_searchee_to_pack(b, _OneSnap({b: path}),
+                                     c.roots, c.dirs, c.dpaths, c.farm)
+
+
+# --------------------------------------------------------------------------- #
 # 索引器标签归一
 # --------------------------------------------------------------------------- #
 _INDEXER_URL_ID = re.compile(r"/(\d+)/api(?:/|$)")

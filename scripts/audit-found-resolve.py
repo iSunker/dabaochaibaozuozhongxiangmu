@@ -1,21 +1,33 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""对账 b − c：Found 行里的 searchee 路径，走**生产代码本身**能不能归到单片。
+"""对账 b − c —— **薄壳**：判据本体在 `orchestrator.state.resolve_found_lines()`。
 
 b = `_RE_FOUND` 命中行数（`audit-found-lines.py` 已对平：a − b = 0）
-c = 其中 `_resolve_searchee_to_pack()` 判成 **in_pack**（即真的归到了单片）的行数
-期望 b − c = 0：抓到的行不光是"抓到了"，还真的**落到了某个单片上**。
+c = 其中组5（searchee **路径**）走生产代码能归到某个单片的行数
 
-★ 与第一版的区别（重要）：第一版自己**重写了一遍** roots/dpaths/farm 的拼装逻辑，
-  那是"用我的模型去核对生产模型"——属于循环论证。
-  这一版走真正的 `StateStore.roots/dir_paths/farm_dir_paths/farm_root` 和真正的
-  `_resolve_searchee_to_pack()`，只把 searchee 路径替换成日志里那一条。
+★★ 口径 —— 本文件存在的**一半**理由（2026-09-12 加）
+------------------------------------------------------
+同一批 Found 行，按"几个包一起试"还是"一次一个包"去归置，`other_pack`
+是**两个完全不同的数**：
 
-★ 这道对账**覆盖不到农场那条防线**：见下面 `farm_lines` 那几行输出。
-  只要日志里还没有 `[inject] Found … from dataDir (/…/reseed/reseed_farm/…)`，
-  农场分支的流量就是 0，`b − c = 0` 说的是**原路径**干净。
-  农场路径目前只出现在 `[inject] Skipping match … due to title mismatch` 里，
-  那种行 `_RE_FOUND` 根本不匹配（也不是 Found 行）。
+  · **全量口径**（所有包一起试、命中即停）：`other_pack` 按构造接近 0。
+    它回答的是「这条 searchee 是不是**某个**包的」。
+  · **生产口径**（一次一个包 —— `drive-loop.py` 的 `S.sync_pack(st, pack,
+    crossseed_db=<同一个库>)` 就是这么调的）：三个包**共用一个 `farm_root`**，
+    所以对任一包来说，别的包的 searchee 天然就是 `other_pack`。
+    实测 **dc-collection 865 / frds 146 / mbf 1011** —— 恒非零、大体恒定。
+
+★ 出过的事：全量口径报出的 `other_pack = 0` 被念成"干净"，而生产口径下根本
+  不是这个数。这跟 `NanyangPT` 与 `NanyangPT (南洋)` 是**同一个形状** ——
+  一个名字盖了两种模型。所以下面每个数都**绑定自己的口径名**，
+  不出现裸的 `other_pack`，也不合并成一个"总对账"。
+★ 两个口径**都报**，这是本脚本的硬要求：只报一个，读数的人就无从知道
+  自己看的是哪一个。
+
+★ 判据**只有一份**：本文件原先自己重写了一遍 roots/dpaths/farm 的拼装逻辑
+  （"用我的模型去核对生产模型" = 循环论证）。现在走
+  `orchestrator.state.pack_contexts()` + 生产自己的 `_resolve_searchee_to_pack()`
+  —— 与 `drive-loop.py` 在 NAS 上跑的是**同一个函数**。
 
 只读：库用 `mode=ro` 拿不到（UNC 不支持 file:// authority），改用
   **裸 UNC 路径 + `PRAGMA query_only = ON`**（就是生产 `_open_csdb()` 那套）。
@@ -28,14 +40,11 @@ c = 其中 `_resolve_searchee_to_pack()` 判成 **in_pack**（即真的归到了
 
 全程只读；不写任何本地文件（连 `state.db` 都不碰，见 `ro_store()`）。
 """
-
 from __future__ import annotations
 
 import pathlib
-import re
 import sqlite3
 import sys
-import types
 
 HERE = pathlib.Path(__file__).resolve().parent
 REPO = HERE.parent
@@ -54,11 +63,8 @@ NAS = pathlib.Path(r"//iSunker-DS423/docker_ssd/prowlarr_cross-seed_autohardlink
 LOG = NAS / "cross-seed/logs/info.current.log"
 DB = NAS / "drive-loop/hlink/state.db"
 
-RE_FOUND = S._RE_FOUND
 B_PREV = 1011          # 2026-09-12 实测的 b（audit-found-lines.py 报出），仅作参照
-
-NEW_FARM = "/volume1/video/download/reseed/reseed_farm/"
-OLD_FARM = "/volume1/video/download/reseed_farm/"
+PROD_PREV = {"dc-collection": 865, "frds-top250-2024": 146, "mbf": 1011}   # 同日实测
 
 
 def open_ro(p: pathlib.Path) -> sqlite3.Connection:
@@ -83,22 +89,6 @@ def ro_store(con: sqlite3.Connection) -> "S.StateStore":
     return st
 
 
-def sname(path: str) -> str:
-    return path.rstrip("/").rsplit("/", 1)[-1]
-
-
-def snap_for(path: str) -> "S.CrossSeedSnapshot":
-    """造一个只含一条 searchee 的快照 —— 和 read_crossseed_db() 的形状一致。
-
-    ★ 坑（第一版就栽在这）：`searchee_paths` 的**键是 searchee 名**，值是路径。
-      得先把**名字**当第一个实参传给 `_resolve_searchee_to_pack`，它才 `.get()` 得到；
-      传成整条路径 → 取到 "" → 静默退化成"只按名字猜"的兜底分支，
-      于是每一行都走错分支，报出来的 440 全是不算数的。
-      当时**是下面那道控制①**把它当场抓出来的（控制①返回 unresolved 而不是 in_pack）。
-    """
-    return types.SimpleNamespace(searchee_paths={sname(path): path})
-
-
 def main() -> int:
     if not LOG.is_file() or not DB.is_file():
         print(f"✗ 缺文件: log={LOG.is_file()} db={DB.is_file()}", file=sys.stderr)
@@ -107,28 +97,16 @@ def main() -> int:
     con = open_ro(DB)
     store = ro_store(con)
 
-    packs = [r["name"] for r in store.packs()]
-    ctx: dict[str, dict] = {}
-    for pk in packs:
-        roots = store.roots(pk)
-        dirs = {r["dir_name"] for r in store.movies(pk)}
-        dpaths = store.dir_paths(pk)
-        farm = store.farm_root(pk)
-        dpaths.update(store.farm_dir_paths(pk))
-        ctx[pk] = dict(roots=roots, dirs=dirs, dpaths=dpaths, farm=farm)
-        print(f"   {pk}: roots={len(roots)} 单片={len(dirs)} dpaths={len(dpaths)}"
-              f" farm={farm or '(未登记)'}")
-
-    # ── 正向控制（先证明"这套解析真的能解析"，否则下面的 0 什么都不是）──
-    print()
+    # ── 正向控制①：先证明"这套解析真的能解析"，否则下面的 0 什么都不是 ──
     ok = True
+    ctx = S.pack_contexts(store)
+    for pk, c in sorted(ctx.items()):
+        print(f"   {pk}: roots={len(c.roots)} 单片={len(c.dirs)} "
+              f"dpaths={len(c.dpaths)} farm={c.farm or '(未登记)'}")
     probe = None
-    for pk, d in ctx.items():
-        for mp, dn in d["dpaths"].items():
-            snap = snap_for(mp)
-            got, belong = S._resolve_searchee_to_pack(sname(mp), snap, d["roots"],
-                                                      d["dirs"], d["dpaths"], d["farm"])
-            probe = (pk, mp, got, belong, dn)
+    for pk, c in sorted(ctx.items()):
+        for mp in c.dpaths:
+            probe = (pk, mp) + S._resolve_one(mp, c)
             break
         if probe:
             break
@@ -137,89 +115,52 @@ def main() -> int:
         ok = False
     elif probe[2] is None:
         print(f"✗ 控制①失败：拿库**自己**的路径 {probe[1][:90]!r} 去解析，"
-              f"居然归不到单片（belong={probe[3]}）—— 解析链是坏的，"
-              f"下面报的 other_pack 全是假象")
+              f"居然归不到单片（belong={probe[3]}）—— 解析链是坏的")
         ok = False
     else:
         print(f"✓ 控制①：库自带路径可归片  {probe[1][:60]}… → {probe[2]!r}"
               f"（belong={probe[3]}）")
 
-    # ── 逐行对账 ──
-    b = 0
-    belong_n: dict[str, int] = {}
-    hit_dirs: dict[str, int] = {}
-    farm_lines = 0
-    orig_lines = 0
-    samples: dict[str, list[str]] = {}
-    t_first = t_last = ""
-    pre_kind: dict[str, int] = {}
+    text = LOG.read_text(encoding="utf-8", errors="replace")
+    r = S.resolve_found_lines(text, store)     # ★ 判据本体，与 drive-loop 同一份
 
-    f = re.compile(r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d+ \w+: (?P<msg>.*)$")
-    with LOG.open("r", encoding="utf-8", errors="replace") as fh:
-        for raw in fh:
-            if "] Found " not in raw:
-                continue
-            m = f.match(raw.rstrip("\r\n"))
-            if not m:
-                continue
-            mm = RE_FOUND.search(m.group("msg"))
-            if not mm:
-                continue
-            b += 1
-            ts = raw[:19]
-            t_first = t_first or ts
-            t_last = ts
-            p = S._norm_path(mm.group(5))
-            kind = ("新农场根" if p.startswith(NEW_FARM) else
-                    "旧农场根" if p.startswith(OLD_FARM) else "原目录")
-            pre_kind[kind] = pre_kind.get(kind, 0) + 1
-            is_farm = any(d["farm"] and p.startswith(S._norm_path(d["farm"]) + "/")
-                          for d in ctx.values())
-            farm_lines += 1 if is_farm else 0
-            orig_lines += 0 if is_farm else 1
-
-            best = None
-            for pk, d in ctx.items():
-                got, belong = S._resolve_searchee_to_pack(sname(p), snap_for(p), d["roots"],
-                                                          d["dirs"], d["dpaths"], d["farm"])
-                if got:
-                    best = (pk, got, belong)
-                    break
-                if belong == "in_pack":
-                    best = (pk, None, belong)
-            if best is None:
-                belong = "other_pack"
-            else:
-                _, got, belong = best
-                if got:
-                    hit_dirs[got] = hit_dirs.get(got, 0) + 1
-            belong_n[belong] = belong_n.get(belong, 0) + 1
-            if len(samples.get(belong, [])) < 3:
-                samples.setdefault(belong, []).append(p[:120])
-
-    c = belong_n.get("in_pack", 0)
     print()
-    print(f"  b  Found 行                 : {b}   （参照 {B_PREV}，"
-          f"差 {b - B_PREV} —— 日志是滚动的，差不为 0 正常）")
-    print(f"     时间跨度                 : {t_first}  →  {t_last}")
-    print(f"     组5 路径前缀分布         : {pre_kind}")
-    print(f"     组5 落在农场根下         : {farm_lines}"
-          f"   ← ★ 这一格恒为 0 时，下面那个 0 覆盖不到农场防线")
-    print(f"     组5 是原路径             : {orig_lines}")
-    print(f"  c  in_pack（真归到单片）    : {c}")
-    print(f"     归到单片的不同片子数     : {len(hit_dirs)}   最多: "
-          f"{sorted(hit_dirs.items(), key=lambda kv: -kv[1])[:5]}")
+    print("━" * 68)
+    print("  ★ 口径：下面【全量】表 = 所有包一起试、命中即停。")
+    print("     它与生产口径（sync_pack **一次一个包**）**不可比** —— 同一批行，")
+    print("     两边的 other_pack 完全不是一个数。两张表都列在下面，别混着念。")
+    print("━" * 68)
     print()
-    print(f"  ★ b − c                     : {b - c}   （= other_pack + unresolved）")
+    print("【全量口径】所有包一起试、命中即停")
+    print(f"   b  Found 行                 : {r.b}   （参照 {B_PREV}，"
+          f"差 {r.b - B_PREV} —— 日志是滚动的，差不为 0 正常）")
+    print(f"      组5 落在农场根下         : {r.farm_lines}"
+          f"   ← ★ 这一格恒为 0 时，下面那个 b−c 覆盖不到农场防线")
+    print(f"      组5 是原路径             : {r.orig_lines}")
+    print(f"   c  in_pack（真归到单片）    : {r.c}")
+    print(f"   ★ 全量 b − c                : {r.delta}   （在这个口径下 = other_pack + unresolved）")
     for k in ("other_pack", "unresolved", "in_pack"):
-        print(f"       {k:<12} {belong_n.get(k, 0)}")
-    for k, v in samples.items():
+        print(f"      [全量] {k:<12} {r.belong_all.get(k, 0)}")
+    for k, v in r.samples.items():
         if k != "in_pack":
-            print(f"       ── {k} 样本 ──")
+            print(f"      ── [全量] {k} 样本 ──")
             for s in v:
-                print(f"          {s}")
+                print(f"         {s}")
 
-    if ok and c == 0:
+    print()
+    print("【生产口径】一次一个包（= drive-loop 里 sync_pack 的调法）")
+    print("   ★ 三包共用一个 farm_root，所以对任一包来说，**别的包的 searchee")
+    print("     必然落到 other_pack** —— 这个数恒非零、大体恒定，本身没有信息量。")
+    print("     要看「真丢了什么」，判据是 unclaimed（全场无人认领），不是这一格。")
+    for pk in sorted(r.belong_prod):
+        d = r.belong_prod[pk]
+        prev = PROD_PREV.get(pk)
+        note = f"   （同日实测 {prev}）" if prev is not None else ""
+        print(f"      {pk:<24} [生产] in_pack={d.get('in_pack', 0):>4}"
+              f"  other_pack={d.get('other_pack', 0):>4}"
+              f"  unresolved={d.get('unresolved', 0):>4}{note}")
+
+    if ok and r.c == 0:
         print()
         print("★ 控制②失败：c=0，但控制①证明解析链是通的 —— "
               "0 说明的是**日志里的路径一条都不是本库的路径**，不是干净")

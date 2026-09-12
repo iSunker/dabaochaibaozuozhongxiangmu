@@ -715,8 +715,167 @@ def iyuu_watch(args) -> tuple[str, dict]:
     return f"IYUU 辅种条数：**{n}** —— {iyuu_verdict(n)}", {"iyuu": n}
 
 
+# --------------------------------------------------------------------------- #
+# 观测对账：a − b / b − c / 全场无人认领
+# --------------------------------------------------------------------------- #
+# ★ 判据本体**不在这个文件里**，在 `orchestrator/state.py`
+#   （`count_found_lines` / `resolve_found_lines` / `unclaimed_searchees`）。
+#   理由只有一条、但是硬的：**本进程跑在 NAS 宿主机上**
+#   （drive-loop-nas.sh: /usr/bin/python3），而 `scripts/audit-found-*.py` 是
+#   `check-deploy-drift.py` 里的 LOCAL_ONLY（"在 Windows 上跑"）——
+#   那两个文件**根本不在 NAS 上**，就算拷上来，它们写死的 `//iSunker-DS423/...`
+#   在 NAS 宿主机上也不存在。`orchestrator/state.py` 被部署两次
+#   （构建上下文 + drive-loop/orchestrator/），是两侧**唯一都能到达**的地方。
+#   两个脚本现在是薄壳，核的是同一份实现 —— 判据只有一份。
+#
+# ★ 为什么挂在**日报**里而不是每批：日报是这套系统里唯一"每天恰好一次"的
+#   观测出口，而且 notify 只把 `metrics` 落进 TSV 流水（不记正文）——
+#   放进 `report_daily` 的 metrics，这些数才真的**留得下来**。
+#   同 `iyuu_watch`。
+_REDACT_SUB = (
+    (re.compile(r"(apikey=)[^,&\s)\]]+", re.I), r"\1<redacted>"),
+    (re.compile(r"(passkey=)[^,&\s)\]]+", re.I), r"\1<redacted>"),
+)
+
+
+def _redact(s: str) -> str:
+    for rx, rep in _REDACT_SUB:
+        s = rx.sub(rep, s)
+    return s
+
+
+def reconcile_watch(args) -> tuple[str, dict]:
+    """三条对账的读数 → (给日报正文的一段, 给 metrics 的字典)。
+
+    三条各自的对账基准（都指回判据之外的**真实记录**）：
+      · a − b：`].  Found ` 那个字面量会吃到别的消息（实测 2231 vs 靶心 1011），
+        所以判据是**六个字面量的合取**；a == b == 1011。
+      · b − c：三包**共用一个 farm_root** → **生产口径**下 other_pack 恒非零
+        （实测 865 / 146 / 1011）。所以这里报的是**全量口径**的 b − c，
+        并且 metrics 名带 `all` —— 不许念成"生产里没有静默丢行"。
+      · 无人认领：实测 1888 条里恰好 1 条（`0观影清单chrlee整理`，只含一个 xlsx）。
+        这个数才恒为 0，且非零时**每条都指得出名字**。
+
+    ★ **绝不抛**：它挂在每天一次的日报里，而日报挂在**每 15 分钟一批**的生产
+      循环里。一次 SMB/库抖动不该让整份日报消失（同 `iyuu_watch` 的规矩）。
+    ★ 读不到时 metrics 给 `n/a` —— **必须给**，否则 TSV 里"这次读失败了"和
+      "那天根本没跑"长得一模一样，事后分不开。
+    """
+    m: dict = {"fa": "n/a", "fb": "n/a", "fd": "n/a",
+               "fb_c_all": "n/a", "fb_c_farm": "n/a", "unclaimed": "n/a"}
+    lines: list[str] = []
+
+    log_path = (getattr(args, "log", None) or [None])[0]
+    text = None
+    if log_path:
+        try:
+            text = Path(log_path).read_text(encoding="utf-8", errors="replace")
+        except OSError as e:
+            LOG.debug("读 cross-seed 日志失败", exc_info=True)
+            lines.append(f"观测对账：读不到日志（{type(e).__name__}）—— "
+                         f"a−b **没跑成**，别念成 0")
+    else:
+        lines.append("观测对账：跳过（没有 --log）")
+
+    if text is not None:
+        c = S.count_found_lines(text)
+        m.update(fa=c.a, fb=c.b, fd=c.delta)
+        lines.append(
+            f"观测对账 a−b：形状 {c.a} / 正则 {c.b} / 差 {c.delta}"
+            f"（期望差 0；合取比 L1 单字面量收窄了 "
+            f"{c.lit_counts.get(S.L1_LABEL, 0) - c.a} 行）")
+        if not c.controls_ok:
+            # 控制没过 = 判据没走到，下面的 0 什么都不说明。
+            emit("alert", "观测对账：判据没走通",
+                 body=("日志读了，但基线一个字面量都没数到 —— 说明**匹配逻辑坏了**，"
+                       "不是「没有 Found 行」。\n"
+                       f"日志: {log_path}\n总行数: {c.total_lines}\n"),
+                 key="reconcile-controls", metrics={"fa": c.a, "fb": c.b})
+        elif c.b == 0:
+            # ★ 零命中既可能是没事，也可能是没跑（§18.17.3）。
+            emit("alert", "观测对账：一条 Found 都没抓到",
+                 body=("b == 0。**这不是「干净」** —— 要么真没搜出去过，要么日志抓错了。\n"
+                       "回灌靠这些行推「哪个站搜到了」，b 长期为 0 时状态机的「匹配到单种」\n"
+                       "会一直是 0。\n"
+                       f"日志: {log_path}\n总行数: {c.total_lines}\n"),
+                 key="reconcile-empty", metrics={"fa": c.a, "fb": c.b})
+        elif c.delta:
+            head = "\n".join("   " + _redact(s)[:190] for s in c.unparsed) or "   （没留样本）"
+            emit("alert", f"观测对账：{c.delta} 行「形状对、正则没吃下」",
+                 body=("有行满足目标形状的六个字面量，但**生产正则 `_RE_FOUND` 没吃下**。\n"
+                       "这些行在台账里等于**没发生过** —— 抓不到 = 不存在。\n"
+                       f"日志: {log_path}\n"
+                       "★ 常见成因：站名/片名里出现了正则不该吃的字符（09-12 修过一次）。\n"
+                       "---- 没吃下的行 ----\n" + head + "\n"),
+                 key="log-parse-miss", metrics={"fa": c.a, "fb": c.b, "fd": c.delta})
+
+    # b − c 与无人认领都要真库；库不可达时**分开报**，别让一条坏了带走另一条。
+    store = snap = None
+    try:
+        if getattr(args, "db", None):
+            store = S.StateStore(args.db)
+        if getattr(args, "db_path", None):
+            snap = S.read_crossseed_db(args.db_path)
+    except Exception as e:                  # noqa: BLE001
+        LOG.debug("开库失败", exc_info=True)
+        lines.append(f"观测对账：库读不到（{type(e).__name__}）—— b−c 与无人认领没跑成")
+
+    try:
+        if text is not None and store is not None:
+            rv = S.resolve_found_lines(text, store)
+            m.update(fb_c_all=rv.delta, fb_c_farm=rv.farm_lines)
+            prod = "  ".join(
+                f"{pk}: other_pack={d.get('other_pack', 0)}"
+                for pk, d in sorted(rv.belong_prod.items()))
+            lines.append(
+                f"观测对账 b−c〔全量口径〕：{rv.b} − {rv.c} = {rv.delta}"
+                f"（农场行 {rv.farm_lines}）\n"
+                f"   ★ 同一批行的〔生产口径〕是另一个数：{prod or '(无包)'}\n"
+                f"     —— 三包共用一个农场根，对任一包来说别的包的 searchee 天然就是"
+                f" other_pack。\n"
+                f"     这个数恒非零、大体恒定，**没有信息量**；要看真丢了什么，看下一行。")
+    except Exception as e:                  # noqa: BLE001
+        LOG.debug("b−c 对账失败", exc_info=True)
+        lines.append(f"观测对账 b−c：算不出（{type(e).__name__}: {e}）")
+
+    try:
+        if store is not None and snap is not None:
+            un = S.unclaimed_searchees(store, snap)
+            m.update(unclaimed=len(un))
+            if un:
+                listing = "\n".join(f"   {p}" for _, p in un[:10])
+                more = f"\n   …还有 {len(un) - 10} 条" if len(un) > 10 else ""
+                lines.append(f"观测对账〔全场无人认领〕：**{len(un)}** 条\n{listing}{more}\n"
+                             f"   ★ 三包合起来都不认它 —— 别的包的 searchee 会落进"
+                             f"〔生产口径〕的 other_pack，\n"
+                             f"     只有这个数才指得出**谁都不归**的那些。")
+                emit("alert", f"农场里有 {len(un)} 条 searchee 谁都不归",
+                     body=("cross-seed 库里的 searchee，**三个包合起来都认不出**。\n"
+                           "它们不在任何包的 `dir_paths` 里，所以状态机看不见它们 ——\n"
+                           "既是「白搜」（cross-seed 照搜，额度照烧），\n"
+                           "也不会有任何片子因为它们的匹配而前进。\n"
+                           "★ 常见形状：农场里混进了非媒体文件/目录"
+                           "（实测那条是一个 `.xlsx` 清单）。\n\n"
+                           f"共 {len(un)} 条：\n{listing}{more}\n"),
+                     key="unclaimed-searchee", metrics={"unclaimed": len(un)})
+            else:
+                lines.append("观测对账〔全场无人认领〕：**0** 条"
+                             "（三包合起来认得出库里每一条 searchee）")
+    except Exception as e:                  # noqa: BLE001
+        LOG.debug("无人认领对账失败", exc_info=True)
+        lines.append(f"观测对账〔无人认领〕：算不出（{type(e).__name__}: {e}）")
+
+    try:
+        if store is not None:
+            store.con.close()
+    except Exception:                       # noqa: BLE001
+        pass
+    return "\n".join(lines), m
+
+
 def report_daily(args, *, force: bool = False, farm_note: str = "") -> bool:
-    """每天最多投一次的台账：额度（来源 A+C）+ 新增做种趋势 + IYUU 辅种条数。
+    """每天最多投一次的台账：额度（来源 A+C）+ 新增做种趋势 + IYUU 辅种条数
+    + 观测对账（a−b / b−c〔全量口径〕/ 全场无人认领）。
 
     ★ 为什么必须自己记「今天发过没有」：notify 的**冷却只对 alert 生效**
       （`batch`/`info` 走 `.get(kind, "info")` → level=info，`_cooled` 根本不查）。
@@ -760,11 +919,19 @@ def report_daily(args, *, force: bool = False, farm_note: str = "") -> bool:
     iyuu_note, iyuu_metrics = iyuu_watch(args)
     parts.append(iyuu_note)
 
+    # 观测对账（a−b / b−c〔全量口径〕/ 全场无人认领）。
+    # ★ 放在**日报里**而不是每批：日报是这套系统里唯一"每天恰好一次"的观测出口，
+    #   而 notify 只把 `metrics` 落进 TSV 流水（不记正文）—— 进日报的 metrics，
+    #   这些数才真的留得下来。同 iyuu_watch。
+    rec_note, rec_metrics = reconcile_watch(args)
+    if rec_note:
+        parts.append(rec_note)
+
     body = "\n\n".join(parts)
     # ★ 数字要进 `metrics` 才落得进 TSV 流水（notify 只记 ts/kind/title/metrics，
     #   **不记正文**）—— 详见 iyuu_watch 的说明。
     if emit("batch", "每日台账", body=body, key="daily",
-            metrics={"day": today, **iyuu_metrics}):
+            metrics={"day": today, **iyuu_metrics, **rec_metrics}):
         _daily_set(today)
         LOG.info("已投递每日台账（额度 + 趋势）")
         return True
