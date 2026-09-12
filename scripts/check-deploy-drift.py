@@ -100,6 +100,7 @@ LOCAL_ONLY = [
     (r"^\.env\.example$",                         "模板；生产用真实 .env，白名单**故意**不含它"),
     (r"^README\.md$",                             "文档"),
     (r"^SUMMARY\.md$",                            "文档"),
+    (r"^走过的弯路\.md$",                         "文档"),
     (r"^patches/",                                "在 NAS 上**手工**应用的操作说明"),
     (r"^tests/",                                  "离线自测（在 Windows 上跑，不进容器）"),
     (r"^deploy\.sh$",                             "同步工具本身（在 Windows 上跑）"),
