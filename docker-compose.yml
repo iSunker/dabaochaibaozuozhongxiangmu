@@ -14,7 +14,34 @@
 #   docker compose build reseed-orchestrator          # Phase 3
 #   docker compose run --rm reseed-orchestrator preflight
 #   docker compose run --rm reseed-orchestrator run --job frds-top250-2024 --dry-run
+#
+# ★ 关于 logging（2026-09-12 加）
+# ---------------------------------
+# 四个服务原先**都没有 logging 段** —— 走 Docker 默认的 json-file 驱动，
+# 而它**默认没有任何上限**（除非全局 daemon.json 另配过）。也就是说这些容器会
+# 一直往 /volume2/@docker/containers/*/*-json.log 里写、永不清理。
+#
+# 为什么这条要单独拿出来说：本项目其余日志其实**都已经在自我轮转**——
+#   ① drive-loop.log        RotatingFileHandler(5MB × 5)        ≈ 30 MB 上限
+#   ② cross-seed/logs/*     按天轮转 + 保留 14 天                ≈ 0.9 GB 稳态
+#   ③ notify/log/*.tsv      不清，但一天 137 字节                ≈ 50 KB/年
+# 所以**容器日志才是唯一没上限的那个**（NAS 的 /volume1 只剩约 20 GB）。
+# 照"给日志加轮转"的直觉去动 ①②，等于做一个**已经存在的东西**。
+#
+# 10m × 3 = 每个容器上限 30 MB，四个合计 ~120 MB（相对现在的"无上限"是质变）。
+# ⚠ 改这里**必须 `--force-recreate` 才生效** —— `restart` 不重新读 compose 配置。
+#   sudo docker compose up -d --force-recreate
+# 验证：sudo docker inspect --format '{{.HostConfig.LogConfig}}' reseed-cross-seed
 # =====================================================================
+
+# 四个服务共用同一份日志上限。★ 用 YAML 锚点（而不是抄四遍）是为了**不会漂移**：
+# 以后要调就只改这一处。`x-` 开头的顶层键是 compose 规范允许的扩展字段，会被忽略。
+x-logging: &logging-limits
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 
 services:
   prowlarr:
@@ -31,6 +58,7 @@ services:
     ports:
       - "9696:9696"
     networks: [reseed-net]
+    logging: *logging-limits
     restart: unless-stopped
 
   # 可选：中文站过 Cloudflare 用；不需要就删掉本段（并去掉 Prowlarr 里的代理设置）
@@ -43,6 +71,7 @@ services:
     ports:
       - "8191:8191"
     networks: [reseed-net]
+    logging: *logging-limits
     restart: unless-stopped
 
   cross-seed:
@@ -76,6 +105,7 @@ services:
       - "2468:2468"
     depends_on: [prowlarr]
     networks: [reseed-net, qbit-net]
+    logging: *logging-limits
     restart: unless-stopped
 
   # 一次性 CLI：默认只做只读预检；实际匹配请用 `docker compose run ... run`
@@ -91,14 +121,23 @@ services:
       - TZ=${TZ}
       - NAS_IP=${NAS_IP}
       - RESEED_CONFIG=/config/config.yml
+      # `state` 子命令只读的那个 sidecar 状态库（真实位置不在 /config 下，见下）
+      - RESEED_STATE_DB=/state/state.db
     volumes:
       # 编排器(autohardlink)的配置目录 = ./hlink；把 config.yml 放进 hlink/ 即可。
       # 注意：这里只放"配置/日志"等元数据，真正的硬链接数据在 LINK_DIR(/volume1/video 下)。
       - ./hlink:/config
+      # ★ 2026-09-12 下午加：状态库**不在** /config 里 —— ./hlink 是编排器自己的配置目录
+      #   （只有 config.yml），而 drive-loop 真正在写的那份在 <compose>/drive-loop/hlink/。
+      #   ★ 挂成 **ro**：`state` 只读；而 StateStore 打开库时会跑一遍 schema 迁移
+      #   （`ALTER TABLE ...`），rw 挂载等于让一个"只读"子命令**有写坏生产库的能力**。
+      #   ro 把这条可能性直接掐掉，顺带也是给 `state` 的语义做背书。
+      - ./drive-loop/hlink:/state:ro
       # 预检要 stat 源目录/校验同卷；prestage 要建链接 → 同样 1:1 挂载媒体卷
       - /volume1/video:/volume1/video
     depends_on: [cross-seed]
     networks: [reseed-net, qbit-net]
+    logging: *logging-limits
     restart: "no"
 
 networks:

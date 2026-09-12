@@ -56,6 +56,16 @@ FILES=(
   "orchestrator/matcher.py::orchestrator/matcher.py"
   "orchestrator/qbit_client.py::orchestrator/qbit_client.py"
   "orchestrator/safety.py::orchestrator/safety.py"
+  # ★ 2026-09-12 下午补：state.py **必须也进构建上下文**（<compose>/orchestrator/）。
+  #   原先白名单只把它同步到 drive-loop/orchestrator/（第 76 行），漏了上面这个 ——
+  #   而 Dockerfile 是 `COPY orchestrator/ /app/orchestrator/`（拷整个目录），
+  #   于是容器里**没有** orchestrator/state.py。
+  #   平时看不出来（main.py 以前不导入它），但 `state` 子命令一加就是
+  #   **模块级 ImportError** —— 连默认的 `preflight` 都会一起打挂。
+  #   ★ 教训：**"这个文件在哪几个地方需要"要按"谁拷它"分别数**，
+  #     同一份代码在 <compose>/ 下有两个不同用途的副本（构建上下文 / drive-loop 运行时），
+  #     漏一个不会报错，只会在某条路径上炸。
+  "orchestrator/state.py::orchestrator/state.py"
   # 驱动层：2026-09-11 起 drive-loop 跑在 **NAS 上**（DSM 计划任务每 15 分钟），
   # 不再从 Windows 经 SMB 执行。Windows 侧有两个独立的坑（详见 SUMMARY §14）：
   #   ① <StopOnIdleEnd>true —— 一动键鼠就 TerminateProcess 整个批次；
@@ -80,6 +90,14 @@ FILES=(
   #   和白名单原则第 2 条一样，**动不到**，需要时在 NAS 上从模板拷一份。
   "scripts/notify-spool.sh::notify/notify-spool.sh"
   "scripts/notify.conf.example::notify/notify.conf.example"
+  # 农场清单维护脚本。★ 2026-09-12 才进的这份白名单 —— 在那之前它是**手工拷上去的**
+  #   （仓库里在 scripts/，生产在 compose 根目录，两边靠人记得同步）。
+  #   代价实测过：09-11 那次改完 --verify 的期望集，生产副本是另外手工放的，
+  #   中间有一段时间两边内容不一致，而且手工放的没有备份。
+  #   进白名单后：改完 deploy.sh --apply 就同步，且自动进 .deploy-backup/ 可回滚。
+  #   路径映射注意：仓库 scripts/build-farm.sh → 生产 **compose 根目录**（不是 scripts/），
+  #   因为它要跟 .env 同目录才找得到配置。
+  "scripts/build-farm.sh::build-farm.sh"
 )
 
 MODE="${1:---dry-run}"

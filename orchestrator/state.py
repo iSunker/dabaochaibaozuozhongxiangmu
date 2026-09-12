@@ -260,8 +260,15 @@ _RE_SKIP = re.compile(
 _RE_SKIP_INFO = re.compile(
     r"\[webhook\] \(\d+/\d+\) Skipped searching on indexers for (\S+) \(filtered by temporarily disabled indexers\)"
 )
+#: ★ 站名必须用 `(.+?)` 而不是 `(\S+)`：Prowlarr 里的站点显示名**可以带空格和括号**
+#:   —— 本项目的 `NanyangPT (南洋)` 就是。用 `(\S+)` 时它只吃到 `NanyangPT`，
+#:   紧接着的 ` by ` 对不上 ` (南洋) by `，**整行静默不匹配**。
+#:   实测（2026-09-12）：09-11 的 91 条、09-12 的 278 条南洋 Found 行 100% 被丢弃，
+#:   HDFans 一条不漏 —— 于是台账里 `matched_indexers` 永远只有 HDFans，
+#:   看起来就像"只有红豆饭拆包成功"。后面 ` by (\w+) from dataDir \(` 是硬锚点，
+#:   非贪婪的 `(.+?)` 不会越界吃到下一个 ` by `。
 _RE_FOUND = re.compile(
-    r"\[(?:webhook|inject)\] Found (.+?) \[([0-9a-f]{8})\.\.\.\] on (\S+) by (\w+) from dataDir \((.+?)\) - (.*)$"
+    r"\[(?:webhook|inject)\] Found (.+?) \[([0-9a-f]{8})\.\.\.\] on (.+?) by (\w+) from dataDir \((.+?)\) - (.*)$"
 )
 _RE_SNOOZE = re.compile(r"\[torznab\] Snoozing indexers \[(.*?)\] with (\w+) until ([\d\-: ]+)")
 _RE_RECEIVED = re.compile(r"\[webhook\] Received search request")
@@ -438,6 +445,29 @@ def dir_name_of(path: str, root: str | list[str],
             return None
         if p.startswith(r + "/"):
             return p[len(r) + 1:].split("/")[0] or None
+    return None
+
+
+def _farm_mirror(path: str, roots: list[str], farm_root: str) -> str | None:
+    """把"已登记的原路径"换算成它在硬链接农场里的镜像路径。
+
+    v3 之后 cross-seed 扫的是农场（`DATA_DIRS=/…/reseed_farm`，一个扁平目录，
+    每个子项是原 dataDir 直接子项的硬链接），报上来的 searchee 路径因此长这样：
+        `/volume1/video/download/reseed_farm/<一级>/…`
+    而 pack 的 `roots` 还停在原目录。两套路径靠这条规则对齐：
+        `<某个root>/<一级>/<其余>`  →  `<farm_root>/<一级>/<其余>`
+    —— 原 dataDir 本身则映射到农场根。归不到任何 root 返回 None。
+    """
+    if not farm_root:
+        return None
+    p, f = _norm_path(path), _norm_path(farm_root)
+    if not p or not f:
+        return None
+    for r in sorted((_norm_path(x) for x in roots if x), key=len, reverse=True):
+        if p == r:
+            return f
+        if p.startswith(r + "/"):
+            return f + "/" + p[len(r) + 1:]
     return None
 
 
@@ -630,24 +660,48 @@ class IndexerBackoff:
     name: str
     status: str            # OK / RATE_LIMITED / ...
     until: datetime | None  # 解禁时间（None = 没在退避）
+    #: ★cross-seed 库里那一列的**原始值**（实测是毫秒 epoch，见 read_indexer_backoff）。
+    #: 留着它是因为「解禁时间过没过」不足以判断有没有被限流过 —— 见
+    #: DriveSession.wait_out_backoff() 里关于短退避的那段。
+    retry_after: float | None = None
+    #: ★cross-seed 侧这个索引器是否启用（`indexer.active` 列）。
+    #: 不启用 = cross-seed 自己都不会搜它，它的退避状态跟我们无关。
+    enabled: bool = True
 
     @property
-    def active(self) -> bool:
-        if self.status in ("", "-", "OK", "NONE"):
+    def snoozed(self) -> bool:
+        """状态是不是「被限流/退避」这一类（不看解禁时间过没过）。"""
+        return self.status not in ("", "-", "OK", "NONE")
+
+    def active(self, now: datetime | None = None) -> bool:
+        """此刻是不是真的挡着路。
+
+        `now` 可注入：调用方（DriveSession）有自己的时钟，测试也用假时钟 ——
+        不注入的话这里会偷偷读真实墙钟，假时钟下"退避永远不过期"，
+        这段逻辑就没法离线验证（2026-09-12 加 `check_secs` 时踩过）。
+        """
+        if not self.enabled:          # 禁用的索引器不挡路
             return False
-        return self.until is None or self.until > datetime.now()
+        if not self.snoozed:
+            return False
+        return self.until is None or self.until > (now or datetime.now())
 
 
 def read_indexer_backoff(db_path: str | Path) -> list[IndexerBackoff]:
-    """轻量读 `indexer` 表，只看退避状态（给 drive 循环用，几十毫秒）。"""
+    """轻量读 `indexer` 表，只看退避状态（给 drive 循环用，几十毫秒）。
+
+    `retry_after` 是**毫秒** epoch（实测 1789172234780 →
+    `2026-09-12 08:17:14`，正好对上日志里那句 `snoozing until ...`），
+    所以这里除以 1000。
+    """
     db_path = Path(db_path)
     if not db_path.is_file():
         raise FileNotFoundError(f"找不到 cross-seed.db: {db_path}")
     con, _tmp = _open_csdb(db_path)
     try:
         out = []
-        for iid, name, url, status, retry_after in con.execute(
-            "SELECT id, name, url, status, retry_after FROM indexer"
+        for iid, name, url, status, retry_after, enabled in con.execute(
+            "SELECT id, name, url, status, retry_after, active FROM indexer"
         ):
             until = None
             if retry_after:
@@ -656,15 +710,400 @@ def read_indexer_backoff(db_path: str | Path) -> list[IndexerBackoff]:
                 except (OverflowError, OSError, ValueError):
                     until = None
             out.append(IndexerBackoff(name or _fallback_indexer_label(iid, url),
-                                      status or "-", until))
+                                      status or "-", until,
+                                      retry_after=retry_after or None,
+                                      enabled=bool(enabled)))
         return out
     finally:
         con.close()
 
 
-def blocking_backoffs(backoffs: list[IndexerBackoff]) -> list[IndexerBackoff]:
+def snoozed_indexers(backoffs: list[IndexerBackoff]) -> list[IndexerBackoff]:
+    """处于退避状态、且**启用中**的索引器 —— 不管解禁时间过没过。
+
+    跟 `blocking_backoffs()` 的区别：那个只回答「现在挡不挡路」，
+    这个回答「最近被限流过没有」。短退避（实测 HDFans 只有 55 秒）在两次
+    检查之间就过期了，只看后者会**永远看不见它**。
+    """
+    return [b for b in backoffs if b.enabled and b.snoozed]
+
+
+def blocking_backoffs(backoffs: list[IndexerBackoff],
+                      now: datetime | None = None) -> list[IndexerBackoff]:
     """当前真正挡住搜索的退避（状态非 OK 且解禁时间还没到）。"""
-    return [b for b in backoffs if b.active]
+    return [b for b in backoffs if b.active(now)]
+
+
+# --------------------------------------------------------------------------- #
+# 额度感知（SUMMARY §16.1）—— 把「该看的数字」按时算出来
+#
+# ★ 先说清楚它**不是**什么：它**拿不到「站点账号还剩多少额度」**。
+#   Prowlarr 的 Query Limit 是我们自己配的**本地计数器**（到顶就临时禁用索引器），
+#   站点网页上那句「今天还剩 N 次」，Prowlarr 从来就不知道（§16.1.1 的 ③）。
+#   所以本节的定位是「把『每天登站看两次』降到『出异常才登站』」，**不是取代人工**。
+#   把它当余额表来做，一定做成一个自己骗自己的假指标。
+#
+# 三个来源各自独立，**对不上就是信号**（§16.1.2）：
+#   A 我们自己数   cross-seed.db 的 `timestamp` 表（零额外请求、零新增存储）
+#   B 问 Prowlarr  /api/v1/indexerstats（需 API key；★见该函数的"未验证"说明）
+#   C 保险丝状态   cross-seed 的 `indexer` 表 —— 退避状态与解禁时间
+#
+# ★ 为什么不用"另开一张计数表"：§16.1.3 要求「计数必须落盘」（`--once` 每轮都是
+#   新进程，内存计数器每轮归零）。来源 A **本身就是落盘的** —— `timestamp` 表是
+#   cross-seed 的**持久**表，不是我们维护的计数器。所以那条要求**自然满足**，
+#   一行新存储都不用加。这是选 A 当主来源的一个附带好处。
+# --------------------------------------------------------------------------- #
+
+@dataclass
+class QuotaLine:
+    """一个索引器在**滚动 24 小时**窗口里的用量与当前状态。"""
+    indexer: str
+    #: 来源 A：最近 `hours` 小时内有搜索记录的**部数**。★口径见 quota_snapshot。
+    searches_24h: int
+    last_search: datetime | None = None
+    #: 来源 C：cross-seed 记的退避状态（OK / RATE_LIMITED / …）
+    status: str = "-"
+    until: datetime | None = None
+    enabled: bool = True
+    #: 来源 B：Prowlarr 自报的近 24h 查询数。None = 没配 / 没拿到（**不是 0**）
+    prowlarr_queries: int | None = None
+    #: 来源 B 不可用时的原因（人话），供渲染时说明"为什么这一列是空的"
+    #: ★ **只表示"整体拿不到"**（没配 key / 连不上 / 结构不认识）——
+    #: 那时所有行都会被写上同一个理由。**单行**名字对不上用 `prowlarr_mismatch`。
+    prowlarr_note: str = ""
+    #: ★ 单行级别：这个站在 Prowlarr 里**找不到同名条目**。
+    #: 与 `prowlarr_note` 分开是必须的 —— 混在一起会导致
+    #: "某一行名字对不上" 被渲染成 "来源 B 互校不可用"，
+    #: 而 B 其实好得很（实测：HDtime 明明从 B 拿到了数，却仍印这句，纯属误导）。
+    prowlarr_mismatch: bool = False
+    #: ★ 这一行**只存在于 Prowlarr**（cross-seed.db 里没有它）——
+    #: 见 `attach_prowlarr_quota` 的说明。它**不是**我们的索引器。
+    prowlarr_only: bool = False
+
+    @property
+    def snoozed(self) -> bool:
+        return self.status not in ("", "-", "OK", "NONE")
+
+    def active(self, now: datetime | None = None) -> bool:
+        if not self.enabled or not self.snoozed:
+            return False
+        return self.until is None or self.until > (now or datetime.now())
+
+    @property
+    def disagrees(self) -> bool:
+        """A 与 B 对不上 —— 只在一方为 0 另一方非 0 时才叫"对不上"。
+
+        ★ 不比较**大小**：两边口径不同（A 是"部数"，B 是 Prowlarr 记的"查询数"，
+        一部片往往会发好几个查询），数值本来就该有倍数差。强行比大小只会天天误报。
+        真正有信息量的是**"一边有、一边是 0"**：说明有东西在吃额度而我们没算进去
+        （手动在 Prowlarr 界面搜、别的 *arr 也接了同一个索引器），或者反过来
+        我们以为搜了、Prowlarr 根本没收到。
+
+        ★ `prowlarr_only` 的行不走这里：它 A 恒为 0、B 非 0，机械地判就是"对不上"，
+        但那句话没说清重点（重点不是"数对不上"，是"**这压根不是我们的站**"）。
+        它有自己的旗标，见 `render_quota`。
+        """
+        if self.prowlarr_only:
+            return False
+        if self.prowlarr_queries is None:
+            return False
+        return (self.searches_24h == 0) != (self.prowlarr_queries == 0)
+
+
+def quota_snapshot(crossseed_db: str | Path, *, hours: float = 24.0,
+                   now: datetime | None = None) -> list[QuotaLine]:
+    """各站「最近 24 小时搜了多少部」+ 现在的退避状态（来源 A + C）。
+
+    ★ **口径是"部数"，不是"查询次数"**：`timestamp` 表是 (searchee, indexer)
+    一行、只留 `last_searched` 最后一次。所以同一部片在窗口内被重搜多次**只算 1**。
+    真正的"发了多少次请求"表里根本没存 —— 本函数的数**不能**直接拿去和
+    Prowlarr 的 Query Limit 比大小。
+
+    ★ **窗口是滚动的 24 小时，不是自然日**（§16.1.3）。Prowlarr 的 limit 重置在
+    UTC 0 点（= 本地 08:00），自然日窗口跟它对不齐，会出现"我们显示 200、
+    Prowlarr 却已经烧了保险丝"。滚动窗口没有这个错位。
+    顺带：滚动窗口是**相对**的，所以这里**不需要**处理时区 ——
+    `last_searched` 是 UTC 毫秒，但比较在 epoch 秒上做，两边同源。
+
+    按 `searches_24h` 降序。
+    """
+    db_path = Path(crossseed_db)
+    if not db_path.is_file():
+        raise FileNotFoundError(f"找不到 cross-seed.db: {db_path}")
+    now = now or datetime.now()
+    cutoff = now.timestamp() - hours * 3600.0        # epoch 秒
+
+    con, _tmp = _open_csdb(db_path)
+    try:
+        rows = list(con.execute(
+            "SELECT id, name, url, status, retry_after, active FROM indexer"))
+        counts: dict[int, int] = {}
+        latest: dict[int, float] = {}
+        for iid, last_ms in con.execute(
+                "SELECT indexer_id, last_searched FROM timestamp"):
+            if not last_ms:
+                continue
+            sec = last_ms / 1000.0
+            if sec < cutoff:            # 窗口外的行直接丢，不参与计数
+                continue
+            counts[iid] = counts.get(iid, 0) + 1
+            if sec > latest.get(iid, 0.0):
+                latest[iid] = sec
+    finally:
+        con.close()
+
+    def _dt(sec: float) -> datetime | None:
+        try:
+            return datetime.fromtimestamp(sec)
+        except (OverflowError, OSError, ValueError):
+            return None
+
+    out: list[QuotaLine] = []
+    known: set[int] = set()
+    for iid, name, url, status, retry_after, active in rows:
+        known.add(iid)
+        until = _dt(retry_after / 1000.0) if retry_after else None
+        out.append(QuotaLine(
+            indexer=name or _fallback_indexer_label(iid, url),
+            searches_24h=counts.get(iid, 0),
+            last_search=_dt(latest[iid]) if iid in latest else None,
+            status=status or "-",
+            until=until,
+            enabled=bool(active),
+        ))
+    # 库里还留着搜索记录、但 `indexer` 表里已经没有这个 id 了（索引器被删过）。
+    # 不补上的话这些"幽灵用量"会被静默丢掉 —— 而"有东西在吃额度但看不见"
+    # 正是本节最该报出来的那类信号。
+    for iid in sorted(set(counts) - known):
+        out.append(QuotaLine(
+            indexer=_fallback_indexer_label(iid, None),
+            searches_24h=counts[iid],
+            last_search=_dt(latest[iid]) if iid in latest else None,
+            enabled=False,
+        ))
+    out.sort(key=lambda q: (-q.searches_24h, q.indexer))
+    return out
+
+
+def prowlarr_indexer_stats(base_url: str, api_key: str, *,
+                           timeout: float = 10.0) -> tuple[dict[str, int], str]:
+    """问 Prowlarr 要各索引器**近 24 小时**的查询数（来源 B）。返回 `(表, 原因)`。
+
+    ★★ **本函数尚未对真实响应验证过**（2026-09-12）。原因写在这里，别当它是既成事实：
+    NAS 上那个 Prowlarr 的 `/api/v1/indexerstatus` 与 `/api/v1/indexerstats`
+    都返回 **401** —— `.env` 里 `TORZNAB_URLS` 带的 apikey **不是 Prowlarr 的 API key**
+    （两个索引器还各带一个不同的 16 位串），`/docs` 与 openapi.json 也都 401。
+    所以**字段名是从 Prowlarr 公开文档抄的，没有拿真实响应核对过**。
+
+    正因为没验证过，这里的策略是**宁可不报、绝不猜**：
+      * 没配 key      → `({}, "未配置 Prowlarr API key")`
+      * 请求失败      → `({}, "HTTP <错误>")`
+      * 结构不认识    → `({}, "响应结构不认识（本函数未验证过）")`
+      * 认出来了      → `({站名: 查询数}, "")`
+    **它永远不会返回一个自己编的数** —— 报错了顶多是这一列空着，
+    不会拿一个错的数字去和来源 A 做"互校"、再把结论引向错误的方向。
+
+    配好 key 之后要做的第一件事：把返回值打出来跟 A 对一遍口径（见 `disagrees`）。
+    `base_url` 形如 `http://192.168.0.7:9696`（**宿主机 IP**，不是容器名 ——
+    drive-loop 跑在 NAS 宿主机上，`prowlarr` 这个服务名它解析不了）。
+    """
+    if not api_key:
+        return {}, "未配置 Prowlarr API key"
+    import urllib.error
+    import urllib.request
+
+    url = f"{base_url.rstrip('/')}/api/v1/indexerstats"
+    req = urllib.request.Request(url, headers={"X-Api-Key": api_key})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", "replace")
+    except Exception as e:                       # 网络/鉴权/超时 —— 一律降级，不抛
+        return {}, f"请求失败：{type(e).__name__}: {e}"
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return {}, "响应不是合法 JSON（多半是被拦了或拿到的不是 API 响应）"
+    if not isinstance(data, dict):
+        return {}, "响应顶层不是对象"
+
+    rows = data.get("indexers")
+    if not isinstance(rows, list):
+        # 认不出来就明说。★ 不要在这里"尽力而为"地翻找 —— 猜错了会变成一个
+        # 看着很合理、其实无意义的数字，而它还要参与"互校"。
+        return {}, "响应里没有 indexers 数组（本函数未对真实响应验证过）"
+    out: dict[str, int] = {}
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        name = r.get("indexerName") or r.get("name")
+        n = r.get("numberOfQueries")
+        if isinstance(name, str) and name and isinstance(n, (int, float)):
+            out[name] = int(n)
+    if not out:
+        return {}, "indexers 数组里没有能认出的条目（字段名未验证）"
+    return out, ""
+
+
+def _norm_site(s: str) -> str:
+    """站点名归一化，用来把 Prowlarr 的名字跟 cross-seed 的 label 对上。
+
+    Prowlarr 的 `indexerName` 与 cross-seed 的 label **未必逐字相同**
+    （例如 cross-seed 记的是 `NanyangPT (南洋)`、Prowlarr 记的是 `NanyangPT`；
+    或者反过来，Prowlarr 名字里带 "(API)" 之类后缀）。
+    只保留字母数字、全部小写，把这类差异抹掉；**不**做模糊匹配 ——
+    匹配不上就诚实地说匹配不上（见 `attach_prowlarr_quota`）。
+    """
+    return "".join(ch for ch in (s or "").lower() if ch.isalnum())
+
+
+def attach_prowlarr_quota(lines: list[QuotaLine], base_url: str, api_key: str, *,
+                          timeout: float = 10.0) -> list[QuotaLine]:
+    """把来源 B（Prowlarr 自报的 24h 查询数）填进台账，**原地改并返回**。
+
+    整体拿不到（没配 key / 401 / 结构不认识）→ 每行 `prowlarr_queries` 留 `None`、
+    `prowlarr_note` 记同一个原因 —— 渲染时就是"这一列空着 + 一句为什么"。
+    单行名字对不上 → 只给那一行记 `"Prowlarr 里没有这个名字"`。
+
+    ★★ 2026-09-12：**还往回加行** —— 只在 Prowlarr 里、cross-seed.db 里没有的索引器，
+    补成 `prowlarr_only=True` 的行（只挑 `numberOfQueries > 0` 的）。
+
+    为什么要加：本函数原先**只遍历来源 A 的行**去 B 里查名字，于是
+    「Prowlarr 配了、我们不用的站」**一行都不会出现** —— 而它恰恰是
+    **"有别的工具在用同一个 Prowlarr" 的唯一信号**。实测：Prowlarr 里有
+    `HDtime`（启用，8 次查询含 4 次失败），而我们的 `TORZNAB_URLS` 只有 2 条，
+    台账里**完全看不见它**。看不见的东西不能叫"没问题"，只能叫"没在看"。
+    （`numberOfQueries == 0` 的不加：那只是一个没用的配置，不是信号，天天打是噪音。）
+
+    ★ 无论哪条路径，**都不会出现"猜出来的数字"**：`prowlarr_queries` 非 None
+    就意味着它确实来自 Prowlarr 的响应（见 `prowlarr_indexer_stats` 的说明）。
+    """
+    stats, note = prowlarr_indexer_stats(base_url, api_key, timeout=timeout)
+    if note:
+        for q in lines:
+            q.prowlarr_note = note
+        return lines
+    by_norm = {_norm_site(k): v for k, v in stats.items()}
+    seen = set()
+    for q in lines:
+        seen.add(_norm_site(q.indexer))
+        n = by_norm.get(_norm_site(q.indexer))
+        if n is None:
+            q.prowlarr_mismatch = True
+        else:
+            q.prowlarr_queries = n
+    for name, n in stats.items():
+        if _norm_site(name) in seen or not n:
+            continue
+        lines.append(QuotaLine(indexer=name, searches_24h=0,
+                               prowlarr_queries=n, prowlarr_only=True))
+    return lines
+
+
+def render_quota(lines: list[QuotaLine], *, title: str = "站点额度台账",
+                 note: str = "滚动 24 小时；★是「部数」不是「查询次数」",
+                 limit: int = 0, hide_idle: bool = True) -> str:
+    """把台账渲染成**纯文本几行**（邮件用；§16.3.2 的"别做图/HTML"同理）。
+
+    额度是**慢性**问题，所以这里是给日报用的，不是即时告警。
+
+    `hide_idle`：把「**已禁用且窗口内 0 部**」的行藏掉 —— 那些是早就删掉的索引器
+    （实测 `prowlarr#1` / `prowlarr#3`），留着只是每天占两行，看久了就没人看了。
+    ★ 但**只藏"零用量"的**：已禁用却**有**用量的行必须留下 ——
+    那正是「有东西在吃额度而我以为它已经关掉了」这类最该被看见的情况。
+    """
+    shown_lines = [q for q in lines
+                   if not (hide_idle and not q.enabled and q.searches_24h == 0)]
+    if not shown_lines:
+        return f"{title}：没有可报告的索引器"
+    out = [f"{title}（{note}）" if note else title]
+    # ★ `prowlarr_only` 的行（不是我们的索引器，但 Prowlarr 记到有查询）
+    #   **不参与 limit 截断**：limit 是给"我们自己的站"防日常噪音用的，
+    #   而这一档本身罕见且重要 —— 被截掉就等于白加。
+    ours = [q for q in shown_lines if not q.prowlarr_only]
+    extras = [q for q in shown_lines if q.prowlarr_only]
+    shown = ours[:limit] if limit else ours
+    for q in shown + extras:
+        flags = []
+        if q.active():
+            flags.append(f"⚠ 退避中{('，解禁 ' + q.until.strftime('%m-%d %H:%M')) if q.until else ''}")
+        elif q.snoozed:
+            flags.append(f"（见过限流：{q.status}）")
+        if not q.enabled:
+            flags.append("（已禁用）")
+        if q.prowlarr_mismatch:
+            flags.append("（Prowlarr 里没有这个名字 —— 两边命名不一致？）")
+        if q.prowlarr_only:
+            flags.append(f"★ 不是本项目的索引器，却被 Prowlarr 记了 "
+                         f"{q.prowlarr_queries} 次查询（别的东西在用这个 Prowlarr？）")
+        if q.disagrees:
+            flags.append(f"‼ Prowlarr 说 {q.prowlarr_queries} 次，对不上")
+        tail = ("  " + " ".join(flags)) if flags else ""
+        # 外来行没有"我们的用量"这回事，打 `-` 而不是 `0`：
+        # 0 会被读成"我们搜了 0 次"，而事实是"这一行根本不属于我们"。
+        cnt = "   -" if q.prowlarr_only else f"{q.searches_24h:>4}"
+        out.append(f"  {q.indexer:<18} {cnt} 部{tail}")
+    if limit and len(ours) > limit:
+        out.append(f"  …还有 {len(ours) - limit} 个索引器")
+    hidden = len(lines) - len(shown_lines)
+    if hidden:
+        out.append(f"  （另有 {hidden} 个已禁用的索引器窗口内无用量，未列出）")
+    lost = [q for q in lines if q.prowlarr_note]
+    if lost:
+        out.append(f"  （来源 B 互校不可用：{lost[0].prowlarr_note}）")
+    return "\n".join(out)
+
+
+# --------------------------------------------------------------------------- #
+# 命中率趋势（SUMMARY §16.3）
+# --------------------------------------------------------------------------- #
+
+#: `movie.matched_indexers` 为空时的兜底归属名。★ **不并进任何站**，单列一栏 ——
+#: 它变多说明"匹配到了但没记下来"，那本身是个 bug 信号，混进某个站就看不见了。
+UNATTRIBUTED_SITE = "（未记站点）"
+
+
+@dataclass
+class TrendReport:
+    """(周, 站) 的新增做种矩阵。由 `StateStore.trend()` 产出。"""
+    weeks: list[str] = field(default_factory=list)              # 升序
+    sites: list[str] = field(default_factory=list)
+    cells: dict = field(default_factory=dict)                   # (week, site) -> n
+    week_totals: dict = field(default_factory=dict)             # week -> n
+    total: int = 0
+    unattributed: int = 0
+
+    def render(self, *, weeks_shown: int = 2) -> str:
+        """渲染成**纯文本几行** —— 邮件里一屏能看完才有用（§16.3.2）。
+
+        ⚠ 别改成图/HTML：收件端是纯文本邮件，HTML 只会变成一坨标签。
+        """
+        if not self.week_totals:
+            return "新增做种趋势：暂无数据（还没有片走到 SEEDING）"
+        cur = self.weeks[-1]
+        out = [f"本周（{cur}）新增做种 {self.week_totals[cur]} 部（去重）"]
+        site_sum = 0
+        for s in sorted(self.sites,
+                        key=lambda x: (-self.cells.get((cur, x), 0), x)):
+            n = self.cells.get((cur, s), 0)
+            if n:
+                out.append(f"    {s}  {n}")
+                site_sum += n
+        # ★ 按站计数之和 > 总数是因为**一部片在两个站都做种会各记一次**。
+        #   不写这句，读者会以为数对不上（这是实测撞到的第一反应）。
+        if site_sum > self.week_totals[cur]:
+            out.append(f"    ↑ 按站相加 {site_sum} > {self.week_totals[cur]}："
+                       "同一部片在多个站做种时，每个站各记一次")
+        # 上一周对比才是重点 —— 换站决策问的是"这周比上周好了没有"，
+        # 光看本周一个数答不了。
+        if len(self.weeks) >= 2:
+            prev = self.weeks[-2]
+            delta = self.week_totals[cur] - self.week_totals[prev]
+            out.append(f"    上周（{prev}）{self.week_totals[prev]} 部 → "
+                       f"{delta:+d}")
+        if self.unattributed:
+            out.append(f"    ★ {self.unattributed} 部没记到站点"
+                       "（matched_indexers 为空 —— 可能是同步漏了）")
+        return "\n".join(out)
 
 
 # --------------------------------------------------------------------------- #
@@ -678,6 +1117,7 @@ CREATE TABLE IF NOT EXISTS pack (
   roots           TEXT,                   -- JSON 数组：多根包的全部 root（root = 第一个）
   local_roots     TEXT,                   -- JSON 数组：与 roots 一一对应的可列目录路径
   max_depth       INTEGER,                -- 枚举深度，对应 cross-seed 的 maxDataDepth
+  farm_root       TEXT,                   -- ★v3：cross-seed 现在扫的"硬链接农场"根
   link_dir        TEXT,
   category        TEXT,
   created_at      TEXT NOT NULL,
@@ -720,6 +1160,9 @@ CREATE TABLE IF NOT EXISTS attempt (
   note             TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_attempt_movie ON attempt(movie_id, at);
+-- 2026-09-12：趋势（§16.3）要按 `at` 聚合。原先只有 (movie_id, at) 复合索引，
+-- 按 `at` 单列查会**全表扫**。现在 1350 行无所谓，但趋势是长期功能。
+CREATE INDEX IF NOT EXISTS idx_attempt_at ON attempt(at);
 """
 
 
@@ -779,10 +1222,21 @@ class StateStore:
                 self.con.execute(f"ALTER TABLE pack ADD COLUMN {col} TEXT")
         if "max_depth" not in cols:
             self.con.execute("ALTER TABLE pack ADD COLUMN max_depth INTEGER")
+        # 2026-09-12：v3 农场切换后 cross-seed 报的是**农场路径**，
+        # 而 pack 的 roots 还是原路径 —— 认不出就全判成"别的包"静默跳过，
+        # SEEDING 会塌成 0。记下农场根，把两套路径对上。
+        if "farm_root" not in cols:
+            self.con.execute("ALTER TABLE pack ADD COLUMN farm_root TEXT")
         mcols = {r["name"] for r in self.con.execute("PRAGMA table_info(movie)")}
         if "indexer_seen" not in mcols:
             self.con.execute(
                 "ALTER TABLE movie ADD COLUMN indexer_seen TEXT NOT NULL DEFAULT '{}'")
+        # ★ 索引也要给**已存在的老库**补上 —— SCHEMA 里的 CREATE INDEX 只在建库时跑，
+        #   老库 executescript 虽然也会执行那句 IF NOT EXISTS……但它跑在 _migrate 之前、
+        #   而老库的 attempt 表早就存在，所以其实会建上。这里再兜一次是因为
+        #   `attempt` 表本身是后来才加进 SCHEMA 的库可能连表结构都不同 ——
+        #   重复 CREATE INDEX IF NOT EXISTS 是幂等的，代价只有一次 PRAGMA。
+        self.con.execute("CREATE INDEX IF NOT EXISTS idx_attempt_at ON attempt(at)")
 
     def close(self) -> None:
         self.con.close()
@@ -798,30 +1252,36 @@ class StateStore:
                     roots: list[str] | None = None,
                     local_roots: list[str] | None = None,
                     max_depth: int | None = None,
+                    farm_root: str | None = None,
                     link_dir: str | None = None,
                     category: str | None = None, note: str | None = None) -> None:
         """登记/更新一个包。
 
         多根包（如 DC 的 47 个标签目录）传 `roots` / `local_roots`；
         `root` 仍必填 —— 它是 `roots[0]`，老代码和 webhook 都还在用它。
+
+        `farm_root`（v3）：cross-seed 实际扫描的硬链接农场根。设了它之后，
+        农场里的 `<farm_root>/<一级目录>/<其余>` 会被认作原包
+        `<某个root>/<一级目录>/<其余>` 的同一条目（见 `_farm_mirror`）。
         """
         roots_json = json.dumps(roots, ensure_ascii=False) if roots else None
         lroots_json = json.dumps(local_roots, ensure_ascii=False) if local_roots else None
         self.con.execute(
             """INSERT INTO pack(name, root, local_root, roots, local_roots, max_depth,
-                                link_dir, category, created_at, note)
-               VALUES(?,?,?,?,?,?,?,?,?,?)
+                                farm_root, link_dir, category, created_at, note)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?)
                ON CONFLICT(name) DO UPDATE SET
                  root=excluded.root,
                  local_root=COALESCE(excluded.local_root, pack.local_root),
                  roots=COALESCE(excluded.roots, pack.roots),
                  local_roots=COALESCE(excluded.local_roots, pack.local_roots),
                  max_depth=COALESCE(excluded.max_depth, pack.max_depth),
+                 farm_root=COALESCE(excluded.farm_root, pack.farm_root),
                  link_dir=COALESCE(excluded.link_dir, pack.link_dir),
                  category=COALESCE(excluded.category, pack.category),
                  note=COALESCE(excluded.note, pack.note)""",
             (name, root, local_root, roots_json, lroots_json, max_depth,
-             link_dir, category, _now(), note),
+             farm_root, link_dir, category, _now(), note),
         )
         self.con.commit()
 
@@ -862,8 +1322,24 @@ class StateStore:
         except (TypeError, ValueError, IndexError):
             return DEFAULT_MAX_DATA_DEPTH
 
+    def farm_root(self, pack: str) -> str:
+        """cross-seed 实际扫描的硬链接农场根；没设就返回空串（旧库/未迁移）。"""
+        p = self.pack(pack)
+        if p is None:
+            raise KeyError(f"包未登记: {pack!r}")
+        return p["farm_root"] or ""
+
     def pack(self, name: str) -> sqlite3.Row | None:
         return self.con.execute("SELECT * FROM pack WHERE name=?", (name,)).fetchone()
+
+    def packs(self) -> list[sqlite3.Row]:
+        """全部已登记的包，按名字排序。
+
+        给「不带 --pack 时列个总览」用（编排器的 `state` 子命令）。
+        ★ 排序放在 SQL 里而不是 Python 里：包名里有中文和连字符，
+          交给 SQLite 的默认排序至少是**稳定**的，跨调用顺序一致。
+        """
+        return list(self.con.execute("SELECT * FROM pack ORDER BY name"))
 
     def mark_scan(self, name: str, *, started: bool = False, finished: bool = False,
                   complete: bool | None = None) -> None:
@@ -903,6 +1379,24 @@ class StateStore:
         而不是塌回容器 `Arrow.S01-S08…`。
         """
         return {_norm_path(r["path"]): r["dir_name"] for r in self.movies(pack)}
+
+    def farm_dir_paths(self, pack: str) -> dict[str, str]:
+        """`{农场镜像路径: 单片名}` —— 与 `dir_paths()` 合并后交给 `dir_name_of()`。
+
+        农场路径和原路径指向同一条目，所以映射到同一个 `dir_name`；合并之后
+        `dir_name_of` 的最长前缀匹配对**两套路径**都成立，它自己和
+        `parse_log()` 的三个调用点都不用动。没登记农场根就返回空 dict（老行为）。
+        """
+        f = self.farm_root(pack)
+        if not f:
+            return {}
+        roots = self.roots(pack)
+        out: dict[str, str] = {}
+        for r in self.movies(pack):
+            m = _farm_mirror(r["path"], roots, f)
+            if m:
+                out.setdefault(m, r["dir_name"])
+        return out
 
     def movies(self, pack: str, *, stages: list[str] | None = None) -> list[sqlite3.Row]:
         sql = "SELECT * FROM movie WHERE pack=?"
@@ -1119,6 +1613,75 @@ class StateStore:
                     d["due"] += 1
         return stat
 
+    def trend(self, *, weeks: int = 4, pack: str | None = None,
+              now: datetime | None = None) -> "TrendReport":
+        """按 **(周, 站)** 汇总「新增做种」—— 换站决策要的是这个，不是全局一个数。
+
+        ★ 数据**早就在库里**，不用另存一份（§16.3.1）：`attempt` 表本身就是事件流水。
+        但**不能直接 count 当天的行** —— `result='seeding'` 是**状态**不是**增量**：
+        同一部片今天已经是 SEEDING，明天的 sync **不会再写一行**，所以"当天有多少行"
+        里既有新做种的、也有别的原因写下 seeding 的。
+        正确口径是**按片取首次**：`MIN(at) GROUP BY movie_id`（下面那条 SQL 就是）。
+
+        ★ 站点归属取自 `movie.matched_indexers`（哪几个站匹配到了这部片）——
+        而**不是** `attempt.indexers`：后者的 `kind='inject'` 行写的是 `[]`
+        （见 `sync_movie` 里那三个 add_attempt 调用），按它归属会全部落到"未记站点"。
+        一部片同时匹配到两个站，就**两边各记一次**（都真的出了力）；
+        但周合计只算一部（不然总和会超过实际部数）。
+
+        只保留 `weeks` 周以内的数据 —— 更早的对"这个站最近值不值得留"没有信息量，
+        留着只会让周对比表越拖越长。
+        """
+        now = now or datetime.now()
+        cutoff = now - timedelta(weeks=weeks)
+        # ★ `first_indexers` 那个子查询：`attempt.indexers` 里记着"这一行是哪个站引起的"。
+        #   为什么需要它：`matched_indexers` 的来源是**解析 cross-seed 日志**，
+        #   日志没覆盖到（或走的是 DB/qB 那条路）时它是空的 —— 实测 201 部里有 40 部
+        #   是这样，`matched_hashes` 有值而 `matched_indexers` 是 `[]`。
+        #   那 40 部的 seeding 行 `attempt.indexers` 却是准的（如 `["HDFans","NanyangPT"]`）。
+        #   两个都是**记下来的事实**，不是猜的 —— 所以按"先 matched_indexers、
+        #   退到首行 indexers"的顺序取，属于补全而不是编造。
+        #   两边都没有才落到 `UNATTRIBUTED_SITE`（并且会被单独标出来）。
+        sql = (
+            "SELECT a.movie_id, MIN(a.at) AS first_at, m.pack, m.matched_indexers, "
+            "       (SELECT a2.indexers FROM attempt a2 "
+            "         WHERE a2.movie_id = a.movie_id AND a2.result = ? "
+            "         ORDER BY a2.at, a2.id LIMIT 1) AS first_indexers "
+            "  FROM attempt a JOIN movie m ON m.id = a.movie_id "
+            " WHERE a.result = ?")
+        params: list = [STAGE_SEEDING.lower(), STAGE_SEEDING.lower()]
+        if pack:
+            sql += " AND m.pack = ?"
+            params.append(pack)
+        sql += " GROUP BY a.movie_id"
+
+        def _sites(*candidates: str | None) -> list[str]:
+            for raw in candidates:
+                got = [s for s in _u(raw) if s and s != UNKNOWN_INDEXER]
+                if got:
+                    return got
+            return []
+
+        rep = TrendReport()
+        for _mid, first_at, _pk, matched, first_idx in self.con.execute(sql, params):
+            dt = _parse_ts(first_at)
+            if dt is None or dt < cutoff:
+                continue
+            ic = dt.isocalendar()
+            wk = f"{ic[0]}-W{ic[1]:02d}"
+            sites = _sites(matched, first_idx)
+            if not sites:
+                rep.unattributed += 1
+                sites = [UNATTRIBUTED_SITE]
+            for s in sites:
+                rep.cells[(wk, s)] = rep.cells.get((wk, s), 0) + 1
+            rep.week_totals[wk] = rep.week_totals.get(wk, 0) + 1
+            rep.total += 1
+
+        rep.weeks = sorted(rep.week_totals)
+        rep.sites = sorted({s for (_w, s) in rep.cells})
+        return rep
+
     def summary(self, pack: str) -> dict[str, int]:
         rows = self.con.execute(
             "SELECT stage, COUNT(*) c FROM movie WHERE pack=? GROUP BY stage", (pack,)
@@ -1162,6 +1725,7 @@ def _resolve_searchee_to_pack(
     roots: list[str],
     dirs: set[str],
     dpaths: dict[str, str],
+    farm_root: str = "",
 ) -> tuple[str | None, str]:
     """把一个 cross-seed searchee 归到**当前包**的单片名。
 
@@ -1171,6 +1735,9 @@ def _resolve_searchee_to_pack(
       * "unresolved"  —— 路径在当前包内、但归不到任何具体单片（真·对不上）
     区分这两种"不是本包"的情况，是为了 sync 汇报时**不把跨包 searchee 误报成
     当前包的对不上数**（FRDS/MBF 的片子不该算进 DC 的 unresolved）。
+
+    `dpaths` 应当已经合并了农场的镜像键（见 `StateStore.farm_dir_paths`），
+    这样 v3 农场路径也能归到单片。
     """
     p = _norm_path(snap.searchee_paths.get(name, ""))
     if p:
@@ -1179,6 +1746,13 @@ def _resolve_searchee_to_pack(
             if p == r or p.startswith(r + "/"):
                 d = dir_name_of(p, roots, dpaths)
                 return (d if d else None, "in_pack" if d else "unresolved")
+        # v3：cross-seed 现在扫的是硬链接农场，报的是农场路径。农场是三个包
+        # 共用的，所以这里**只认 dpaths 里的镜像键**（root 传空 → 不做事后
+        # 兜底的单根猜测），命中不了就是别的包的，别乱认领。
+        f = _norm_path(farm_root)
+        if f and (p == f or p.startswith(f + "/")):
+            d = dir_name_of(p, [], dpaths)
+            return (d if d else None, "in_pack" if d else "other_pack")
         return (None, "other_pack")       # 路径在别的包下 → 不属于当前包
     # 查不到路径（老库 / 罕见）：退回纯名字匹配；匹配不上算 unresolved
     d = resolve_dir_name(name, dirs)
@@ -1290,6 +1864,11 @@ def sync_pack(
     # 路径 → 单片名：给日志解析做最长前缀匹配。多根/嵌套包靠它才能把
     # "季层"路径和"容器层"路径分开（见 dir_name_of 的说明）。
     dpaths = store.dir_paths(pack_name)
+    # v3：cross-seed 扫的是硬链接农场，报的是农场路径 —— 把镜像键并进来，
+    # 同一个 dir_name 现在有两把钥匙（原路径 + 农场路径）。dir_name_of 与
+    # parse_log 不必改动。
+    farm = store.farm_root(pack_name)
+    dpaths.update(store.farm_dir_paths(pack_name))
     rep = SyncReport(pack=pack_name, movies=len(dirs))
 
     # --- 1) cross-seed.db ------------------------------------------------- #
@@ -1302,7 +1881,7 @@ def sync_pack(
         alias = {**snap.alias, **alias}      # 用户显式给的优先
         indexers_now = [_norm_one(i, alias) for i in (indexers_override or snap.indexers)]
         for name, idxmap in snap.searched.items():
-            d, belong = _resolve_searchee_to_pack(name, snap, roots, dirs, dpaths)
+            d, belong = _resolve_searchee_to_pack(name, snap, roots, dirs, dpaths, farm)
             if d is None:
                 if belong == "unresolved":
                     rep.unresolved += 1
@@ -1313,7 +1892,7 @@ def sync_pack(
                 if ts and (label not in tgt or ts > tgt[label]):
                     tgt[label] = ts
         for name, decs in snap.decisions.items():
-            d, belong = _resolve_searchee_to_pack(name, snap, roots, dirs, dpaths)
+            d, belong = _resolve_searchee_to_pack(name, snap, roots, dirs, dpaths, farm)
             if d is None:
                 continue
             for info_hash, _decision in decs:
@@ -1498,44 +2077,104 @@ class DriveSession:
     但不管是哪种，索引器一旦被 snooze，cross-seed 会把后续条目**直接跳过**。
     所以每次发送前先看一眼 cross-seed 的 `indexer` 表，有退避就等到解禁再继续，
     免得白发一堆注定被跳的 webhook。
+
+    ★ 但「退避」不只有"正挡着"这一种形态（2026-09-12 修过一次，见
+    `wait_out_backoff()`）：实测的 429 只 snooze 了 55 秒，比检查间隔还短，
+    只查"此刻挡不挡路"就会**永远看不见它**，`backoff_hits` 恒为 0，
+    `next_sleep()` 也就永远收不到"站点在限流"这个信号。所以现在：
+      · 检查同时按**条数**（check_every）和**秒数**（check_secs）触发；
+      · 只要 `retry_after` 变了就认定"新发生了一次限流"，哪怕窗口已经过去。
     """
 
     def __init__(self, *, url: str, api_key: str, crossseed_db: str | Path | None = None,
                  interval: float = 30.0, check_every: int = 10, max_wait: float = 1800.0,
+                 check_secs: float = 60.0,
                  timeout: float = 30.0, pause_on_backoff: bool = True,
-                 sleep=time.sleep, now=datetime.now, on_event=None):
+                 sleep=time.sleep, now=datetime.now, monotonic=time.monotonic,
+                 on_event=None):
         self.url = url
         self.api_key = api_key
         self.crossseed_db = Path(crossseed_db) if crossseed_db else None
         self.interval = max(0.0, float(interval))
         self.check_every = max(1, int(check_every))
+        #: ★除了「每 check_every 条」再按**时间**兜一层。只有条数触发的话，
+        #: 10 条 × 30s = 300s 才看一眼，而实测的 429 只 snooze 了 55 秒 ——
+        #: 整个窗口落在两次检查之间，退避就跟没发生过一样（详见 wait_out_backoff）。
+        self.check_secs = max(0.0, float(check_secs))
         self.max_wait = float(max_wait)
         self.timeout = timeout
         self.pause_on_backoff = pause_on_backoff
         self._sleep = sleep
         self._now = now
+        self._mono = monotonic
         self._on_event = on_event or (lambda *a, **k: None)
+        #: 上一次看到的「索引器 → retry_after 原值」，用来认出新发生的退避
+        self._snooze_seen: dict[str, float] = {}
+        self._baselined = False
         self.stats = DriveStats()
 
     # -- 退避 --------------------------------------------------------------- #
-    def backoffs(self) -> list[IndexerBackoff]:
+    def _read_backoffs(self) -> tuple[list[IndexerBackoff], list[IndexerBackoff]]:
+        """一次读库，返回 `(此刻挡路的, 最近被限流过的)`。读不到就都给空表。
+
+        两列都要：前者决定「要不要等」，后者决定「要不要记一笔、下批拉长间隔」。
+        """
         if not self.crossseed_db:
-            return []
+            return [], []
         try:
-            return blocking_backoffs(read_indexer_backoff(self.crossseed_db))
+            rows = read_indexer_backoff(self.crossseed_db)
         except (OSError, sqlite3.Error, FileNotFoundError) as e:
             self._on_event("warn", f"读索引器状态失败（忽略）: {e}")
-            return []
+            return [], []
+        # 用会话自己的时钟判断"解禁过没过"（见 IndexerBackoff.active）
+        now = self._now()
+        return blocking_backoffs(rows, now), snoozed_indexers(rows)
+
+    def backoffs(self) -> list[IndexerBackoff]:
+        """此刻真正挡住搜索的索引器。"""
+        return self._read_backoffs()[0]
 
     def wait_out_backoff(self) -> bool:
-        """有索引器在退避就等到解禁。返回 False 表示等太久了，建议中止。"""
+        """有索引器在退避就等到解禁。返回 False 表示等太久了，建议中止。
+
+        ★ 2026-09-12 修：以前这里只问「**此刻**挡不挡路」（`blocking_backoffs`），
+        结果**短退避根本检测不到**，`backoff_hits` 恒为 0，`next_sleep()` 也就
+        永远收不到「站点在限流」这个信号。实测就是这么漏的：
+            info.2026-09-12.log  `08:16:19 ... Failed to reach NanyangPT (南洋):
+                                  code 429 ... snoozing until 2026-09-12 08:17:14`
+        窗口只有 **55 秒**，而检查间隔是 `check_every × interval` = 10 × 30s = 300s，
+        整段落在两次检查之间；下一眼看过去时 `until` 已经过去，`active=False`，
+        于是既不等待、也不计数。
+        现在两条腿走路：
+          ① `retry_after` 跟上次看到的不一样 → **新发生的退避**，照记一笔命中，
+             哪怕窗口已经过去 —— 它确实发生过，是「站点在限流」的真信号；
+          ② 窗口还没过去，照旧等到解禁（受 `max_wait` 上限保护）。
+        进程刚起时第一次检查只建立基线，不计数（手上没有「上一次」可比）——
+        但如果那一刻退避**正在挡路**，仍然要记（它明明白白挡着我们）。
+        """
         if not self.pause_on_backoff:
             return True
+        baseline = not self._baselined
+        self._baselined = True
         while True:
-            blocking = self.backoffs()
+            blocking, snoozed = self._read_backoffs()
+            for b in snoozed:
+                key = b.retry_after if b.retry_after is not None else -1.0
+                fresh = self._snooze_seen.get(b.name) != key
+                # ★基线那一眼必须**只认"此刻真挡路"的**：库里常常留着一小时前
+                #   那次退避的残值（status 还写着 RATE_LIMITED，retry_after 早过期），
+                #   若把"没见过"当成"新发生"，每一批开头都会白记一笔 → 永远 2 小时一跑。
+                if (fresh and not baseline) or (baseline and b.active(self._now())):
+                    self.stats.backoff_hits += 1
+                    self._on_event("warn", f"索引器 {b.name} 被限流（{b.status}）"
+                                   + (f"，解禁 {b.until:%H:%M:%S}" if b.until
+                                      else "，未给解禁时间"))
+                self._snooze_seen[b.name] = key
             if not blocking:
                 return True
-            self.stats.backoff_hits += 1
+            for b in blocking:                    # 没给解禁时间的也要进基线
+                self._snooze_seen.setdefault(
+                    b.name, b.retry_after if b.retry_after is not None else -1.0)
             soonest = min((b.until for b in blocking if b.until), default=None)
             names = ", ".join(b.name for b in blocking)
             if soonest is None:
@@ -1561,11 +2200,22 @@ class DriveSession:
     # -- 主循环 ------------------------------------------------------------- #
     def run(self, paths: list[str]) -> DriveStats:
         self.stats.total = len(paths)
+        last_check = 0.0
         for i, pth in enumerate(paths, 1):
-            if self.pause_on_backoff and (i == 1 or (i - 1) % self.check_every == 0):
-                if not self.wait_out_backoff():
-                    self._on_event("abort", self.stats.aborted or "退避等待超时")
-                    break
+            if self.pause_on_backoff:
+                now_m = self._mono()
+                # 条数触发（老行为，保持）+ 时间触发（★短退避靠它才看得见）。
+                # ★ check_secs=0 表示"关掉时间触发" —— 不能写成 `now-last >= 0`
+                #   （那恒为真，会退化成每条都查一次库）。
+                due = (i == 1
+                       or (i - 1) % self.check_every == 0
+                       or (self.check_secs > 0
+                           and now_m - last_check >= self.check_secs))
+                if due:
+                    last_check = now_m
+                    if not self.wait_out_backoff():
+                        self._on_event("abort", self.stats.aborted or "退避等待超时")
+                        break
 
             code = post_webhook(pth, url=self.url, api_key=self.api_key,
                                 timeout=self.timeout)

@@ -7,6 +7,7 @@
 ----
 每次跑一批 `drive --limit N --apply`，跑完读 `DriveStats` 的三个信号：
   * `still_skipped > 0` 或 `backoff_hits > 0`  → 站点在退避/限流 → 下次间隔拉长
+    ★ 但退避**按实际等待时长分级**（见 next_sleep）：站点打 1 分钟喷嚏不该罚 2 小时
   * `newly_seeding` 稳定产出、无退避           → 站点健康 → 下次间隔收紧
   * `aborted`（> --max-wait 提前中止）         → 休整 + 间隔拉满
 然后在 DC / FRDS / (MBF) 三个包之间轮流推进。
@@ -25,14 +26,20 @@
   --limit 50                    每批条数
   --interval / --check-every / --max-wait / --settle 透传
 
-调度（2026-09-11 起跑在 NAS 上，Windows 计划任务已停用）
+调度（2026-09-11 起跑在 NAS 上）
 --------------------------------------------------------
 NAS 侧用 DSM 任务计划，每 15 分钟唤醒一次：
   控制面板 → 任务计划 → 用户定义的脚本，用户选 root，频率「每 15 分钟」
   脚本 = sh /volume2/docker_ssd/prowlarr_cross-seed_autohardlink/drive-loop/run.sh
 
-`--once` 模式下每次唤醒只跑一批；`--min-sleep` 保证不会连续猛打。
-★ 为什么在 NAS 上跑（原本是 Windows 计划任务）—— 两个独立的坑，见 SUMMARY §14：
+`--once` 模式下每次唤醒只跑一批。批间隔 = `max(--min-sleep, 上一批 next_sleep 的结论)`，
+由 `.drive-loop.state` 的 `last_sleep_sec` 跨进程传递 —— 于是「站点在退避就缓一缓」
+真的会生效，而不只是往日志里写一行字（2026-09-12 之前就是那样，见 once_round）。
+
+★★ 电脑端（Windows）已于 2026-09-12 退役，只保留 deploy.sh（见 README「电脑端已不参与」）。
+   下面这两条是**当时**为什么要搬走的记录 —— 不是待办，是历史，别再照着它去配 Windows 任务。
+
+★ 为什么当初要搬到 NAS（原本是 Windows 计划任务）—— 两个独立的坑，见 SUMMARY §14：
   ① Windows 任务计划的 <StopOnIdleEnd>true（默认配置，不是代码问题）：
      你一动鼠标/键盘就**直接 TerminateProcess 整个任务实例**，
      表现是批次「凭空消失」：没有 traceback、没有 finally 收尾、状态文件里
@@ -40,6 +47,8 @@ NAS 侧用 DSM 任务计划，每 15 分钟唤醒一次：
   ② 包装器 drive-loop-once.cmd 曾是 LF 行尾：cmd.exe 按字节块读批处理文件，
      LF-only 会让它从某行中间开始执行（REM 注释的单词被当命令跑），
      set 的变量全丢 → 留下 exit=9009 且**有 exit= 没有 start=**。已修成 CRLF。
+     （该 .cmd 已于 2026-09-12 删除 —— 退役的不是"修好它"，是"不再需要它"。
+       所以别看到"已修成 CRLF"就以为那个文件还在。）
   根因与完整证据见 README「把调度挂到 NAS 上」+ SUMMARY §14。
 """
 # ★ 必须放在所有其它 import 之前 —— 这行是 Python 3.10 以下能跑起来的前提。
@@ -57,6 +66,9 @@ import json
 import logging
 import os
 import re
+# [电脑端已退役 2026-09-12] subprocess 原先只给 Windows 的 tasklist 分支用，
+# 那支已注释掉（见 pid_alive）。
+# ★ 2026-09-12 恢复启用：现在由**农场巡检** `check_farm()` 用（起 build-farm.sh --verify）。
 import subprocess
 import sys
 import threading
@@ -71,8 +83,9 @@ sys.path.insert(0, str(ROOT))
 
 from orchestrator import state as S  # noqa: E402
 
-# 通知（可选）。Windows 侧只往 NAS 的 spool 写纯文本事件文件，零凭据；
+# 通知（可选）。只往 NAS 本机的 spool 写纯文本事件文件，零凭据；
 # 发信由 NAS 上的 notify-spool.sh 读 DSM 自己的 SMTP 配置完成（见 notify.py）。
+# ★ 电脑端退役前是"Windows 写进 NAS 的 spool"，现在跑批和 spool 同在 NAS 上。
 # ★ 用 try 包住：notify.py 缺失/损坏也不该让跑批起不来 —— 通知是附属功能。
 try:
     import notify as _notify  # noqa: E402
@@ -86,22 +99,21 @@ DEFAULT_DB = os.environ.get("RESEED_STATE_DB", str(ROOT / "hlink" / "state.db"))
 
 
 # --------------------------------------------------------------------------- #
-# cross-seed 的 compose 目录 —— 同一批文件，两种视角
+# cross-seed 的 compose 目录
 # --------------------------------------------------------------------------- #
-# 这个目录在哪台机器上看，写法不一样：
+# 在 NAS 本机（DSM 计划任务跑）： /volume2/docker_ssd/prowlarr_cross-seed_autohardlink
 #
-#   在 NAS 本机（DSM 计划任务跑）： /volume2/docker_ssd/prowlarr_cross-seed_autohardlink
-#   在 Windows（经 SMB 跑）：       //iSunker-DS423/docker_ssd/prowlarr_cross-seed_autohardlink
-#
-# ★ 顺序必须「NAS 原生优先」：
-#   在 NAS 上 UNC 写法虽然也能通（等于从本机绕一圈 SMB 连回自己），但慢、且
-#   依赖 SMB 服务；原生路径一定在。反过来在 Windows 上原生路径不存在，
-#   自动落到第二项 —— 于是同一份代码、同一条命令行两边都能跑，
-#   不需要维护两套参数（这正是 2026-09-11 把驱动搬到 NAS 时想要的：
-#   搬迁只是换个地方执行，不是分叉出第二个版本）。
+# ★★ 2026-09-12：**电脑端已退役**，UNC 兜底已注释掉（保留可查，别删注释）。
+#   留着的理由不是"以后可能还用" —— 是这段注释本身记着一个坑：2026-09-11 之前，
+#   同一份代码要在 Windows 和 NAS 两边都能跑，所以这里得有"NAS 原生优先、
+#   Windows 落 UNC"的顺序。现在只剩 NAS 一个执行环境，多一条候选路径
+#   就多一个「哪天 NAS 路径写错，它会**悄悄**绕回 SMB 连自己」的静默降级点 ——
+#   那种情况不会报错，只是变慢，属于最难查的一类。
+#   要回退：取消下面那行的注释即可（代码本身没错，是场景没了）。
 CROSSSEED_DIRS = (
     "/volume2/docker_ssd/prowlarr_cross-seed_autohardlink",
-    "//iSunker-DS423/docker_ssd/prowlarr_cross-seed_autohardlink",
+    # [电脑端已退役 2026-09-12] 原本是 Windows 经 SMB 跑时的兜底路径：
+    # "//iSunker-DS423/docker_ssd/prowlarr_cross-seed_autohardlink",
 )
 
 
@@ -172,11 +184,29 @@ def describe_notifier() -> str:
 # 反馈 → 下次间隔
 # --------------------------------------------------------------------------- #
 BASE_SLEEP = 60 * 45        # 站点健康时，批间最小间隔 45 分钟
-BACKOFF_SLEEP = 60 * 120     # 撞退避后，拉长到 2 小时
+BACKOFF_SLEEP = 60 * 120     # 站点在压我们 → 拉长到 2 小时
+SNOOZE_SLEEP = 60 * 90       # 中等退避 → 放缓到 1.5 小时
 ABORT_SLEEP = 60 * 180       # 提前中止（退避等太久），休整 3 小时
 
 MIN_SLEEP = 60 * 30          # 硬下限：任何情况批间隔不少于 30 分钟
 MAX_SLEEP = 60 * 240         # 硬上限：4 小时
+
+# ---- 退避分级的阈值（2026-09-12）------------------------------------------- #
+# `backoff_hits > 0` 只说明「见到过限流」，**不说明被耽误了多久**：实测的 429
+# 只 snooze 30~60 秒，站点转头就恢复，跟「站点持续压着我们」是两回事。
+# 一律罚 2 小时，等于把打喷嚏和重感冒当同一种病。所以按这批**实际等掉的时间**
+# （`waited_sec`）分档 —— 没真耽误我们的，就别惩罚。
+#
+#   waited < BACKOFF_SHORT_SEC          → 喷嚏，按基准 45 分钟
+#   BACKOFF_SHORT_SEC ≤ waited < BACKOFF_LONG_SEC → 放缓到 1.5 小时
+#   waited ≥ BACKOFF_LONG_SEC           → 站点确实在压，拉满 2 小时
+#
+# ★ 想回到「命中就 2 小时」的老行为：把两个阈值都设成 0 即可。
+# ★ 「等了 0 秒却记了一笔」是**故意**的：那一笔来自「窗口落在两次检查之间、
+#   我们压根没等」的限流 —— 它确实发生过，记进 backoff_hits 供观测，但既然
+#   没挡住我们，就不该改间隔。这正是本次分级的核心目的。
+BACKOFF_SHORT_SEC = 180.0    # 3 分钟
+BACKOFF_LONG_SEC = 600.0     # 10 分钟
 
 
 def clamp(s: float) -> float:
@@ -187,10 +217,20 @@ def next_sleep(stats: S.DriveStats) -> tuple[float, str]:
     """根据上一批的结果决定下次批间隔。返回 (秒, 原因)。"""
     if stats.aborted:
         return ABORT_SLEEP, f"提前中止：{stats.aborted}"
+    # ★ still_skipped 与 backoff_hits 性质不同，不参与分级：
+    #   前者是「真有片子没推进」（结果问题），后者只是「站点限过流」（过程噪声）。
     if stats.still_skipped > 0:
         return BACKOFF_SLEEP, f"仍有 {stats.still_skipped} 部被退避跳过"
     if stats.backoff_hits > 0:
-        return BACKOFF_SLEEP, f"本轮 {stats.backoff_hits} 次命中退避"
+        w = stats.waited_sec
+        if w >= BACKOFF_LONG_SEC:
+            return BACKOFF_SLEEP, (f"本轮 {stats.backoff_hits} 次退避、等了 "
+                                   f"{w / 60:.1f} 分钟，站点在限流")
+        if w >= BACKOFF_SHORT_SEC:
+            return SNOOZE_SLEEP, (f"本轮 {stats.backoff_hits} 次退避、等了 "
+                                  f"{w / 60:.1f} 分钟，放缓一档")
+        return BASE_SLEEP, (f"短暂退避 {stats.backoff_hits} 次（{w:.0f} 秒），"
+                            "站点已恢复，按基准")
     if stats.newly_seeding > 0:
         return BASE_SLEEP, f"新增做种 {stats.newly_seeding} 部，站点健康"
     # 一批发出去、既没退避也没新增 —— 站点正常但命中一般，按基准即可
@@ -337,7 +377,9 @@ def check_indexers(args) -> None:
                    "后果：这些站搜到的结果会被状态机**漏记** ——\n"
                    "  要么反复重搜（浪费站点额度），要么永远不重搜。而且**不报错**，只是数算错。\n\n"
                    f"修法：把 --indexers 改成  {','.join(named)}\n"
-                   "     （Windows 计划任务的 /TR 参数里也有一份，两处都要改）\n"),
+                   "     ★ 改 **<compose>/drive-loop/run.sh** 里那一行"
+                   "（--indexers HDFans,NanyangPT）——\n"
+                   "       电脑端已退役，没有第二处要改了。\n"),
              key=f"indexer-missing:{','.join(missing)}", metrics={"missing": len(missing)})
     if extra:
         LOG.warning("⚠ --indexers 列了 %s，但 cross-seed 根本不会搜 ——"
@@ -512,9 +554,314 @@ def read_key_from_env(env_path: Path) -> str | None:
     return None
 
 
+def env_value(env_path: Path, key: str) -> str:
+    """从 .env 取一个值；取不到（文件不在 / 没这个键）返回 ""。
+
+    ★ 用 `splitlines()` 而不是 `read_text().split("\\n")`：前者会把 CRLF 的
+      `\\r` 一并剥掉。`.env` 是 CRLF，而 shell 那边的 `sed` **不会**剥
+      —— §16.2.1.2 那个假漂移就是这么来的。Python 这边天然没这个坑，
+      但**前提是用对方法**：拿 `split("\\n")` 就会把 `\\r` 留在值里。
+    ★ 一律吞掉 OSError：这类"配置缺一项"不该让调用方炸。
+    """
+    try:
+        for ln in env_path.read_text(encoding="utf-8").splitlines():
+            if ln.startswith(key + "="):
+                return ln.split("=", 1)[1].strip()
+    except OSError:
+        pass
+    return ""
+
+
+def prowlarr_cfg(args) -> tuple[str, str]:
+    """从 --env 指的 .env 里取 (PROWLARR_URL, PROWLARR_API_KEY)。
+
+    ★ 凭据**只从文件读**，不提供命令行开关 —— 同 `read_key_from_env` 的理由：
+      避免 key 落进 shell 历史 / 进程表 / 聊天记录。
+    """
+    p = Path(getattr(args, "env", "") or "")
+    if not p.is_file():
+        return "", ""
+    return env_value(p, "PROWLARR_URL"), env_value(p, "PROWLARR_API_KEY")
+
+
 # --------------------------------------------------------------------------- #
 # 跑一轮（一个包的一批）
 # --------------------------------------------------------------------------- #
+# --------------------------------------------------------------------------- #
+# 收尾通知：每日台账（额度 §16.1 + 趋势 §16.3）+ 正在退避的即时告警
+#
+# ★ 为什么额度进**日报**而不是告警：额度是**慢性**问题（超了不会当场炸）。
+#   即时通道必须留给**急性**故障 —— 否则就是 README 警告过的
+#   「每 15 分钟一封骚扰 → 你去建过滤规则 → 连真告警一起过滤掉」（§16.1.3）。
+#   真正急的那条（站点**此刻**正在退避）单独走 alert，见下。
+#
+# ★ 来源 B（问 Prowlarr /api/v1/indexerstats）**2026-09-12 起接在这里了**。
+#   原先不接的理由是"字段名没拿真实响应核对过，不把没验证过的东西塞进每轮都跑的
+#   无人值守路径"。当天用真响应核对过，结构是：
+#       {"indexers":[{"indexerName":..., "numberOfQueries":..., ...}],
+#        "userAgents":[...], "hosts":[...]}
+#   —— 与 `S.prowlarr_indexer_stats` 的解析完全一致，理由不再成立。
+#   而且它现在多了一个**更重要的用途**：把「Prowlarr 里有、我们没在用」的站也摆出来，
+#   那是"有别的工具在用同一个 Prowlarr"的唯一信号（§16.6）。
+#   ★ 拿不到时**只写一句原因**，绝不编数（见 `attach_prowlarr_quota` 的保证）。
+# --------------------------------------------------------------------------- #
+DAILY_FILE = HERE / ".daily-report.state"
+
+
+def _daily_last() -> str:
+    try:
+        return json.loads(DAILY_FILE.read_text(encoding="utf-8")).get("last_day", "")
+    except Exception:                       # 文件不存在 / 坏了 —— 都当"还没发过"
+        return ""
+
+
+def _daily_set(day: str) -> None:
+    try:
+        tmp = DAILY_FILE.with_suffix(".state.tmp")
+        tmp.write_text(json.dumps({"last_day": day}), encoding="utf-8")
+        os.replace(tmp, DAILY_FILE)         # 原子替换，别让下一轮读到半个文件
+    except OSError:
+        LOG.debug("每日台账标记写不进去（不影响跑批）", exc_info=True)
+
+
+def alert_blocked_indexers(args, *, now: datetime | None = None) -> int:
+    """有站点**此刻正在**退避 → alert（即时）。返回发了几条。
+
+    ★ `now` 只为**可测**而存在（生产调用一律省略 → 用真实时钟）。
+      起因是 2026-09-12：自测里 fixture 的解禁时刻是写死的 `NOW + 1 小时`，
+      而这个函数内部读的是真实时钟 —— 于是自测**上午还过、11:00 一过必挂**，
+      变成一颗按钟点引爆的定时炸弹。把「此刻」变成入参，测试才能钉死时间。
+
+    ★ 判据是 `blocking_backoffs()`（状态非 OK **且解禁时间还没到**），
+      不是 `snoozed_indexers()`（只要见过限流）。差别很要命：cross-seed 的
+      `status` 列**不会自动清**回 OK —— 实测 HDFans 的 `retry_after` 早就过期了、
+      状态还挂着 `RATE_LIMITED`。只看"见过限流"的话，每隔一个冷却期就会为
+      **同一件早就过去的事**再喊一次，喊到人不再看它 —— 那正好毁掉告警通道。
+    """
+    if not getattr(args, "db_path", None):
+        return 0
+    try:
+        blocked = S.blocking_backoffs(S.read_indexer_backoff(args.db_path), now)
+    except Exception:                       # 读不到就当没这回事；通知是附属功能
+        LOG.debug("读退避状态失败，跳过站点告警", exc_info=True)
+        return 0
+    n = 0
+    for b in blocked:
+        until = b.until.strftime("%m-%d %H:%M") if b.until else "未知"
+        if emit("alert", f"站点退避中：{b.name}",
+                body=(f"{b.name} 此刻在退避（{b.status}），解禁 {until}。\n"
+                      "发给它的搜索会被跳过 —— drive-loop 自己会等它解禁，"
+                      "**不需要手动处理**。\n"
+                      "但如果**连续几天**都在退避，说明我们搜得太勤："
+                      "把周期调大（--cadence-days），或者考虑换站。"),
+                key=f"indexer-blocked:{b.name}",
+                metrics={"indexer": b.name, "status": b.status}):
+            n += 1
+    if n:
+        LOG.info("已投递 %d 条「站点正在退避」告警", n)
+    return n
+
+
+def report_daily(args, *, force: bool = False, farm_note: str = "") -> bool:
+    """每天最多投一次的台账：额度（来源 A+C）+ 新增做种趋势。
+
+    ★ 为什么必须自己记「今天发过没有」：notify 的**冷却只对 alert 生效**
+      （`batch`/`info` 走 `.get(kind, "info")` → level=info，`_cooled` 根本不查）。
+      也就是说同一个 batch 事件，**每一批都会真的写一个新文件进 spool**
+      —— 45 分钟一批就是一天 30 多条。日报不能靠 notify 去重，得自己记。
+    """
+    today = datetime.now().strftime("%Y-%m-%d")
+    if not force and _daily_last() == today:
+        return False
+
+    parts: list[str] = []
+    if getattr(args, "db_path", None):
+        try:
+            lines = S.quota_snapshot(args.db_path)
+            pl_url, pl_key = prowlarr_cfg(args)
+            if pl_url and pl_key:
+                S.attach_prowlarr_quota(lines, pl_url, pl_key, timeout=8)
+                parts.append(S.render_quota(lines, limit=8))
+            else:
+                parts.append(S.render_quota(lines, limit=8))
+                miss = "PROWLARR_URL" if not pl_url else "PROWLARR_API_KEY"
+                parts.append(f"（来源 B 互校：没配 {miss}，跳过 —— 见 SUMMARY §16.1.4）")
+        except Exception as e:              # noqa: BLE001 —— 一节坏了不该拖垮整份日报
+            parts.append(f"站点额度台账：读不到（{type(e).__name__}: {e}）")
+    else:
+        parts.append("站点额度台账：跳过（没有 --db-path / 找不到 cross-seed.db）")
+
+    try:
+        with S.StateStore(args.db) as st:
+            parts.append(st.trend(weeks=4).render())
+    except Exception as e:                  # noqa: BLE001
+        parts.append(f"新增做种趋势：算不出（{type(e).__name__}: {e}）")
+
+    # 农场巡检那一行摘要（§16.2.2 任务 6）。★ 它**不是**可有可无的装饰：
+    #   巡检每天才跑一次，而 `batch` 级通知是**每批都真的投一条**（见本函数开头的说明），
+    #   所以「巡检还活着」这个心跳只能由日报带出来 —— 否则巡检哪天静默不跑了，
+    #   从外面看与「一直没漂移」完全一样。这正是 §16.2 要防的那种坏法。
+    if farm_note:
+        parts.append(farm_note)
+
+    body = "\n\n".join(parts)
+    if emit("batch", "每日台账", body=body, key="daily",
+            metrics={"day": today}):
+        _daily_set(today)
+        LOG.info("已投递每日台账（额度 + 趋势）")
+        return True
+    return False
+
+
+# --------------------------------------------------------------------------- #
+# 农场巡检：把 `build-farm.sh --verify` 挂上来（SUMMARY §16.2.2 —— 任务 6）
+# --------------------------------------------------------------------------- #
+# 要解决的问题：农场（v3 硬链接）与它的那 49 条源之间会**慢慢漂移** ——
+# 源里新增了片子、或者片子在源里被删/改名。漂移了不报错，只会安静地变坏：
+#   源有农场无 → cross-seed 看不见这部，白等一轮；
+#   农场有源无 → 农场那条还在，cross-seed **照样拿去搜 = 白烧站点额度**。
+# 原先靠人工偶尔跑一次 `--verify`，所以漂移能存在很久没人知道。
+#
+# 四条约束（照 §16.2.2 抄；有改动的地方在注释里说明）：
+#   1. `--verify` 有漂移 → **退出码 1**。这是 2026-09-12 09:52 才补上的：
+#      在那之前它只打印计数、恒返回 0 —— 挂上去也**永远不会报警**，
+#      那才是真正的前置条件（不是"没时间挂"）。
+#   2. 有漂移 → `alert`（**即时**）。这是要人去处理的事，不能埋进日报里。
+#   3. 零漂移 → **不出告警**，只留一行摘要由每日台账带出去，兼作"巡检还活着"的心跳。
+#   4. ★★ **绝不自动 `--prune`**：prune 判「源没了」的依据正是那份期望集，
+#      拿它自动删 = 把一次误判放大成**不可逆**的数据丢失。**只报告，删不删由人定。**
+#      —— 这条有测试盯着（断言 argv 里永远不出现 --prune）。
+#
+# ★ 一处比 §16.2.2 更严的地方：**脚本本身跑不起来也算故障**，照样 alert。
+#   退出码既不是 0 也不是 1，说明"根本没查成"。不这么判的话，"巡检静默地没在跑"
+#   和"真的没漂移"从外面看一模一样 —— 那正是 §16.2 开头说的
+#   「分不清'真的没漂移'和'还是没在检查'」，比不做校验更坏，因为它给的是**虚假的安心**。
+FARM_CHECK_FILE = HERE / ".farm-check.state"
+FARM_CHECK_MIN_GAP_SEC = 20 * 3600      # 约一天一次（用时间戳差值，绕开"跨天/时区"边界）
+# 超时按**实测**给余量，不是拍脑袋：2026-09-12 在 NAS 上量到 `--verify` **4 秒**
+# （475 条，本地 stat + 列 49 个目录；全是本机 I/O，没有网络往返）。
+# 120 秒 = 30 倍余量 —— 日常远够，真卡死时又能及时收手去发告警。
+# ★ 别为了"保险"把它调得很大：这个值同时也是**判据** —— 超时会被当成
+#   「巡检跑不起来」而发 alert。调太大，等于把一次真故障从告警变成静默等待。
+FARM_CHECK_TIMEOUT_SEC = 120
+
+
+def _farm_check_read() -> dict:
+    try:
+        d = json.loads(FARM_CHECK_FILE.read_text(encoding="utf-8"))
+    except Exception:                       # 文件不存在 / 坏了 —— 都当"还没查过"
+        return {}
+    return d if isinstance(d, dict) else {}
+
+
+def _farm_check_write(note: str, *, now: float) -> None:
+    try:
+        tmp = FARM_CHECK_FILE.with_suffix(".state.tmp")
+        tmp.write_text(json.dumps({"ts": now, "note": note}), encoding="utf-8")
+        os.replace(tmp, FARM_CHECK_FILE)    # 原子替换，别让下一轮读到半个文件
+    except OSError:
+        LOG.debug("农场巡检标记写不进去（不影响跑批）", exc_info=True)
+
+
+def _run_verify(argv: list[str]) -> tuple[int, str]:
+    """真跑一次 `build-farm.sh --verify`。返回 (退出码, 输出)。
+
+    ★ 超时兜底是**必须**的：这一步挂在批次收尾里，而收尾后面还有个 finally
+      要落状态（跑了哪个包、下批间隔）。子进程真卡住时，宁可报一条"超时"，
+      也不能让状态写不回去 —— 写不回去会让下一轮的闸门算错。
+    ★ 用 PIPE 收 stdout+stderr：漂移明细只出现在 stdout，而 die() 走 stderr，
+      两条都得看得到（合并成一条流，顺序也保住了）。
+    """
+    try:
+        p = subprocess.run(
+            argv, cwd=str(Path(argv[1]).parent),
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            timeout=FARM_CHECK_TIMEOUT_SEC,
+            # ★ 显式传 COMPOSE_DIR：脚本里的默认值是写死的 NAS 绝对路径，
+            #   这里用脚本自己所在的目录覆盖掉它 —— 以后装到别处也不用改脚本。
+            env={**os.environ, "COMPOSE_DIR": str(Path(argv[1]).parent)},
+        )
+        return p.returncode, p.stdout.decode("utf-8", "replace")
+    except subprocess.TimeoutExpired:
+        return 124, f"build-farm.sh --verify 超时（> {FARM_CHECK_TIMEOUT_SEC} 秒）"
+    except OSError as e:                    # sh 不在 / 脚本没执行权限 / 路径坏了
+        return 127, f"起不了 build-farm.sh：{type(e).__name__}: {e}"
+
+
+def check_farm(*, force: bool = False, now: float | None = None,
+               runner=None) -> str:
+    """跑一次农场巡检，返回一行摘要（由每日台账引用）。返回 "" = 库里没记录。
+
+    间隔没到就直接返回**缓存的那一行**（默认 20 小时一次）—— 这样日报里
+    永远有一句农场的话，而巡检本身不用每批都跑。
+
+    ★ `now` / `runner` 只为**可测**而存在（生产调用一律省略）。
+      —— 与 `alert_blocked_indexers(now=...)` 同一个理由：测试要能钉死时间、
+      要能打桩子进程。否则这段代码只能靠"真跑一次 NAS"来验证。
+    """
+    now = time.time() if now is None else now
+    cached = _farm_check_read()
+    if not force and cached.get("ts") and \
+            now - float(cached["ts"]) < FARM_CHECK_MIN_GAP_SEC:
+        return str(cached.get("note") or "")
+
+    script = first_existing("build-farm.sh")
+    if not script:
+        note = "农场巡检：跳过（compose 目录里找不到 build-farm.sh）"
+        LOG.warning("%s", note)
+        _farm_check_write(note, now=now)
+        return note
+
+    argv = ["sh", script, "--verify"]       # ★ 只有 --verify；永远不加 --prune
+    rc, out = (runner or _run_verify)(argv)
+    out = (out or "").strip()
+
+    if rc == 0:
+        note = "农场巡检：无漂移"
+        LOG.info("%s", note)
+    else:
+        tail = "\n".join(out.splitlines()[-40:]) if out else "(无输出)"
+        if rc == 1:
+            note = "农场巡检：**有漂移**（已发告警，处理与否由你定）"
+            title = "农场巡检：有漂移"
+            head = ("农场（硬链接）与它的源对不上了。**只报告、不动手** —— "
+                    "脚本从不自动删，`--prune` 跑不跑由你定。\n"
+                    "· 补新建项：`sh build-farm.sh --apply`\n"
+                    "· 删孤儿项：**确认源真的没了**再 `sh build-farm.sh --apply --prune`\n"
+                    "★ 判「源没了」的依据就是同一份期望集，误判一次即不可逆，"
+                    "所以这一步**故意**留给人。\n")
+            key = "farm-drift"
+        else:
+            note = f"农场巡检：**跑不起来**（退出码 {rc}）—— 已发告警"
+            title = "农场巡检跑不起来"
+            head = ("这**不是**「没有漂移」，而是「根本没查成」 —— 退出码既不是 "
+                    "0（无漂移）也不是 1（有漂移）。修好之前，农场有没有漂移"
+                    "**无人知道**，别把它当成「一切正常」。\n")
+            key = "farm-check-broken"
+        LOG.warning("%s（退出码 %d）", note, rc)
+        emit("alert", title, body=head + "\n---- 输出末尾 ----\n" + tail,
+             key=key, metrics={"rc": rc})
+
+    _farm_check_write(note, now=now)
+    return note
+
+
+def after_batch_reports(args) -> None:
+    """跑批收尾的通知 + 农场巡检。
+
+    ★ 外面再包一层 try —— 这些全是**附属功能**，任何一件出事都不该让整批算失败。
+      （emit 自己已经吞异常了，但 `report_daily` 里还有读库/算趋势这些代码，
+      `check_farm` 还要起子进程。）
+    ★ 顺序：巡检**在日报之前**跑，好把它那一行摘要塞进本次日报里。
+    """
+    try:
+        alert_blocked_indexers(args)
+        farm_note = check_farm()
+        report_daily(args, farm_note=farm_note)
+    except Exception:                       # noqa: BLE001
+        LOG.debug("收尾通知失败（不影响跑批）", exc_info=True)
+
+
 def run_round(pack: str, args, api_key: str) -> S.DriveStats | None:
     """对指定包跑一批 drive + 回灌。返回 DriveStats；无待搜 / 出错返回 None。
 
@@ -577,6 +924,7 @@ def run_round(pack: str, args, api_key: str) -> S.DriveStats | None:
         crossseed_db=args.db_path,
         interval=args.interval,
         check_every=args.check_every,
+        check_secs=args.backoff_check_secs,
         max_wait=args.max_wait,
         timeout=args.timeout,
         pause_on_backoff=not args.no_pause_on_backoff,
@@ -636,6 +984,9 @@ def run_round(pack: str, args, api_key: str) -> S.DriveStats | None:
                   "newly_seeding": stats.newly_seeding,
                   "still_skipped": stats.still_skipped,
                   "backoff_hits": stats.backoff_hits})
+    # 每天一次的台账（额度 + 趋势）+「有站点此刻在退避」的即时告警。
+    # ★ 放在批次自己的 batch 事件**之后** —— 台账要反映刚回灌完的最新状态。
+    after_batch_reports(args)
     return stats
 
 
@@ -678,7 +1029,8 @@ class Heartbeat:
     """后台心跳线程：批次运行期间每 `period` 秒刷一次状态文件。
 
     ★ 为什么不能只靠 PID 判断"上一批还在不在"
-      Windows 会**复用 PID**。批次被强杀后状态文件里留着 running_pid，
+      **PID 会被复用**（Windows 上尤其容易撞到，Linux 内核的 pid_max 也会绕回）。
+      批次被强杀后状态文件里留着 running_pid，
       若那个号恰好被别的进程占用，pid_alive() 会永远返回 True
       —— 于是每次唤醒都判"上一批还在跑"，**静默永久停工**。
       这正是无人值守最怕的失败模式：不报错，只是不动。
@@ -719,22 +1071,29 @@ class Heartbeat:
 
 
 def pid_alive(pid) -> bool:
-    """判断 pid 是否还在跑。Windows 上用 tasklist（os.kill(pid,0) 在 Windows 会杀进程！）。"""
+    """判断 pid 是否还在跑。
+
+    ★ 原本这里为 Windows 分了一支（`os.kill(pid, 0)` 在 Windows 上**会真的
+      把进程杀掉**，只能改用 `tasklist`）。电脑端退役后那支用不上了，
+      注释保留在下面 —— 它记的是一个**反直觉的坑**：POSIX 上"发 0 号信号
+      探测存活"是标准做法，搬到 Windows 上就变成"探测即击杀"。
+    """
     if not pid:
         return False
     try:
         pid = int(pid)
     except (TypeError, ValueError):
         return False
-    if os.name == "nt":
-        try:
-            out = subprocess.run(
-                ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
-                capture_output=True, text=True, errors="replace", timeout=15,
-            ).stdout
-            return str(pid) in (out or "")
-        except Exception:  # noqa: BLE001
-            return False
+    # [电脑端已退役 2026-09-12] Windows 专用的 tasklist 分支，现只剩 NAS(Linux) 一个环境：
+    # if os.name == "nt":
+    #     try:
+    #         out = subprocess.run(
+    #             ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+    #             capture_output=True, text=True, errors="replace", timeout=15,
+    #         ).stdout
+    #         return str(pid) in (out or "")
+    #     except Exception:  # noqa: BLE001
+    #         return False
     try:
         os.kill(pid, 0)
         return True
@@ -747,7 +1106,7 @@ def pid_alive(pid) -> bool:
 def batch_alive(st: dict) -> bool:
     """上一批是否**真的**还在跑：PID 存活 **且** 心跳新鲜。
 
-    只看 PID 会被 Windows 的 PID 复用骗到（详见 Heartbeat 的说明）——
+    只看 PID 会被 PID 复用骗到（详见 Heartbeat 的说明）——
     那会导致"永远判在跑 → 静默停工"。
     """
     pid = st.get("running_pid")
@@ -775,10 +1134,17 @@ def batch_alive(st: dict) -> bool:
     return False
 
 
-def log_result(pack: str, stats: S.DriveStats | None) -> None:
+def log_result(pack: str, stats: S.DriveStats | None) -> float | None:
+    """把本批结果写进日志，并**返回算出的下批间隔**（交给 once_round 落盘）。
+
+    ★ 返回值这一环是 2026-09-12 补的：在那之前 `next_sleep()` 的结论只进日志、
+      不落任何地方，于是 `--once` 模式下真正的闸门是写死的 `min_sleep`，
+      「站点在限流就缓一缓」这条策略**压根没接线**。现在把它交出去。
+      返回 None = 本批没动作（没待搜 / 计划为空），调用方按「无退避证据」处理。
+    """
     if stats is None:
         LOG.info("[%s] 本批无动作（没待搜或计划为空）", pack)
-        return
+        return None
     sleep_sec, reason = next_sleep(stats)
     LOG.info("[%s] %s | 原因：%s | 下次间隔 %.0f 分钟", pack,
              stats.render().splitlines()[0], reason, sleep_sec / 60)
@@ -787,24 +1153,48 @@ def log_result(pack: str, stats: S.DriveStats | None) -> None:
     if stats.still_skipped:
         LOG.warning("  → 仍有 %d 部被退避（站点侧 502/限流？见 SUMMARY §6.5）",
                     stats.still_skipped)
+    return sleep_sec
 
 
 def once_round(packs: list[str], args, api_key: str, min_sleep: float) -> int:
     """`--once` 单批模式：跨进程节流（防计划任务唤醒重叠）+ 包轮换持久化。
 
     - 上一批还在跑（pid 活着）→ 直接退出
-    - 距上次批次结束不足 min_sleep → 直接退出（防猛打）
-    - 否则跑「轮到的那个包」一批，并把 {结束时间, 包序号} 写回状态文件
+    - 距上次批次结束不足 **闸门** 秒 → 直接退出（防猛打）
+    - 否则跑「轮到的那个包」一批，并把 {结束时间, 包序号, 下批间隔} 写回状态文件
+
+    ★ 闸门 = max(min_sleep, 上一批算出的间隔)。上一批撞了退避 → `next_sleep()`
+      给 1.5~2 小时，这里就真的会等那么久；站点健康 → 45 分钟，但不短于
+      `min_sleep`（默认 30 分钟）。2026-09-12 之前这里**只有** min_sleep 一项，
+      `next_sleep()` 的结论不落盘、也就没人用 —— 退避分级形同虚设。
     """
     st = read_state()
     if batch_alive(st):
         LOG.info("上一批（pid %s）仍在运行，跳过本轮", st.get("running_pid"))
         return 0
     last_end = float(st.get("last_end_ts") or 0)
+    last_sleep = float(st.get("last_sleep_sec") or 0)
+    wait = clamp(max(min_sleep, last_sleep))
     gap = time.time() - last_end
-    if last_end and gap < min_sleep:
-        LOG.info("距上次批次结束仅 %.1f 分钟（< %.0f 分钟），跳过本轮",
-                 gap / 60, min_sleep / 60)
+    if last_end and gap < wait:
+        # ★ 2026-09-12 改判据。原先这里是 `if wait > min_sleep:` → 一律打印
+        #   「上一批报告站点在退避」——**在完全正常的健康档也成立**，因为健康档
+        #   BASE_SLEEP(45 分钟) 本就大于 min_sleep(30 分钟)。实测 NAS 上 09-12
+        #   10:00/10:15/10:30/11:15 四次跳过全是 45 分钟健康档，却全报「在退避」，
+        #   而**同一批**上面那行刚说过「无退避、无新增（正常）」—— 一个批次的两行
+        #   日志自相矛盾。这不是行为错（闸门确实按 45 分钟挡住了），是文案在
+        #   **断言一个没有依据的原因**；下次真出限流时，这行会把人往错的方向带。
+        #   真退避档只可能是 SNOOZE(90)/BACKOFF(120)/ABORT(180)，都**严格大于**
+        #   BASE_SLEEP，所以判据要用「last_sleep 超过了健康档」而不是「超过了硬下限」。
+        if last_sleep > BASE_SLEEP:
+            why = "上一批报告站点在退避"
+        elif min_sleep > last_sleep:
+            # last_sleep 还没记录（0）或被 --min-sleep 抬到了更大 —— 此时是下限在管
+            why = "按 --min-sleep 下限"
+        else:
+            why = "按上一批算出的批间隔"
+        LOG.info("距上次批次结束仅 %.1f 分钟（< %.0f 分钟：%s），跳过本轮",
+                 gap / 60, wait / 60, why)
         return 0
 
     idx = (int(st.get("last_pack_idx", -1)) + 1) % len(packs)
@@ -813,16 +1203,24 @@ def once_round(packs: list[str], args, api_key: str, min_sleep: float) -> int:
     LOG.info("[--once] 跑包 %s（第 %d/%d 个）", pack, idx + 1, len(packs))
 
     stats = None
+    sleep_sec = None      # 本批算出的下批间隔；没跑成 / 无动作 → None（按无退避证据）
     rc = 0
     failed = False
     try:
         # 心跳线程只包住跑批阶段：跑完就停，免得和下面 finally 写状态打架
         with Heartbeat():
             stats = run_round(pack, args, api_key)
-        log_result(pack, stats)
+        sleep_sec = log_result(pack, stats)
         if stats is None:
             # 这个包没待搜 —— 看看是不是所有包都干完了（无人值守时必须出声）
             alert_if_all_done(packs, args.db)
+            # ★ 农场巡检**不能只挂在「批次跑完了」那条路上**：它在
+            #   after_batch_reports 里，而 run_round 没待搜时会**提前 return None**，
+            #   根本走不到那里。于是"所有包都搜完了"的那几天，巡检会**跟着一起停**
+            #   —— 而那恰恰是最该跑的时候：没在搜索不等于农场没漂移，
+            #   只等于**没人看了**。等哪天真要搜了，漂移已经攒了几天。
+            #   它自己有 20 小时间隔兜着，所以这里多调一次几乎总是空转（只读一个状态文件）。
+            check_farm()
     except Exception:  # noqa: BLE001 —— 单批异常也要正确收尾状态
         LOG.exception("[%s] 本批异常", pack)
         failed, rc = True, 1
@@ -837,8 +1235,14 @@ def once_round(packs: list[str], args, api_key: str, min_sleep: float) -> int:
     finally:
         # 连续失败计数跨进程持久化（无人值守下没人盯着，只能靠日志喊）
         streak = update_abort_streak(int(st.get("consec_abort") or 0), stats, failed=failed)
+        # ★ last_sleep_sec 必须落盘 —— 下一轮的闸门读它（见 once_round 开头）。
+        #   sleep_sec 为 None（没跑成 / 本包无待搜）时写 0，即「没有退避证据」，
+        #   闸门退回 min_sleep 下限。
+        #   注意这个 write_state 是**整体覆盖**、不合并 st（这是刻意的：顺便把
+        #   heartbeat_ts 清掉，否则残留的心跳会让下一轮误判「上一批还在跑」）。
         write_state({"running_pid": None, "last_end_ts": time.time(),
-                     "last_pack_idx": idx, "consec_abort": streak})
+                     "last_pack_idx": idx, "consec_abort": streak,
+                     "last_sleep_sec": clamp(sleep_sec) if sleep_sec else 0.0})
     LOG.info("--once 完成。")
     return rc
 
@@ -866,6 +1270,10 @@ def main() -> int:
     ap.add_argument("--limit", type=int, default=50)
     ap.add_argument("--interval", type=float, default=30.0)
     ap.add_argument("--check-every", type=int, default=10)
+    ap.add_argument("--backoff-check-secs", type=float, default=60.0,
+                    help="★除了每 --check-every 条，再按秒数检查索引器退避，默认 60。"
+                         "实测 429 只 snooze 55 秒，而 10 条×30s=300s 才看一眼 —— "
+                         "窗口整段落在两次检查之间，退避就等于没发生（backoff_hits 恒 0）")
     ap.add_argument("--max-wait", type=float, default=1800.0)
     ap.add_argument("--no-pause-on-backoff", action="store_true")
     ap.add_argument("--settle", type=float, default=90.0)
@@ -968,7 +1376,7 @@ def main() -> int:
     # 批次之间的最小间隔（常驻模式用它 sleep；--once 模式用它拦掉过密的唤醒）
     min_sleep = args.min_sleep or MIN_SLEEP
 
-    # --once：单批模式（配合 Windows 计划任务）。跨进程节流 + 包轮换见 once_round()。
+    # --once：单批模式（配合 DSM 计划任务）。跨进程节流 + 包轮换见 once_round()。
     if args.once and not args.dry_run:
         return once_round(packs, args, api_key, min_sleep)
 

@@ -57,14 +57,17 @@ LOG = logging.getLogger("notify")
 #: 事件文件的扩展名。NAS 侧脚本只认这个，避免误读别的东西。
 SUFFIX = ".txt"
 
-#: spool 的候选位置，按顺序取第一个**已存在**的。
-#: ★ 与 drive-loop.py 的 CROSSSEED_DIRS 同一个道理、同一个顺序：NAS 原生优先。
-#:   drive-loop 跑在 NAS 上时直接写本机路径（不绕 SMB 自连）；
-#:   跑在 Windows 上才落到 UNC。两边指向**同一个目录**，
-#:   所以 NAS 侧的 notify-spool.sh 看到的是同一批文件、同一份归档。
+#: spool 的位置。
+#: ★★ 2026-09-12：**电脑端已退役**，UNC 兜底注释掉了。原先这里是"候选列表 +
+#:   取第一个已存在的"（和 drive-loop.py 的 CROSSSEED_DIRS 同一个道理）——
+#:   因为当时 drive-loop 可能跑在 Windows 上，也可能跑在 NAS 上。
+#:   现在两边都在 NAS 上，多一条候选只会多一个"写进 UNC = 绕一圈 SMB 连自己"
+#:   的静默降级点：不报错，只是慢。
+#:   要回退：取消下面那行的注释即可。
 SPOOL_CANDIDATES = (
     "/volume2/docker_ssd/prowlarr_cross-seed_autohardlink/notify/spool",
-    "//iSunker-DS423/docker_ssd/prowlarr_cross-seed_autohardlink/notify/spool",
+    # [电脑端已退役 2026-09-12] 原本是 Windows 跑批时的兜底路径：
+    # "//iSunker-DS423/docker_ssd/prowlarr_cross-seed_autohardlink/notify/spool",
 )
 
 #: 兜底（一个都不存在时用这个）。保留旧名字 —— 文档/脚本里有引用。

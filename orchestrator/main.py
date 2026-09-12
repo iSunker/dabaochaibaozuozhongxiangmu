@@ -4,13 +4,20 @@
   preflight  只读预检：配置合法性、各任务同卷/单片枚举、qB 与 cross-seed 连通性。
   run        对启用的任务执行匹配→注入→等待→汇报（--job 只跑一个，--dry-run 不触发）。
   status     连 :3060，按分类列出当前单种的做种状态汇总。
+  state      只读：从 sidecar 状态库读「登记了多少部 / 各阶段多少 / 还有多少待搜」。
   prestage   可选：把某任务的大包整体硬链接到 linkDir（参考脚本的加固版）。
 
 用法（容器内默认读 /config/config.yml，可用 --config 或环境变量 RESEED_CONFIG 覆盖）：
   python -m orchestrator.main preflight
   python -m orchestrator.main run --job frds-top250-2024
   python -m orchestrator.main status
+  python -m orchestrator.main state --pack frds-top250-2024
   python -m orchestrator.main prestage --job frds-top250-2024 --dry-run
+
+★ `status` 与 `state` 是**两件不同的事**，名字像但不是一回事，别混：
+    status ← qBittorrent 的**当下快照**（此刻这个分类里有多少种在做种）
+    state  ← 我们自己的 **sidecar 状态库**（哪些片搜过、匹配到没、还欠多少）
+  对不上是**正常且有意义**的：状态机说"没做种"而 qB 里在做种，正是 §17.5.1 那类 bug 的症状。
 """
 from __future__ import annotations
 
@@ -18,14 +25,19 @@ import argparse
 import logging
 import os
 import sys
+from pathlib import Path
 
 from . import hardlink, safety
+from . import state as S
 from .config import AppConfig, ConfigError, JobConfig, load_config
 from .crossseed_client import CrossSeedClient, CrossSeedError
 from .matcher import MatchRun, build_matcher
 from .qbit_client import QbitClient, QbitError, classify
 
 DEFAULT_CONFIG = os.environ.get("RESEED_CONFIG", "/config/config.yml")
+# ★ 状态库的默认落点与 config.yml **同目录**（compose 里 `./hlink:/config`）。
+#   可用 --db 或环境变量 RESEED_STATE_DB 覆盖。
+DEFAULT_STATE_DB = os.environ.get("RESEED_STATE_DB", "/config/state.db")
 log = logging.getLogger("reseed")
 
 
@@ -152,6 +164,75 @@ def cmd_status(cfg: AppConfig, category: str | None) -> int:
     return 0
 
 
+def cmd_state(pack: str | None, db: str, indexers: str | None, include_cooldown: bool,
+              cadence_days: int, cadence: str | None, want_trend: bool,
+              verbose: bool) -> int:
+    """只读汇报 sidecar 状态库。与 `status`（qB 快照）**无关**，见模块 docstring。"""
+    # ★★★ 先判存在，再开库 —— 这一步**不能省**。
+    #   `StateStore.__init__` 会 `mkdir(parents=True)` 再 `sqlite3.connect()`，
+    #   而 sqlite 连一个不存在的路径**不会报错，会凭空建一个 0 字节的库**。
+    #   实测踩过：打错一层路径，就在**媒体目录**里留下了一个空的 state.db，
+    #   而它看起来"命令跑成功了"。只读命令**绝不能**有这种副作用。
+    if not Path(db).is_file():
+        print(f"[错误] 状态库不存在: {db}")
+        print("       本命令**只读**，不会替你建一个空库（空库会伪装成「一部都没登记」）。")
+        print("       库的真实位置由 drive-loop 的运行目录决定，常见的是：")
+        print("         <compose>/drive-loop/hlink/state.db")
+        print("       ★ 注意 compose 里 `./hlink:/config` 挂的是 <compose>/hlink，")
+        print("         那是**编排器自己的配置目录**，里面只有 config.yml、没有状态库 ——")
+        print("         所以**容器内默认的 /config/state.db 是不存在的**（要挂载才看得到）。")
+        print("       在 NAS 上直接跑时，用：--db ../drive-loop/hlink/state.db")
+        return 2
+
+    idx = [s.strip() for s in indexers.split(",") if s.strip()] if indexers else None
+    meanings = {
+        S.STAGE_SEEDING: "已在 qB 里（终点）",
+        S.STAGE_MATCHED: "匹配到单种，等 qB 确认",
+        S.STAGE_UNMATCHED: "真搜过，但没匹配到",
+        S.STAGE_SKIPPED: "★被退避跳过 —— 必须重搜",
+        S.STAGE_PENDING: "还没搜过",
+        S.STAGE_ERROR: "异常",
+    }
+    cad_by_idx = S.parse_cadence(cadence)
+
+    with S.StateStore(db) as st:
+        if pack:
+            rows = [st.pack(pack)]
+            if rows[0] is None:
+                print(f"[错误] 未登记的包: {pack}（先 reseed-state.py init）")
+                return 2
+        else:
+            rows = st.packs()
+            if not rows:
+                print("状态库里一个包都没有（先 reseed-state.py init）")
+                return 0
+
+        for p in rows:
+            name = p["name"]
+            sm = st.summary(name)
+            print(f"=== 包 {name} ===")
+            print(f"    源目录: {p['root']}")
+            print(f"    登记 {sm['TOTAL']} 部")
+            for k in S.ALL_STAGES:
+                print(f"    {k:<13} {sm[k]:>5}   {meanings[k]}")
+
+            pairs = st.todo_detail(name, indexers_now=idx,
+                                  include_cooldown=include_cooldown,
+                                  cadence_days=cadence_days,
+                                  cadence_by_indexer=cad_by_idx)
+            print(f"    → 待搜索: {len(pairs)} 部"
+                  f"（周期 每站 {cadence_days} 天）")
+            if verbose:
+                for r, due in pairs:
+                    print(f"       [{r['stage']:<10}] 该搜: {','.join(due) or '-':<18}"
+                          f" {r['dir_name']}")
+
+        if want_trend:
+            print()
+            print(st.trend(weeks=8).render())
+    return 0
+
+
 def cmd_prestage(cfg: AppConfig, job_name: str | None, dry_run: bool) -> int:
     jobs = [cfg.job(job_name)] if job_name else cfg.enabled_jobs()
     rc = 0
@@ -179,8 +260,24 @@ def build_parser() -> argparse.ArgumentParser:
     pr.add_argument("--job", help="只运行指定任务（默认全部启用的）")
     pr.add_argument("--dry-run", action="store_true", help="只枚举/汇报，不触发搜索与注入")
 
-    ps = sub.add_parser("status", help="按分类汇总做种状态")
+    ps = sub.add_parser("status", help="按分类汇总做种状态（连 qB，看当下快照）")
     ps.add_argument("--category", help="覆盖默认分类")
+
+    pst = sub.add_parser("state", help="只读汇报 sidecar 状态库（不连网、不读 config.yml）")
+    pst.add_argument("--pack", help="只看这一个包（默认列出全部）")
+    pst.add_argument("--db", default=DEFAULT_STATE_DB,
+                     help=f"sidecar 状态库路径（默认 {DEFAULT_STATE_DB}）")
+    pst.add_argument("--indexers", help="当前生效的索引器名，逗号分隔（覆盖库里的推断）")
+    pst.add_argument("--include-cooldown", action="store_true",
+                     help="把还在周期内的也算作待搜")
+    pst.add_argument("--cadence-days", type=int, default=S.DEFAULT_CADENCE_DAYS,
+                     help=f"每站的搜索周期天数（默认 {S.DEFAULT_CADENCE_DAYS}）")
+    pst.add_argument("--cadence", help="按站覆盖周期，如 'SiteA=7,SiteB=30'")
+    pst.add_argument("--trend", action="store_true", help="附上新增做种趋势（§16.3）")
+    # ★ 用 --detail 而不是 -v/--verbose：顶层已经有一个 -v 了，子解析器再定义一个同名
+    #   会把顶层那个**覆盖成默认值** —— `main -v state` 就会静默丢掉 -v。
+    #   两个同名参数谁生效取决于写法，是那种"看起来能跑、偶尔不灵"的坑，直接换名。
+    pst.add_argument("--detail", action="store_true", help="逐部列出待搜清单")
 
     pp = sub.add_parser("prestage", help="可选：把大包整体硬链接到 linkDir")
     pp.add_argument("--job", help="只处理指定任务")
@@ -191,6 +288,13 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     setup_logging(args.verbose)
+
+    # ★ `state` 在**读配置之前**分派：它只读本地那个 sidecar 库，既不连网也不碰 config.yml，
+    #   没理由因为"配置文件坏了/不在"就跑不了 —— 出故障时恰恰最需要它还能用。
+    if args.cmd == "state":
+        return cmd_state(args.pack, args.db, args.indexers, args.include_cooldown,
+                         args.cadence_days, args.cadence, args.trend, args.detail)
+
     try:
         cfg = load_config(args.config)
     except ConfigError as e:

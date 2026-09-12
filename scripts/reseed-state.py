@@ -30,7 +30,7 @@ DEFAULT_CADENCE_DAYS 注释里的取舍理由）：cross-seed 的 `timestamp` �
 
     # 4) 导出"该搜但没搜"的清单
     python scripts/reseed-state.py todo --pack frds-top250-2024 \\
-        --indexers SiteA,SiteB --out scripts/todo.txt
+        --indexers SiteA,SiteB --out scripts/todo-paths.txt
 
     # 5) 驱动重搜：控速 + 退避感知 + 打完自动回灌（默认 dry-run，加 --apply 才发）
     python scripts/reseed-state.py drive --pack frds-top250-2024 --apply \\
@@ -294,11 +294,46 @@ def cmd_init(args) -> int:
             roots=nas_roots,
             local_roots=local_roots or nas_roots,
             max_depth=args.depth,
+            farm_root=getattr(args, "farm_root", None),
             link_dir=args.link_dir, category=args.category)
         added = st.register_dirs(args.pack, entries)
         total = len(st.movies(args.pack))
     _say(f"新登记 {added} 部，库内共 {total} 部（已存在的不重置 stage）")
     return 0
+
+
+def cmd_farm(args) -> int:
+    """给**已登记**的包补一个农场根，不动 roots、不重扫目录。
+
+    v3 把 cross-seed 的 `DATA_DIRS` 换成了硬链接农场，包的原路径还在，
+    但 cross-seed 报上来的 searchee 路径变成了农场路径 —— 不登记这个根，
+    `sync` 会认不出来，把整包算成"别的包"（症状：qB 里明明在做种，
+    状态机却集体降级成 PENDING/UNMATCHED）。
+    """
+    with S.StateStore(args.db) as st:
+        p = st.pack(args.pack)
+        if p is None:
+            _say(f"[!!] 未登记: {args.pack}（先 init）")
+            return 2
+        if args.clear:
+            st.con.execute("UPDATE pack SET farm_root=NULL WHERE name=?", (args.pack,))
+            st.con.commit()
+            _say(f"{args.pack}: 已清除农场根（回到只认原路径的老行为）")
+            return 0
+        if not args.farm_root:
+            cur = st.farm_root(args.pack)
+            _say(f"=== 包 {args.pack} ===")
+            _say(f"    源目录: {p['root']}")
+            _say(f"    农场根: {cur or '（未设置）'}")
+            _say(f"    镜像键: {len(st.farm_dir_paths(args.pack))} 条")
+            return 0
+        st.upsert_pack(args.pack, p["root"], farm_root=args.farm_root)
+        n = len(st.farm_dir_paths(args.pack))
+        _say(f"{args.pack}: 农场根 = {args.farm_root}（可识别 {n} 条农场路径）")
+        if not n:
+            _say("[warn] 镜像键为 0 —— 检查农场根是否写对，或包的 roots 是否还指向旧路径")
+            return 2
+        return 0
 
 
 def cmd_sync(args) -> int:
@@ -368,6 +403,90 @@ def cmd_report(args) -> int:
             _say("")
             _say("    (加 -v 看逐部清单)")
     return 0
+
+
+def cmd_trend(args) -> int:
+    """新增做种趋势（§16.3）—— 按 (周, 站) 看，而不是全局一个数。
+
+    换站决策问的是「**这个站最近还值不值得留**」，快照答不了，得看趋势。
+    """
+    with S.StateStore(args.db) as st:
+        if args.pack and st.pack(args.pack) is None:
+            _say(f"[!!] 未登记: {args.pack}（先 init）")
+            return 2
+        rep = st.trend(weeks=args.weeks, pack=args.pack)
+    head = f"（包 {args.pack}）" if args.pack else "（全部包）"
+    _say(f"=== 新增做种趋势 {head} ===")
+    _say(rep.render())
+    if args.verbose and rep.weeks:
+        _say("")
+        _say("    逐周 × 逐站：")
+        for wk in rep.weeks:
+            _say(f"      {wk}   合计 {rep.week_totals[wk]} 部（去重）")
+            for s in rep.sites:
+                n = rep.cells.get((wk, s), 0)
+                if n:
+                    _say(f"          {s}  {n}")
+    else:
+        _say("")
+        _say("    (加 -v 看逐周 × 逐站明细)")
+    _say("")
+    _say("    ★ 「新增做种」按**每片首次**变 SEEDING 算（attempt 表按 at 聚合）——")
+    _say("      同一部片不会因为反复 sync 被重复计数。")
+    return 0
+
+
+def cmd_quota(args) -> int:
+    """站点额度台账（§16.1）—— 来源 A（自己数）+ C（保险丝），B（Prowlarr）可选。
+
+    ★★ 它**不是站点余额表**：Prowlarr 的 Query Limit 是我们自己配的本地计数器，
+    站点网页上那句"今天还剩 N 次"我们拿不到（§16.1.1 的 ③）。
+    这个功能的定位是「把『每天登站看两次』降到『出异常才登站』」。
+    """
+    if not args.db_path:
+        _say("[!!] 需要 --db-path（cross-seed.db 的路径；只读）")
+        return 2
+    try:
+        lines = S.quota_snapshot(args.db_path, hours=args.hours)
+    except FileNotFoundError as e:
+        _say(f"[!!] {e}")
+        return 2
+
+    key = args.prowlarr_api_key or _read_env_key(Path(args.env), "PROWLARR_API_KEY")
+    note = ""
+    if args.with_prowlarr:
+        if not args.prowlarr_url:
+            note = "（要 --prowlarr-url 才知道问谁）"
+        else:
+            S.attach_prowlarr_quota(lines, args.prowlarr_url, key or "")
+    elif key:
+        note = "（没有 --with-prowlarr，本次不做来源 B 互校）"
+
+    _say(S.render_quota(
+        lines, title=f"=== 站点额度台账（滚动 {args.hours:g} 小时）===", note=""))
+    _say("")
+    _say("    ★ 口径：这是「最近窗口内搜过的**部数**」，不是发出去的请求次数")
+    _say("      （timestamp 表每 (片,站) 只留最后一次，重搜不叠加）。")
+    _say("    ★ 这不是站点余额 —— 站点网页上的剩余额度 Prowlarr 不知道（§16.1.1）。")
+    if args.hours != 24.0:
+        _say(f"    ★ 注意：这里是 {args.hours:g} 小时窗口；Prowlarr 的 limit 按 UTC 0 点"
+             "重置（= 本地 08:00），比大小前先对齐窗口。")
+    if note:
+        _say(f"    {note}")
+    return 0
+
+
+def _read_env_key(env_path: Path, key: str) -> str | None:
+    """从 .env 里取一个值。★ 凭据**只从文件读**，不提供命令行开关 ——
+    项目的规则是 PT 站/API 凭据不进命令行（会留在 shell 历史和进程列表里）。"""
+    try:
+        for ln in env_path.read_text(encoding="utf-8").splitlines():
+            if ln.startswith(key + "="):
+                v = ln.split("=", 1)[1].strip()
+                return v or None
+    except OSError:
+        pass
+    return None
 
 
 def cmd_todo(args) -> int:
@@ -471,6 +590,7 @@ def cmd_drive(args) -> int:
             crossseed_db=args.db_path,
             interval=args.interval,
             check_every=args.check_every,
+            check_secs=args.backoff_check_secs,
             max_wait=args.max_wait,
             timeout=args.timeout,
             pause_on_backoff=not args.no_pause_on_backoff,
@@ -580,10 +700,21 @@ def build_parser() -> argparse.ArgumentParser:
                         "★必须与 cross-seed 的配置一致，否则会登记出 cross-seed 根本不搜的幽灵条目")
     a.add_argument("--link-dir")
     a.add_argument("--category")
+    a.add_argument("--farm-root",
+                   help="v3：cross-seed 实际扫描的硬链接农场根（如 "
+                        "/volume1/video/download/reseed_farm）。设了它，农场路径才能"
+                        "归回本包 —— 不设的话 sync 会把整包判成“别的包”而集体降级")
     a.add_argument("--pattern", default="*")
     a.add_argument("--exclude", nargs="*", default=[])
     a.add_argument("--dry-run", action="store_true")
     a.set_defaults(func=cmd_init)
+
+    a = sub.add_parser("farm", help="给已登记的包设置硬链接农场根（v3，不用重扫）")
+    a.add_argument("--pack", required=True)
+    a.add_argument("--farm-root", nargs="?", default=None,
+                   help="不给就只打印当前设置")
+    a.add_argument("--clear", action="store_true", help="清空农场根")
+    a.set_defaults(func=cmd_farm)
 
     a = sub.add_parser("sync", help="从 cross-seed.db + 日志 + qB 同步状态")
     a.add_argument("--pack", required=True)
@@ -600,6 +731,27 @@ def build_parser() -> argparse.ArgumentParser:
                    help="把还没到周期的也计入待搜（用于强制全量重扫）")
     a.add_argument("-v", "--verbose", action="store_true")
     a.set_defaults(func=cmd_report)
+
+    a = sub.add_parser("trend", help="新增做种趋势（按周 × 按站）")
+    a.add_argument("--pack", help="不填 = 全部包")
+    a.add_argument("--weeks", type=int, default=4, help="回溯几周，默认 4")
+    a.add_argument("-v", "--verbose", action="store_true", help="逐周 × 逐站展开")
+    a.set_defaults(func=cmd_trend)
+
+    a = sub.add_parser("quota", help="站点额度台账（滚动 24 小时；★不是站点余额）")
+    a.add_argument("--db-path", help="cross-seed.db 路径（只读）")
+    a.add_argument("--hours", type=float, default=24.0,
+                   help="滚动窗口小时数，默认 24")
+    a.add_argument("--with-prowlarr", action="store_true",
+                   help="额外做来源 B 互校（问 Prowlarr；需要 PROWLARR_API_KEY）")
+    a.add_argument("--prowlarr-url",
+                   help="如 http://NAS_IP:9696 —— ★宿主机 IP，不是容器名")
+    a.add_argument("--prowlarr-api-key",
+                   help="Prowlarr 的 API key（★不是 Torznab 那个）。"
+                        "更推荐写进 .env 的 PROWLARR_API_KEY，避免留在 shell 历史里")
+    a.add_argument("--env", default=str(REPO / ".env"),
+                   help="从哪个 .env 读 PROWLARR_API_KEY")
+    a.set_defaults(func=cmd_quota)
 
     a = sub.add_parser("todo", help="导出待搜索清单")
     a.add_argument("--pack", required=True)
@@ -635,6 +787,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="两条 webhook 之间的间隔秒数，默认 30（对齐 cross-seed 的 delay）")
     a.add_argument("--check-every", type=int, default=10,
                    help="每发多少条检查一次索引器退避，默认 10")
+    a.add_argument("--backoff-check-secs", type=float, default=60.0,
+                   help="★再按秒数检查一次索引器退避，默认 60。实测 429 只 snooze "
+                        "55 秒，光靠 --check-every×interval 会整段错过它")
     a.add_argument("--max-wait", type=float, default=1800.0,
                    help="单次退避最多等多少秒，超过就中止，默认 1800")
     a.add_argument("--no-pause-on-backoff", action="store_true",

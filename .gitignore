@@ -20,7 +20,9 @@ cross-seed/torrent_cache/
 # 我们自己的单片状态库（运行时数据，含包内片名清单）+ 由它导出的待办清单
 hlink/state.db
 hlink/state.db-*
-scripts/todo.txt
+# ★ 2026-09-12 由 todo.txt 改名：它是一份**路径清单**（reseed-state.py todo 的
+#   输出，334 行全是绝对路径），不是给人和工具当"待办事项"读的文件。
+scripts/todo-paths.txt
 
 # 由状态机导出的派生数据（含真实片名/站点名，属运行时产物）
 scripts/*.tsv
@@ -28,6 +30,10 @@ scripts/*.tsv
 # drive-loop.py 的运行日志与状态文件（含真实片名/时间，属运行时产物）
 scripts/drive-loop.log
 scripts/.drive-loop.state
+# 每日台账「今天发过没有」的标记（运行时产物；内容只是一个日期）
+scripts/.daily-report.state
+# 农场巡检「上次什么时候查的、结论是什么」（运行时产物）
+scripts/.farm-check.state
 # 计划任务那一层的起跑/退出码留痕 + stderr 捕获（诊断「批次凭空消失」用）
 scripts/drive-loop.attempts.log
 scripts/drive-loop.task.err
