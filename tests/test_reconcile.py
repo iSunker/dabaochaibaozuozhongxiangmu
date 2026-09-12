@@ -230,7 +230,72 @@ ck("有日志：a − b", m["fd"], 0)
 ck("正文带口径名（当日日志）", "〔当日日志〕" in note, True)
 ck("没库：b−c 给 n/a", m["fb_c_all"], "n/a")
 ck("没库：无人认领给 n/a（不是 0）", m["unclaimed"], "n/a")
+
+print("== ④ 状态库**不在** → 必须先问 is_file，绝不能让它把空库建出来 ==")
+# ★★ 这一格钉的是**唯一一个「沉默会变成数字」的入口**。
+#    `StateStore.__init__` 第一件事就是 mkdir(parents=True) + connect +
+#    `executescript(SCHEMA)` —— 库不存在时**就地建一个空的**。于是：
+#        "库不在" → 不抛异常 → pack/movie 两张表全空 → pack_contexts() 返回 {}
+#                 → 库里**每一条** searchee 都算「无人认领」→ 报出一个**巨大的假数**，
+#                   外加一条醒目告警，还在错位置写下了一个库文件。
+#    ★ 这正是 ③ 自己立的规矩（「读不到给 n/a 不给 0」）在**第三个输入**上被破的
+#      那一格 —— 而且是往**假阳性**那头破。对照 `read_crossseed_db()`：它自己
+#      `raise FileNotFoundError`，所以 `--db-path` 那一路天然是安全的。
+events.clear()
+# ★ 故意造一个**父目录也不存在**的路径：StateStore 连父目录都会替你建出来，
+#   所以"父目录没被建"是比"文件没被建"更强的证据 —— 证明我们压根没把它交出去。
+_missing = os.path.join(tempfile.mkdtemp(), "sub", "not-there.db")
+note, m = D.reconcile_watch(
+    argparse.Namespace(log=[LOG_A], db=_missing, db_path=None))
+ck("库不在 → 无人认领给 n/a（★ 不是一个大数）", m["unclaimed"], "n/a")
+ck("库不在 → b−c 也给 n/a", m["fb_c_all"], "n/a")
+ck("★ 那个文件没有被建出来", os.path.exists(_missing), False)
+ck("★ 连父目录都没被建（证明没交给 StateStore）",
+   os.path.isdir(os.path.dirname(_missing)), False)
+ck("正文点名「状态库不在」", "状态库不在" in note, True)
+ck("库不在时**不发**告警（没跑到，不是有信号）",
+   [e for e in events if e[0] == "alert"], [])
 ck("差值 0 时**不发**告警", events, [])
+
+# ★★ 下面两格钉的是**另外两个出口** —— 它们此前**一条断言都没有**：
+#    三个出口里只有 `log-parse-miss` 被钉过，另两条**整段删掉测试也不会红**。
+#    而本系统的全部价值就在「判据的出口会响」：一个不会响的出口，
+#    在无人值守下和"根本没有这个出口"等价。这也正是 §18.18 那个形状 ——
+#    **判据被验过了，判据的出口没被验。**
+print("== ④ 出口 2：控制没过（判据压根没走到）—— 又是一条，key 也不一样 ==")
+LOG_C = os.path.join(tempfile.mkdtemp(), "info3.log")
+# 日志**读得进来**，但一整行 `] Found ` 都没有 → 基线一个字面量都数不到。
+# ★ 注意这与"空文件"不同：空文件是 total_lines = 0，这里是"读了、但没有靶心形状"。
+pathlib.Path(LOG_C).write_text(
+    '2026-09-12 01:00:00.000 info: [webhook] Received search request',
+    encoding="utf-8")
+events.clear()
+note, m = D.reconcile_watch(argparse.Namespace(log=[LOG_C], db=None, db_path=None))
+ck("控制没过：a / b 都是 0", (m["fa"], m["fb"]), (0, 0))
+ck("控制没过：发了一条 alert", [e[0] for e in events], ["alert"])
+ck("key 是 reconcile-controls", events[0][3], "reconcile-controls")
+# ★ 正文必须说「匹配逻辑坏了」，而不是「没有 Found 行」——
+#   这两句对应完全不同的排查动作（改正则 vs 去查为什么没搜）。
+ck("正文点明「匹配逻辑」（不是「没有 Found 行」）",
+   "匹配逻辑" in events[0][2], True)
+
+print("== ④ 出口 3：空转（b == 0 但**控制通过**）—— 必须与上一格分得开 ==")
+# ★ 两格的 metrics 都是 fb = 0，**但含义相反**：一个是"判据坏了"，
+#   一个是"判据好的、只是今天真没有 Found 行"。混成一条就没法从告警
+#   判断该去查哪儿（§18.17.3 要的正是把这两件事分开）。
+#   这一行的形状照生产日志抄：L1 那个字面量吃得到，六字面量合取吃不到。
+LOG_D = os.path.join(tempfile.mkdtemp(), "info4.log")
+pathlib.Path(LOG_D).write_text(
+    '2026-09-12 01:00:00.000 info: [webhook] Found 0 torrents for {"a":1}',
+    encoding="utf-8")
+events.clear()
+note, m = D.reconcile_watch(argparse.Namespace(log=[LOG_D], db=None, db_path=None))
+ck("控制**通过**（L1 数到了）", m["fa"], 0)
+ck("b == 0（空转本身）", m["fb"], 0)
+ck("空转发的是 alert", [e[0] for e in events], ["alert"])
+ck("key 是 reconcile-empty（★ 不是 reconcile-controls）",
+   events[0][3], "reconcile-empty")
+ck("正文点明「不是「干净」」", "干净" in events[0][2], True)
 
 print("== ④ 差不为 0 → 必须真的发 alert，且 key 固定 ==")
 events.clear()

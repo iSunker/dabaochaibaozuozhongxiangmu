@@ -770,6 +770,12 @@ def reconcile_watch(args) -> tuple[str, dict]:
       循环里。一次 SMB/库抖动不该让整份日报消失（同 `iyuu_watch` 的规矩）。
     ★ 读不到时 metrics 给 `n/a` —— **必须给**，否则 TSV 里"这次读失败了"和
       "那天根本没跑"长得一模一样，事后分不开。
+    ★★ 但"读不到"有个**反向的**坑：`StateStore(path)` 会**把不存在的库建出来**，
+      于是"库不在"会伪装成"库是空的"→ 报出一个巨大的 `unclaimed`。所以
+      `--db` 必须先 `is_file()` 问一句（见下面的注释）。
+    ★ 三个出口各有一条 alert：`reconcile-controls`（判据没走通）/
+      `reconcile-empty`（b == 0 空转）/ `log-parse-miss`（形状对、正则没吃下），
+      四条分支在 `tests/test_reconcile.py` §④ 里**逐条钉了 key**。
     """
     m: dict = {"fa": "n/a", "fb": "n/a", "fd": "n/a",
                "fb_c_all": "n/a", "fb_c_farm": "n/a", "unclaimed": "n/a"}
@@ -822,8 +828,25 @@ def reconcile_watch(args) -> tuple[str, dict]:
     # b − c 与无人认领都要真库；库不可达时**分开报**，别让一条坏了带走另一条。
     store = snap = None
     try:
-        if getattr(args, "db", None):
-            store = S.StateStore(args.db)
+        db_p = getattr(args, "db", None)
+        if db_p:
+            # ★★ 必须先问「文件在不在」，不能直接把它交给 StateStore ——
+            #    `StateStore.__init__` 的第一件事就是 mkdir + connect +
+            #    `executescript(SCHEMA)`，**库不存在时会就地建一个空的**。
+            #    那样「读不到」就变成了「读到了一个空库」：pack/movie 两张表全空
+            #    → `pack_contexts()` 返回 `{}` → 库里**每一条** searchee 都算
+            #    「无人认领」→ 报出一个巨大的假数 + 一条醒目告警，顺带在错位置
+            #    写下一个空库。**沉默被念成了数字**，正是这一格要防的方向
+            #    （而且它和「零命中既可能是没事也可能是没跑」是同一个形状）。
+            #    ★ 对照 `read_crossseed_db()`：它自己 `raise FileNotFoundError`，
+            #      所以 `--db-path` 那一路天然走 `n/a`。这里补的正是缺掉的那一问。
+            if not Path(db_p).is_file():
+                lines.append(f"观测对账：状态库不在（{db_p}）—— "
+                             f"b−c 与无人认领**没跑成**，别念成 0")
+                LOG.debug("状态库不存在，跳过 b−c / 无人认领：%s", db_p)
+                db_p = None
+            else:
+                store = S.StateStore(db_p)
         if getattr(args, "db_path", None):
             snap = S.read_crossseed_db(args.db_path)
     except Exception as e:                  # noqa: BLE001

@@ -94,7 +94,7 @@ prowlarr_cross-seed_autohardlink/   # NAS 部署目录（compose 就放这里，
 > ★ 2026-09-12 起电脑端只留 **`deploy.sh`**（推代码）、**`check-deploy-drift.py`**（查漂移）、
 > **`scan-secrets.py`**（推前扫凭据）、**`audit-found-*.py`**（对账）几个用途，
 > 见「⛔ 电脑端已不参与」。
-> `tests/` 是**离线自测**（12 个脚本 / 382 条断言）—— 原先散在 `D:/tmp` 里**没有版本管理**，
+> `tests/` 是**离线自测**（12 个脚本 / 397 条断言）—— 原先散在 `D:/tmp` 里**没有版本管理**，
 > 2026-09-12 搬进仓库。不联网、不碰生产、不碰真库，`python tests/<名字>.py`
 > **任一 cwd** 都能跑（路径按 `__file__` 解析），全过退出码 0。见 `tests/README.md`。
 > 由状态机导出的 `unmatched.tsv` /
