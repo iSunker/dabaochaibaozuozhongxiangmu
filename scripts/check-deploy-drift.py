@@ -104,6 +104,7 @@ LOCAL_ONLY = [
     (r"^tests/",                                  "离线自测（在 Windows 上跑，不进容器）"),
     (r"^deploy\.sh$",                             "同步工具本身（在 Windows 上跑）"),
     (r"^scripts/check-deploy-drift\.py$",         "本哨兵（在 Windows 上跑）"),
+    (r"^scripts/scan-secrets\.py$",               "推前凭据扫描（在 Windows 上跑；读本地 .env，但绝不打印命中到的值）"),
     (r"^prowlarr/\.gitkeep$",                     "占位符；生产的 prowlarr/ 是**不许碰**的"),
     (r"^scripts/(add-indexers|add-torznab-indexer|check-indexer-timestamps"
      r"|gen-datadirs|gen-nas-env-update|migrate-reseed-dirs|run-batch|wait-for-checks)"
