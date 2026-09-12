@@ -98,6 +98,21 @@ FILES=(
   #   路径映射注意：仓库 scripts/build-farm.sh → 生产 **compose 根目录**（不是 scripts/），
   #   因为它要跟 .env 同目录才找得到配置。
   "scripts/build-farm.sh::build-farm.sh"
+  # ★ 2026-09-12 晚补：这两个原先**靠手工拷**，是同一族问题的最后两个。
+  #   查"git 提交是不是一半 NAS 一半本地"时量出来的 —— 白名单之外的文件
+  #   **没有任何机制保证两边一致**（build-farm.sh 就是前车之鉴，见上）。
+  #   实测收进来时两边已一致，所以这次是**零风险**地把"靠记性"换成"靠 cmp"。
+  #
+  #   fix-statedb-farm-root.py —— 仓库里是 scripts/ 下的**已跟踪源码**，
+  #     生产副本却放在 compose **根目录**（和数据修复时手边方便有关）。
+  #   nas-update-env.sh —— 是**生成物**（scripts/gen-nas-env-update.py 产出，
+  #     故在仓库里被 gitignore）。★ 之所以能同步：它只装载 DATA_DIRS + LINK_DIR
+  #     两个**路径**键，不含任何凭据；且实测本地 .env 与生产 .env 的 DATA_DIRS
+  #     **逐字节相同**（指纹 420afc99339a）。若哪天它开始携带别的键，先回看这里。
+  #     本地没生成过这个文件时（如全新 clone），deploy.sh 会打
+  #     「⚠ 本地缺失，跳过」并继续 —— 不会因为少了它而中断。
+  "scripts/fix-statedb-farm-root.py::fix-statedb-farm-root.py"
+  "scripts/nas-update-env.sh::nas-update-env.sh"
 )
 
 MODE="${1:---dry-run}"
