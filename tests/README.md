@@ -12,7 +12,7 @@ python tests/test_backoff.py        # 任一 cwd 都行
 路径按 `__file__` 解析（不是 cwd），所以从哪儿跑都一样。
 每个脚本自己打印 `ok` / `FAIL`：**全过退出码 0，有失败退出码 1**，可以直接接 CI。
 
-2026-09-12 实测：**10 个脚本、301 条断言、0 失败**。
+2026-09-12 实测：**11 个脚本、332 条断言、0 失败**。
 
 ## 各测什么
 
@@ -27,6 +27,7 @@ python tests/test_backoff.py        # 任一 cwd 都行
 | `test_quota_trend.py` | 96 | 额度台账（A 来源滚动 24h + B 来源 Prowlarr + 两者互校）+ 趋势（按周按站）+ 农场巡检判断（**argv 里绝不出现 `--prune`**） |
 | `test_remove_indexer.py` | 8 | `add-torznab-indexer.py --remove` 的**字节保真**与安全闸（合成样本 + 假 key，绝不碰生产 `.env`） |
 | `test_scan_secrets.py` | 25 | 推前凭据扫描器 `scripts/scan-secrets.py`：阳性拦得住（值指纹 + 形状两条路）、阴性不误报；**形状层必须参与退出码**、**只拦「本次新引入」**、三类假阳性（读变量 / 英文短语 / 同字符重复）必须被规则认出来 |
+| `test_sync_empty_sets.py` | 31 | `sync_movie` 整行覆盖写 + 四个空集的后果：**SEEDING 塌成 PENDING 是降级不是删行**（连 `searched_indexers` 都被抹掉），而 `indexer_seen` 是**合并**保留的 → `next_retry_at` 被推到未来一整个周期 = **额度悄悄烧掉一轮**；端到端钉「一条计数器 / 两条静默通道」——searchee 落到**别的包**（`other_pack`）与**认不出的名字**（`unresolved`）后果一模一样，**只有后者会喊** |
 | `test_iyuu_watch.py` | 30 | IYUU 辅种条数（§18.8 的唯一生产级证伪点）：**重构没改行为**（`qbit_torrents` 的 URL 仍是老那个字面量 —— 它在每 15 分钟的热路径上）、中文 tag 必须被百分号编码（URL 要纯 ASCII）、`iyuu_watch` **三种情形都不许抛**、以及 **数字真的进了 `metrics`**（TSV 只记 metrics 不记正文，"看着发了其实没留痕"肉眼看不出来） |
 
 ## 写测试时踩过的坑（别再踩）
@@ -39,6 +40,8 @@ python tests/test_backoff.py        # 任一 cwd 都行
   `test_remove_indexer.py` 第 4 项拿 `api\n\r\n` 当针（那行实际以 `apikey=FAKE` 结尾，
   针在哪儿都匹配不到），以及 `check-indexer-timestamps.py` 用严格 `==` 比
   `NanyangPT` 与 `NanyangPT (南洋)`。**两次的表现都和真 bug 一模一样。**
+  第三次是同一天：`test_sync_empty_sets.py` §② 只期望一条流水，实际
+  `PENDING → SEEDING` 那次**也是变档**、也留了一条 —— 代码是对的，断言写窄了。
 - ★ **"生产会写文件"的路径，测试里必须改向到临时目录** —— `STATE_FILE` /
   `FARM_CHECK_FILE` / `DAILY_FILE` / spool。否则跑一次测试就往**仓库**里留产物：
   `test_once_gate.py` §⑤ 就是这么把 `.farm-check.state` 写进 `scripts/` 过的（已清掉）。
