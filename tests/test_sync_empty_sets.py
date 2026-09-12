@@ -50,7 +50,8 @@ def ck(label, got, want):
 
 
 def mkstore(pack="p", dirs=("Movie.A.2024", "Movie.B.2019", "Movie.C.2021")):
-    st = StateStore(os.path.join(tempfile.mkdtemp(), "t.db"))
+    # create=True：夹具建库（生产默认不建，见 StateStore.__init__）
+    st = StateStore(os.path.join(tempfile.mkdtemp(), "t.db"), create=True)
     st.upsert_pack(pack, ROOT, max_depth=2)
     st.register_dirs(pack, [(d, f"{ROOT}/{d}") for d in dirs])
     return st

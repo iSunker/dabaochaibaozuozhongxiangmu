@@ -15,7 +15,7 @@ except Exception:
 FARM = "/volume1/video/download/reseed_farm"
 
 db = os.path.join(tempfile.mkdtemp(), "t.db")
-st = StateStore(db)
+st = StateStore(db, create=True)   # 夹具就是要建库（生产默认不建，见 StateStore.__init__）
 
 # --- 单根包 ---
 st.upsert_pack("frds", "/volume1/video/download/FRDS",

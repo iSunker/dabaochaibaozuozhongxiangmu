@@ -1202,8 +1202,35 @@ def _u(s: str | None) -> list[str]:
 class StateStore:
     """我们的 sidecar 状态库。**唯一**被本模块写入的库。"""
 
-    def __init__(self, db_path: str | Path):
+    def __init__(self, db_path: str | Path, *, create: bool = False):
+        """打开状态库。**默认不建**。
+
+        ★★ `create=False`（默认）时，文件不在就抛 `FileNotFoundError` ——
+          因为 `sqlite3.connect()` 连一个不存在的路径**不报错**，而下面的
+          `executescript(SCHEMA)` 会把它**就地建成一个 0 字节的空库**。
+          于是「读不到」伪装成「读到的是一个空库」：`pack` / `movie` 两张表全空 →
+          读的人拿到的是一个**看起来成功**的结果，而不是一次失败。
+          `cmd_state` 的注释里记着那次现场：打错一层路径，就在**媒体目录**里
+          留下了一个空 `state.db`，而它看起来"命令跑成功了"。
+        ★ 要建库的只有两种调用者：`reseed-state.py init`（它的职责就是建库）
+          和测试夹具。它们显式传 `create=True` —— **让"会写磁盘"在调用点看得见**，
+          而不是藏在一个 13 个调用点共享的默认值里。
+        ★ 闸放在 `__init__` 而不是各调用点：**调用点各加一遍正是上次漏掉的那种做法**
+          —— `reconcile_watch` 一个人加了 `is_file()`，另外 13 处没加，
+          而那 13 处里有在热路径上的（`run_round`）：路径打错 →
+          建空库 → `todo_detail` 把整包看成 PENDING → **全量重搜、额度静默烧掉一轮**。
+        ★ 行为变更：热路径上的错路径，从「静默建空库 + 全量重搜」变成
+          「本批异常 → `consec_abort` 涨 → 到 3 批发告警」。方向是**从安静变响**。
+        """
         self.path = Path(db_path)
+        if not create and not self.path.is_file():
+            raise FileNotFoundError(
+                f"状态库不存在: {self.path} —— 本路径**只读**，不会替你建空库"
+                f"（空库会伪装成「一部都没登记」）。\n"
+                f"       要建库：`reseed-state.py --db <路径> init --pack ...`；"
+                f"要显式建：`StateStore(<路径>, create=True)`。\n"
+                f"       库的真实位置由 drive-loop 的运行目录决定，常见的是 "
+                f"`<compose>/drive-loop/hlink/state.db`。")
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.con = sqlite3.connect(str(self.path))
         self.con.row_factory = sqlite3.Row

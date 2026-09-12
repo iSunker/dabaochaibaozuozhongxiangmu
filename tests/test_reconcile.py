@@ -117,7 +117,7 @@ A_ROOT = "/vol1/tv"
 B_ROOT = "/vol1/movies"
 
 db = os.path.join(tempfile.mkdtemp(), "t.db")
-st = StateStore(db)
+st = StateStore(db, create=True)   # 夹具建库（生产默认不建，见 StateStore.__init__）
 st.upsert_pack("alpha", A_ROOT, roots=[A_ROOT], farm_root=FARM)
 st.register_dirs("alpha", [("Show.S01", A_ROOT + "/Show.S01")])
 st.upsert_pack("beta", B_ROOT, roots=[B_ROOT], farm_root=FARM)
@@ -211,6 +211,11 @@ D = _load(DRIVE_LOOP, "drive_loop_reconcile")
 events: list = []
 D.emit = lambda kind, title, body="", *, key=None, metrics=None: (
     events.append((kind, title, body, key, metrics)) or True)
+# ★ 「生产会写文件」的路径，测试里必须**改向到临时目录** ——
+#   不改的话跑一次测试就往 `scripts/` 里留一个 `.reconcile.state`
+#   （tests/README 的坑那一节记着同类事故：`.farm-check.state`）。
+#   ★ 用模块级常量（`RECONCILE_FILE`）而不是函数里的局部路径，就是为了让这一行成立。
+D.RECONCILE_FILE = pathlib.Path(tempfile.mkdtemp()) / ".reconcile.state"
 
 LOG_A = os.path.join(tempfile.mkdtemp(), "info.log")
 pathlib.Path(LOG_A).write_text(LOG4, encoding="utf-8")
@@ -297,6 +302,30 @@ ck("key 是 reconcile-empty（★ 不是 reconcile-controls）",
    events[0][3], "reconcile-empty")
 ck("正文点明「不是「干净」」", "干净" in events[0][2], True)
 
+print("== ④ 出口 4：a > 0 且 b == 0 —— 最严重的那一种，不许被「空转」吞掉 ==")
+# ★★ 这一格钉的是**判断顺序**：旧顺序是 ①controls → ②b==0 → ③delta，
+#   于是 `a > 0 且 b == 0`（形状数到了六字面量、正则**一条都没吃下**，
+#   于是 delta = a > 0）被 ② 吞了 —— 正文说「要么真没搜出去过」，
+#   而 metrics 里 `fa` 明明白白是 1，**两个字段互相打脸**。
+#   更要命的是两者指向**完全不同的排查动作**：一个去查"为什么没搜"，
+#   一个去查正则。看告警的人只读正文，就会被指错方向。
+# ★ 合成形状照生产抄：标签不是 `webhook`/`inject`（`_RE_FOUND` 钉了这两个），
+#   所以六个字面量全中、生产正则一条也不吃。
+LOG_E = os.path.join(tempfile.mkdtemp(), "info5.log")
+pathlib.Path(LOG_E).write_text(
+    '2026-09-12 01:00:04.000 verbose: [search] Found Miss.2021 [cafebabe...]'
+    ' on HDFans by MATCH from dataDir (/v/farm/Miss.2021) - MATCH', encoding="utf-8")
+events.clear()
+note, m = D.reconcile_watch(argparse.Namespace(log=[LOG_E], db=None, db_path=None))
+ck("形状 1 行 / 正则 0 行（★ 这就是那个极端形）", (m["fa"], m["fb"]), (1, 0))
+ck("delta = 1（不是 0 —— 所以它**不是**空转）", m["fd"], 1)
+ck("★ key 是 log-parse-miss（不是 reconcile-empty）",
+   [e[3] for e in events if e[0] == "alert"], ["log-parse-miss"])
+ck("★ 正文点名「一条都没吃下」", "一条都没吃下" in events[0][2], True)
+# ★ 反向控制：两个出口**用同一个数（fb == 0）报出来**，只有这句话能把它们分开 ——
+#   所以"空转那句不许出现"必须单独钉一条，否则顺序改回去这格照样绿。
+ck("★ 正文**不**出现空转那句「真没搜出去过」", "真没搜出去过" in events[0][2], False)
+
 print("== ④ 差不为 0 → 必须真的发 alert，且 key 固定 ==")
 events.clear()
 note, m = D.reconcile_watch(argparse.Namespace(log=[LOG_B], db=None, db_path=None))
@@ -316,7 +345,7 @@ def _fake_read(_p, *a, **k):
 
 D.S.read_crossseed_db = _fake_read        # 真库里那 1888 行的形状，用 SNAP 复刻
 db2 = os.path.join(tempfile.mkdtemp(), "t2.db")
-st2 = StateStore(db2)
+st2 = StateStore(db2, create=True)
 # ★ 两个包都要登记 —— 只登记 alpha 的话，beta 那条会被正确地报成"无人认领"，
 #   于是本节测的就不是接线而是夹具（第一版就是这么错的，数报了 2）。
 st2.upsert_pack("alpha", A_ROOT, roots=[A_ROOT], farm_root=FARM)
@@ -385,6 +414,32 @@ note, m = D.reconcile_watch(
 ck("库读不到：两个方向都 n/a（不是 0）",
    (m["packs_undriven"], m["packs_unreg"]), ("n/a", "n/a"))
 ck("库读不到：正文说清「没跑成」", "没跑成" in note, True)
+
+print("== ④ #34：n/a 要配「上次成功读数时刻」—— 长期 n/a 与偶发 n/a 分开 ==")
+# ★ 为什么非要这一节：`n/a` **只说明这一次**。TSV 里一个连续三天读不到的格子
+#   和一个昨天还好、今天抖了一下的格子**长得一模一样**，于是"判据长期失效"
+#   和"偶发抖动"事后完全分不开 —— 判据要能指回时间，才谈得上指回真实记录。
+#
+# ① 换一个**全新的**台账文件 → 谁都没成功过
+D.RECONCILE_FILE = pathlib.Path(tempfile.mkdtemp()) / ".reconcile.state"
+events.clear()
+note, m = D.reconcile_watch(argparse.Namespace(log=None, db=None, db_path=None))
+ck("全新台账：8 格全是 n/a", sorted(k for k, v in m.items() if v == "n/a"), sorted(m))
+ck("★ 正文点名「从未成功读到过」", "从未成功读到过" in note, True)
+
+# ② 真读到数 → 给**每一格**盖上时间戳（packs 也带上，否则那两格没被覆盖）
+events.clear()
+note, m2 = D.reconcile_watch(
+    argparse.Namespace(log=[LOG_A], db=db2, db_path="<stub>", packs="alpha,beta"))
+ck("真读到数：8 格全不是 n/a", [k for k, v in m2.items() if v == "n/a"], [])
+
+# ③ 再读不到 → 必须说得出来「上次是什么时候」
+note, m3 = D.reconcile_watch(argparse.Namespace(log=None, db=None, db_path=None))
+ck("这次又是 n/a", m3["fa"], "n/a")
+ck("★ 正文带上「上次成功」的时刻", "上次成功" in note, True)
+ck("★ 且**不是**「从未成功」—— 那两句话指向完全不同的处置",
+   "从未成功读到过" in note, False)
+print("   ↑ ③ 的正文：", note.splitlines()[-2].strip()[:100])
 
 print()
 if fails:

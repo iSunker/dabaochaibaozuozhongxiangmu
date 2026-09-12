@@ -315,7 +315,11 @@ def cmd_init(args) -> int:
         _say("(--dry-run，未写库)")
         return 0
 
-    with S.StateStore(args.db) as st:
+    # ★★ 这是全仓**唯一**一处该建库的地方 —— 所以 `create=True` 写在这里，
+    #    而不是当成 `StateStore` 的默认值。其余 7 个调用点（farm/sync/report/
+    #    trend/todo/drive/show）都作用在**已登记**的包上，库不在就该报错，
+    #    不是"顺手建一个空库"（空库 = 每部片都像没登记过）。
+    with S.StateStore(args.db, create=True) as st:
         st.upsert_pack(
             args.pack, nas_roots[0],
             local_root=(local_roots or nas_roots)[0],
@@ -841,7 +845,14 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     _safe_stdout()
     args = build_parser().parse_args(argv)
-    return args.func(args)
+    try:
+        return args.func(args)
+    except FileNotFoundError as e:
+        # ★ 库不在不是"异常"，是**一条要读的提示** —— 逐字打 traceback 会把它埋掉。
+        #   唯一会建库的子命令是 init（它传 create=True），所以走到这里的
+        #   一定是只读/改档类命令，本来就该停下。
+        _say(f"[错误] {e}")
+        return 2
 
 
 if __name__ == "__main__":

@@ -53,7 +53,8 @@ def make_crossseed(path: Path, *, indexers, ts_rows):
 
 
 def make_state(path: Path, movies, attempts):
-    with S.StateStore(path) as st:
+    # create=True：夹具的职责就是建库（生产默认不建，见 StateStore.__init__）
+    with S.StateStore(path, create=True) as st:
         st.con.execute("INSERT INTO pack(name,root,created_at) VALUES('P','/r','t')")
         for mid, mi, stage in movies:
             st.con.execute(
@@ -205,7 +206,7 @@ make_state(sd,
         # 片 4：从没 seeding 过 —— 不该出现
         (6, 4, "2026-09-11 10:00:00", "unmatched", '["HDFans"]'),
     ])
-with S.StateStore(sd) as st:
+with S.StateStore(sd, create=True) as st:
     rep = st.trend(weeks=8, now=datetime(2026, 9, 12))
 ck("  总数（片 1 只算一次）", rep.total, 3)
 ck("  未归属 = 0（兜底生效）", rep.unattributed, 0)
@@ -224,19 +225,19 @@ ck("  确实是「和 > 总数」这一支", sum(
     n for (w, _s), n in rep.cells.items() if w == "2026-W37") > rep.week_totals["2026-W37"], True)
 
 print("\n== ⑧ 趋势：窗口裁剪 + 全空 ==")
-with S.StateStore(sd) as st:
+with S.StateStore(sd, create=True) as st:
     rep2 = st.trend(weeks=1, now=datetime(2026, 9, 12))
 ck("  只留 1 周（W36 被裁掉）", rep2.weeks, ["2026-W37"])
 sd2 = TMP / "empty.db"
 make_state(sd2, movies=[], attempts=[])
-with S.StateStore(sd2) as st:
+with S.StateStore(sd2, create=True) as st:
     ck("  空库不炸、给一句话", st.trend().render().startswith("新增做种趋势：暂无数据"), True)
 
 print("\n== ⑨ 趋势：两边都没记站 → 落「未记站点」并被点名 ==")
 sd3 = TMP / "state3.db"
 make_state(sd3, movies=[(1, "[]", "SEEDING")],
            attempts=[(1, 1, "2026-09-11 10:00:00", "seeding", "[]")])
-with S.StateStore(sd3) as st:
+with S.StateStore(sd3, create=True) as st:
     r3 = st.trend(now=datetime(2026, 9, 12))
 ck("  未归属计数", r3.unattributed, 1)
 ck("  落进「未记站点」栏", r3.cells.get(("2026-W37", S.UNATTRIBUTED_SITE)), 1)
@@ -246,7 +247,7 @@ print("\n== ⑩ 趋势：`(未记录)` 占位不算一个站 ==")
 sd4 = TMP / "state4.db"
 make_state(sd4, movies=[(1, '["HDFans"]', "SEEDING")],
            attempts=[(1, 1, "2026-09-11 10:00:00", "seeding", '["(未记录)","HDFans"]')])
-with S.StateStore(sd4) as st:
+with S.StateStore(sd4, create=True) as st:
     r4 = st.trend(now=datetime(2026, 9, 12))
 ck("  只用 matched_indexers，不把占位当站", r4.sites, ["HDFans"])
 
@@ -257,6 +258,10 @@ spec = importlib.util.spec_from_file_location(
 dl = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(dl)
 dl.DAILY_FILE = TMP / ".daily-report.state"
+# ★ 同理必须改向：`report_daily` 会调 `reconcile_watch`，而后者末尾要写
+#   「每一格上次成功读到数」的台账 —— 不改向就跑一次测试往 scripts/ 里留一个
+#   `.reconcile.state`（实测：就是这里漏了才留的）。
+dl.RECONCILE_FILE = TMP / ".reconcile.state"
 sent = []
 dl.emit = lambda kind, title, body="", **kw: (sent.append((kind, title, kw.get("key"))), True)[1]
 dl._daily_set("")

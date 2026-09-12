@@ -217,6 +217,9 @@ def _run_daily(stub_tagged):
         # ★ 必须改向 —— 否则 `_daily_set` 会往**仓库**里写 .daily-report.state
         #   （tests/README.md 记过这个坑：test_once_gate.py §⑤ 栽的就是它）。
         D.DAILY_FILE = pathlib.Path(td) / ".daily-report.state"
+        # ★ 同一类：`report_daily` 里还挂着 `reconcile_watch`，它末尾要写
+        #   「每一格上次成功读到数」的台账 —— 也是往仓库里写，也必须改向。
+        D.RECONCILE_FILE = pathlib.Path(td) / ".reconcile.state"
         D.report_daily(args, force=True)
         ck("★ 日报告诉别人它写过了（否则明天会被 _daily_last 挡住）",
            D._daily_last() != "")

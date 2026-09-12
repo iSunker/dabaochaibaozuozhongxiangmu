@@ -68,8 +68,12 @@ def run(argv):
 
 
 def make_db(path: Path, packs):
-    """packs: [(name, root, [(dir_name, stage)])]"""
-    with S.StateStore(path) as st:
+    """packs: [(name, root, [(dir_name, stage)])]
+
+    ★ `create=True`：夹具的职责就是建库。生产默认 `create=False` —— 见
+      `StateStore.__init__`（读一个不存在的路径会伪装成「读到空库」）。
+    """
+    with S.StateStore(path, create=True) as st:
         for name, root, movies in packs:
             st.con.execute("INSERT INTO pack(name,root,created_at) VALUES(?,?,?)",
                            (name, root, "t"))
@@ -121,6 +125,30 @@ ck("  ★★ 文件**没有**被建出来", missing.exists(), False)
 ck("  ★ 连父目录也没被建出来", missing.parent.exists(), False)
 ck("  给了真实位置（drive-loop/hlink）", "drive-loop/hlink/state.db" in out, True)
 
+print("\n== ④b ★★ 根因闸：StateStore **自己**不建库（不只是 cmd_state 那一层）==")
+# ★ 为什么单钉这一格：上面 ④ 证的是 `cmd_state` **这个调用点**上有一道闸。
+#   而 2026-09-12 那次漏掉的，**正是"闸所在的调用点之外的地方"** ——
+#   `reconcile_watch` 一个人加了 `is_file()`，另外 13 处没加，
+#   其中 `run_round` 在热路径上：路径打错 → 建空库 → 整包算 PENDING
+#   → **全量重搜，额度静默烧掉一轮**。
+#   闸搬到 `__init__` 之后，判据也必须跟着搬 —— 否则它只是换了个位置继续没被验。
+gate = TMP / "gate" / "nope.db"
+try:
+    S.StateStore(gate)
+    raised = None
+except FileNotFoundError as e:
+    raised = e
+ck("  抛 FileNotFoundError", isinstance(raised, FileNotFoundError), True)
+ck("  提示里点名真实位置", "drive-loop/hlink/state.db" in str(raised), True)
+ck("  ★★ 文件**没有**被建出来", gate.exists(), False)
+ck("  ★ 连父目录也没被建出来", gate.parent.exists(), False)
+# ★ 反向控制：不验这一条的话，一道"永远抛"的闸也能让上面四格全绿 ——
+#   而那道闸会把 init（全仓唯一该建库的地方）一起挡掉。
+gate2 = TMP / "gate" / "ok.db"
+with S.StateStore(gate2, create=True) as st2:
+    st2.upsert_pack("p", "/r")
+ck("  反向：create=True 就建得出来（别把 init 一起挡了）", gate2.is_file(), True)
+
 print("\n== ⑤ --detail：逐部列出待搜 ==")
 rc, out = run(["state", "--db", str(DB), "--pack", "aaa-pack", "--detail"])
 ck("  退出码 0", rc, 0)
@@ -151,7 +179,7 @@ ck("  DEFAULT_CONFIG 是模块级常量（导入后改环境变量无效）",
    M.DEFAULT_CONFIG, os.environ.get("RESEED_CONFIG", "/config/config.yml"))
 
 print("\n== ⑧ packs() 辅助方法 ==")
-with S.StateStore(DB) as st:
+with S.StateStore(DB, create=True) as st:
     names = [r["name"] for r in st.packs()]
 ck("  按名字升序", names, ["aaa-pack", "bbb-pack"])
 

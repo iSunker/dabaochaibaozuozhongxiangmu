@@ -754,6 +754,41 @@ def _redact(s: str) -> str:
     return s
 
 
+#: 对账读数台账：记下**每一格最后一次真的读到数**是什么时候。
+#: ★ 为什么不并进 `.daily-report.state`：那个文件是 `_daily_set()` **整文件覆盖写**
+#:   （`tmp.write_text(json.dumps({"last_day": day}))`）—— 并进去会被静默抹掉，
+#:   而且是那种"这次抹了、下次才发现"的抹法。宁可多一个文件。
+RECONCILE_FILE = HERE / ".reconcile.state"
+
+
+def _reconcile_read() -> dict:
+    try:
+        d = json.loads(RECONCILE_FILE.read_text(encoding="utf-8"))
+    except Exception:                       # 文件不存在 / 坏了 —— 都当"从没读到过"
+        return {}
+    return d if isinstance(d, dict) else {}
+
+
+def _reconcile_write(ok: dict) -> None:
+    try:
+        tmp = RECONCILE_FILE.with_suffix(".state.tmp")
+        tmp.write_text(json.dumps(ok), encoding="utf-8")
+        os.replace(tmp, RECONCILE_FILE)     # 原子替换，别让下一轮读到半个文件
+    except OSError:
+        LOG.debug("对账读数标记写不进去（不影响跑批）", exc_info=True)
+
+
+def _age_h(sec: float) -> str:
+    """把秒数说成人话。**只是给人看的**，不参与任何判据。"""
+    if sec < 90:
+        return f"{sec:.0f} 秒前"
+    if sec < 5400:
+        return f"{sec / 60:.0f} 分钟前"
+    if sec < 36 * 3600:
+        return f"{sec / 3600:.1f} 小时前"
+    return f"{sec / 86400:.1f} 天前"
+
+
 def reconcile_watch(args) -> tuple[str, dict]:
     """四类对账的读数 → (给日报正文的一段, 给 metrics 的字典)。
 
@@ -787,17 +822,26 @@ def reconcile_watch(args) -> tuple[str, dict]:
       循环里。一次 SMB/库抖动不该让整份日报消失（同 `iyuu_watch` 的规矩）。
     ★ 读不到时 metrics 给 `n/a` —— **必须给**，否则 TSV 里"这次读失败了"和
       "那天根本没跑"长得一模一样，事后分不开。
+    ★★ `n/a` 还差一半：它**只说明这一次**。所以本函数末尾会把"每一格最后一次
+      真的读到数"的时刻记进 `.reconcile.state`，并在有 `n/a` 时写进正文 ——
+      刚抖一下 vs 连续三天读不到，从此分得开（#34）。
     ★★ 但"读不到"有个**反向的**坑：`StateStore(path)` 会**把不存在的库建出来**，
-      于是"库不在"会伪装成"库是空的"→ 报出一个巨大的 `unclaimed`。所以
-      `--db` 必须先 `is_file()` 问一句（见下面的注释）。
-    ★ 三个出口各有一条 alert：`reconcile-controls`（判据没走通）/
-      `reconcile-empty`（b == 0 空转）/ `log-parse-miss`（形状对、正则没吃下），
+      于是"库不在"会伪装成"库是空的"→ 报出一个巨大的 `unclaimed`。这里问一句
+      `is_file()`（见下面的注释）；**根因**已经在 `StateStore.__init__(create=False)`
+      堵上 —— 这里这一问现在是第二道，不是唯一那道。
+    ★★ **三个出口的判断顺序就是判据本身**，别随手调换：
+        ① `not controls_ok`   —— 判据压根没走到（连基线字面量都没数到）
+        ② `delta`             —— 形状数到了、正则没吃下（**含 b == 0 的极端形**）
+        ③ `b == 0`            —— 走到这 ⇒ `a == 0`，是"真没有 Found 行"，不是"正则坏了"
+      旧顺序是 ①③②，于是 `a > 0 且 b == 0`（delta = a > 0，最严重的那种）
+      被 ③ 吞了，正文和 metrics 互相打脸。**错的不是数，是它指向的排查动作。**
       四条分支在 `tests/test_reconcile.py` §④ 里**逐条钉了 key**。
     """
     m: dict = {"fa": "n/a", "fb": "n/a", "fd": "n/a",
                "fb_c_all": "n/a", "fb_c_farm": "n/a", "unclaimed": "n/a",
                "packs_undriven": "n/a", "packs_unreg": "n/a"}
     lines: list[str] = []
+    prev_ok = _reconcile_read()             # #34：每一格上次真的读到数是什么时候
 
     log_path = (getattr(args, "log", None) or [None])[0]
     text = None
@@ -825,23 +869,39 @@ def reconcile_watch(args) -> tuple[str, dict]:
                        "不是「没有 Found 行」。\n"
                        f"日志: {log_path}\n总行数: {c.total_lines}\n"),
                  key="reconcile-controls", metrics={"fa": c.a, "fb": c.b})
-        elif c.b == 0:
-            # ★ 零命中既可能是没事，也可能是没跑（§18.17.3）。
-            emit("alert", "观测对账：一条 Found 都没抓到",
-                 body=("b == 0。**这不是「干净」** —— 要么真没搜出去过，要么日志抓错了。\n"
-                       "回灌靠这些行推「哪个站搜到了」，b 长期为 0 时状态机的「匹配到单种」\n"
-                       "会一直是 0。\n"
-                       f"日志: {log_path}\n总行数: {c.total_lines}\n"),
-                 key="reconcile-empty", metrics={"fa": c.a, "fb": c.b})
         elif c.delta:
+            # ★★★ 顺序很关键：这一支必须排在 `b == 0` **前面**。
+            #   旧顺序是 `controls_ok → b == 0 → delta`，于是 `a > 0 且 b == 0`
+            #   （delta = a > 0，**最严重**的那种「形状对、正则一条都没吃下」）
+            #   被前面的 `b == 0` 吞了：正文说「要么真没搜出去过，要么日志抓错了」，
+            #   而 metrics 里 `fa` 明明白白 > 0 —— **两个字段互相打脸**。
+            #   看告警的人只读正文，于是会去查「为什么没搜」，而真问题是正则整条失效。
+            #   ★ 错的不是数，是它**指向的排查动作**（同 §18.17.3 那条）。
             head = "\n".join("   " + _redact(s)[:190] for s in c.unparsed) or "   （没留样本）"
+            zero = ""
+            if c.b == 0:
+                zero = (f"★★ b == 0：**一条都没吃下** —— 形状明明数到了 {c.a} 行。\n"
+                        f"   这不是「今天没搜出去」（那要 a == 0），是正则**整条失效**。\n")
             emit("alert", f"观测对账：{c.delta} 行「形状对、正则没吃下」",
-                 body=("有行满足目标形状的六个字面量，但**生产正则 `_RE_FOUND` 没吃下**。\n"
+                 body=(zero +
+                       "有行满足目标形状的六个字面量，但**生产正则 `_RE_FOUND` 没吃下**。\n"
                        "这些行在台账里等于**没发生过** —— 抓不到 = 不存在。\n"
                        f"日志: {log_path}\n"
                        "★ 常见成因：站名/片名里出现了正则不该吃的字符（09-12 修过一次）。\n"
                        "---- 没吃下的行 ----\n" + head + "\n"),
                  key="log-parse-miss", metrics={"fa": c.a, "fb": c.b, "fd": c.delta})
+        elif c.b == 0:
+            # ★ 走到这里 ⇒ `delta == 0` 且 `a == 0`（上面那支已把 delta > 0 接走）。
+            #   即**形状一条都没数到** —— 不是「正则没吃下」（那样 delta 会 > 0），
+            #   是**根本没有 Found 行**。§18.17.3：零命中既可能是没事，也可能是没跑。
+            emit("alert", "观测对账：一条 Found 都没抓到",
+                 body=(f"形状行 a == 0，正则行 b == 0（★ 不是「正则没吃下」——"
+                       f"那样 delta 会大于 0，那是另一条告警）。\n"
+                       "**这不是「干净」** —— 要么真没搜出去过，要么日志抓错了文件。\n"
+                       "回灌靠这些行推「哪个站搜到了」，b 长期为 0 时状态机的「匹配到单种」\n"
+                       "会一直是 0。\n"
+                       f"日志: {log_path}\n总行数: {c.total_lines}\n"),
+                 key="reconcile-empty", metrics={"fa": c.a, "fb": c.b})
 
     # b − c 与无人认领都要真库；库不可达时**分开报**，别让一条坏了带走另一条。
     store = snap = None
@@ -983,6 +1043,33 @@ def reconcile_watch(args) -> tuple[str, dict]:
             store.con.close()
     except Exception:                       # noqa: BLE001
         pass
+
+    # ---- #34：`n/a` 要配「上次成功读数时刻」 ----
+    # ★ 为什么非要有这一行：`n/a` 本身**只说明这一次**。TSV 里一个已经连续
+    #   三天读不到的格子，和一个昨天还好、今天抖了一下的格子，长得**一模一样** ——
+    #   于是"判据长期失效"和"偶发抖动"在事后完全分不开。
+    #   判据要能指回时间，才谈得上"指回判据之外的真实记录"。
+    # ★ 只记**真的读到数**的那些格：`n/a` 不覆盖旧时间戳（否则一次失败就把
+    #   "上次成功"抹成"从没成功过"，反而丢信息）。
+    now_ts = time.time()
+    live = dict(prev_ok)
+    for k, v in m.items():
+        if v != "n/a":
+            live[k] = now_ts
+    na = sorted(k for k, v in m.items() if v == "n/a")
+    if na:
+        marks = []
+        for k in na:
+            t = prev_ok.get(k)
+            # ★ 「上次成功 X 前」和「从未成功读到过」是**两种处置**：
+            #   前者去查这一次为什么抖（SMB/库占用），后者去查这个格子
+            #   从装上那天起是不是根本没接上（输入源配错了）。所以两句都要写全。
+            marks.append(f"{k}（上次成功 {_age_h(now_ts - t)}）" if t
+                         else f"{k}（★ 从未成功读到过）")
+        lines.append("观测对账〔本轮 n/a 的格子〕：" + "、".join(marks)
+                     + "\n   ★ 括号里是**这个格子最后一次真的读到数**是什么时候 ——"
+                       "刚抖一下 vs 长期读不到，差别全在这里。")
+    _reconcile_write(live)
     return "\n".join(lines), m
 
 
