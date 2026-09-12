@@ -1,0 +1,164 @@
+# -*- coding: utf-8 -*-
+"""编排器 `state` 子命令的自测（§11.9 那条待办）。
+
+重点不是"能打印"，而是两件**容易做错**的事：
+  ① ★ 库不存在时**绝不许**把文件建出来（`StateStore.__init__` 会凭空建库）
+  ② `state` 必须在**读配置之前**分派 —— 配置坏了的时候它还得能用
+
+不碰生产：全部在一个临时库里现造。
+"""
+import os
+import sys
+import tempfile
+from pathlib import Path
+
+REPO = str(Path(__file__).resolve().parent.parent)  # 仓库根
+sys.path.insert(0, REPO)
+
+from orchestrator import state as S   # noqa: E402
+from orchestrator import main as M    # noqa: E402
+
+# ★ 输出强制 UTF-8：GBK 控制台下 ⑪(U+246A) 编不出去，会在中途炸掉。
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
+TMP = Path(tempfile.mkdtemp())
+fails = []
+
+
+def ck(label, got, want):
+    ok = got == want
+    print(("  ok  " if ok else " FAIL ") + f"{label}: {got!r}")
+    if not ok:
+        fails.append(f"{label}: got {got!r} want {want!r}")
+
+
+class Capture:
+    """把 stdout 收起来，好断言打印内容。"""
+
+    def __init__(self):
+        self.buf = ""
+
+    def __enter__(self):
+        import io
+        self._old = sys.stdout
+        sys.stdout = io.StringIO()
+        return self
+
+    def __exit__(self, *a):
+        self.buf = sys.stdout.getvalue()
+        sys.stdout = self._old
+        return False
+
+
+def run(argv):
+    """跑一次 main()，返回 (退出码, 输出)。
+
+    ★ 要接住 SystemExit：argparse 参数错时会直接 `sys.exit(2)`，
+      不接的话整个测试脚本会**在断言之前就死掉**（第一次跑就是这样）。
+    """
+    with Capture() as c:
+        try:
+            rc = M.main(argv)
+        except SystemExit as e:                  # argparse 的参数错
+            rc = e.code if isinstance(e.code, int) else 2
+    return rc, c.buf
+
+
+def make_db(path: Path, packs):
+    """packs: [(name, root, [(dir_name, stage)])]"""
+    with S.StateStore(path) as st:
+        for name, root, movies in packs:
+            st.con.execute("INSERT INTO pack(name,root,created_at) VALUES(?,?,?)",
+                           (name, root, "t"))
+            for dn, stage in movies:
+                # ★ id 是 INTEGER PRIMARY KEY，别拿字符串凑（会报 datatype mismatch）
+                st.con.execute(
+                    "INSERT INTO movie(id,pack,dir_name,path,stage,matched_indexers)"
+                    " VALUES((SELECT COALESCE(MAX(id),0)+1 FROM movie),?,?,?,?,?)",
+                    (name, dn, f"{root}/{dn}", stage, '["HDFans"]'))
+        st.con.commit()
+
+
+DB = TMP / "state.db"
+make_db(DB, [
+    ("bbb-pack", "/r/bbb", [("片1", S.STAGE_SEEDING), ("片2", S.STAGE_PENDING)]),
+    ("aaa-pack", "/r/aaa", [("片A", S.STAGE_SEEDING), ("片B", S.STAGE_UNMATCHED),
+                            ("片C", S.STAGE_SKIPPED)]),
+])
+
+# --------------------------------------------------------------------------- #
+print("== ① 不带 --pack：列出全部包，按名字排序 ==")
+rc, out = run(["state", "--db", str(DB)])
+ck("  退出码 0", rc, 0)
+ck("  两个包都在", ("aaa-pack" in out and "bbb-pack" in out), True)
+ck("  ★ aaa 在 bbb 之前（SQL 里排的序）", out.index("aaa-pack") < out.index("bbb-pack"), True)
+ck("  登记数打出来了", "登记 3 部" in out, True)
+ck("  各阶段的中文含义在", "★被退避跳过" in out, True)
+
+print("\n== ② 带 --pack：只出那一个 ==")
+rc, out = run(["state", "--db", str(DB), "--pack", "aaa-pack"])
+ck("  退出码 0", rc, 0)
+ck("  有 aaa", "aaa-pack" in out, True)
+ck("  ★ 没有 bbb", "bbb-pack" in out, False)
+
+print("\n== ③ 未登记的包 → 退出码 2，不是 0 ==")
+rc, out = run(["state", "--db", str(DB), "--pack", "查无此包"])
+ck("  退出码 2", rc, 2)
+ck("  说清楚是未登记", "未登记" in out, True)
+
+print("\n== ④ ★★ 库不存在：报错、退出码 2、且**绝不许**把文件建出来 ==")
+# 背景：StateStore.__init__ 会 mkdir -p 再 sqlite3.connect()，
+# 而 sqlite 连不存在的路径**不报错、直接建一个 0 字节的库**。
+# 实测踩过 —— 打错一层路径就在媒体目录里留下一个空 state.db。
+missing = TMP / "sub" / "nope.db"
+rc, out = run(["state", "--db", str(missing)])
+ck("  退出码 2", rc, 2)
+ck("  明说不会替你建库", "不会替你建一个空库" in out, True)
+ck("  ★★ 文件**没有**被建出来", missing.exists(), False)
+ck("  ★ 连父目录也没被建出来", missing.parent.exists(), False)
+ck("  给了真实位置（drive-loop/hlink）", "drive-loop/hlink/state.db" in out, True)
+
+print("\n== ⑤ --detail：逐部列出待搜 ==")
+rc, out = run(["state", "--db", str(DB), "--pack", "aaa-pack", "--detail"])
+ck("  退出码 0", rc, 0)
+ck("  列出了片名（PENDING/SKIPPED 都算待搜）", "片B" in out or "片C" in out, True)
+ck("  没加 --detail 时不列片名", "片B" in run(
+    ["state", "--db", str(DB), "--pack", "aaa-pack"])[1], False)
+
+print("\n== ⑥ --trend：附上趋势（§16.3） ==")
+rc, out = run(["state", "--db", str(DB), "--trend"])
+ck("  退出码 0", rc, 0)
+ck("  出现了趋势那一段", "新增做种趋势" in out, True)
+
+print("\n== ⑦ ★ state 必须在读 config.yml **之前**分派 ==")
+# 只读一个本地库，没理由因为"配置文件不在"就跑不了 ——
+# 出故障的时候恰恰最需要它还能用。
+# ★ 注意 --config 是**顶层**参数，必须写在子命令**之前**：
+#   `main --config X state` ✅   /   `main state --config X` ❌（argparse 不认）
+rc, out = run(["--config", str(TMP / "根本没有这个文件.yml"),
+               "state", "--db", str(DB), "--pack", "aaa-pack"])
+ck("  显式指一个不存在的 --config 也照样跑通", rc, 0)
+ck("  没有报配置错误", "配置错误" in out, False)
+
+# ★ 默认配置路径 /config/config.yml 在 Windows 上**本来就不存在**，
+#   所以上面那轮其实已经证明了"没读到配置也能跑"。
+#   记一条真事实：RESEED_CONFIG 是在**导入时**读的（DEFAULT_CONFIG 是模块级常量），
+#   导入之后再设环境变量**不起作用** —— 别写出依赖它的测试。
+ck("  DEFAULT_CONFIG 是模块级常量（导入后改环境变量无效）",
+   M.DEFAULT_CONFIG, os.environ.get("RESEED_CONFIG", "/config/config.yml"))
+
+print("\n== ⑧ packs() 辅助方法 ==")
+with S.StateStore(DB) as st:
+    names = [r["name"] for r in st.packs()]
+ck("  按名字升序", names, ["aaa-pack", "bbb-pack"])
+
+print()
+if fails:
+    print(f"!!! {len(fails)} 个失败")
+    for f in fails:
+        print("   " + f)
+    sys.exit(1)
+print("全部通过")

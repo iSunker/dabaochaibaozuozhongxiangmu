@@ -1749,7 +1749,7 @@ python -m orchestrator.main prestage --job frds-top250-2024 --dry-run
    子解析器再定义同名参数会把顶层那个**覆盖成默认值** —— `main -v state` 会静默丢掉 `-v`。
    这类"看起来能跑、偶尔不灵"的坑，直接换名绕开。
 
-**验证**：`D:/tmp/test_orchestrator_state.py`，21 条断言全过（含上面第 1、2 条那两个"必须不"）。
+**验证**：`tests/test_orchestrator_state.py`，21 条断言全过（含上面第 1、2 条那两个"必须不"）。
 另用**真库快照**（连 WAL 一起拷）跑过一遍：dc 115 / frds 486（161 待搜）/ mbf 4 —— 与基准一致。
 
 配置默认读容器内 `/config/config.yml`，可用 `--config` 或环境变量 `RESEED_CONFIG` 覆盖：
@@ -4723,7 +4723,7 @@ DST="${_DST_FROM_ENV:-${DST:-}}"
 
 **三层验证**：
 
-1. **离线断言** 15 条全过（`D:/tmp/test_farm_root.py`）
+1. **离线断言** 15 条全过（`tests/test_farm_root.py`）
 2. **只读模拟真库**：镜像覆盖 frds **486/486**、dc **115/115**、mbf **4/4**；
    **0 个 searchee 被两个包同时认领**；**0 个认不出**
 3. **真跑 `sync`**：**`SEEDING` 21 → 201**，并证明 **201 就是理论上限** ——
@@ -4766,7 +4766,7 @@ info.2026-09-12.log   08:16:19  Failed to reach NanyangPT (南洋): code 429 ...
 | `IndexerBackoff` 读 `indexer.active` 列 —— **被禁用的索引器不挡路** | 否则已从 `TORZNAB_URLS` 移除的站，留着一条未来的 `retry_after` 就能**卡死循环**（`active=1` 的两行恰好就是 `/2` `/4`） |
 | 时钟可注入（`now` / `monotonic`） | 否则这条路径**根本没法测** |
 
-**验证**：`D:/tmp/test_backoff.py` 15 条断言，含 **08:16 那次 55 秒窗口的完整复刻**。
+**验证**：`tests/test_backoff.py` 15 条断言，含 **08:16 那次 55 秒窗口的完整复刻**。
 
 ---
 
@@ -4788,7 +4788,7 @@ info.2026-09-12.log   08:16:19  Failed to reach NanyangPT (南洋): code 429 ...
 ★「**等了 0 秒却记了一笔**」是**故意**的：那来自「窗口落在两次检查之间、我们压根没等」的限流 ——
 记进 `backoff_hits` 供观测，但**不该改间隔**。
 
-**验证**：`D:/tmp/test_next_sleep.py` 17 条断言（三档边界 + 单调性）。
+**验证**：`tests/test_next_sleep.py` 17 条断言（三档边界 + 单调性）。
 
 ---
 
@@ -4827,7 +4827,7 @@ if last_end and gap < min_sleep: 跳过本轮
 | `finally` 的 `write_state` **整体覆盖**、不合并 | 顺带清掉 `heartbeat_ts` —— 残留心跳会让下一轮误判「上一批还在跑」 |
 | 过渡安全 | 老状态文件**没有这个键** → 读出 `0` → 闸门 = 30 分钟，与改动前**完全一致** |
 
-**验证**：`D:/tmp/test_once_gate.py`。其中两条是**专门钉住无人值守失败模式**的：
+**验证**：`tests/test_once_gate.py`。其中两条是**专门钉住无人值守失败模式**的：
 ①「无动作批会把旧退避清成 0」；②「`heartbeat_ts` 跑完必须被清掉」。
 这两个都是"**不报错、只是不动**"的形状，专门钉死。
 
@@ -5484,7 +5484,7 @@ schtasks /Query /TN "reseed-drive-loop"   →  系统找不到指定的文件
   和 TORZNAB_URLS 那行末尾多出来的那个**游离 LF** 都原样留着
   （做法：切 `\n` 而不是切 `\r\n`，给每行记住自己的尾 `\r` 再拼回）。
 
-测试 `D:/tmp/test-remove.py`：8 项断言全过（预检不改文件 / 真摘 / 字节保真 / 游离 LF 保住 /
+测试 `tests/test_remove_indexer.py`：8 项断言全过（预检不改文件 / 真摘 / 字节保真 / 游离 LF 保住 /
 幂等 / 加回往返 / 摘空被拒且没写文件 / 参数互斥）。
 
 ★ **测试第 4 项第一次报 FAIL，是断言写错了，不是代码错了**：
@@ -5634,3 +5634,69 @@ cross-seed 搜索**报错时不写 `timestamp` 行** → 状态机看到"还没�
 
 ★ 通用结论：**下次再遇到"某站搜不到"，先按那张表定位到哪一层，再决定要不要动 FlareSolverr** ——
 不要因为"这站 CF 很厚"这个**印象**，去接一个帮不上的东西。
+
+### 18.13 ★ 把 7 个测试从 `D:/tmp` 搬进仓库 `tests/`（2026-09-12 傍晚）
+
+**起因**：查「代码提交完整了么」时发现，**给仓库代码钉回归的那 7 个测试全住在 `D:/tmp`**，
+既没有版本历史、也不进备份 —— 而 README / SUMMARY 有 6 处**按绝对路径引用它们**。
+`D:/tmp` 是最容易被清掉的目录：**哪天清一次，护栏就没了，而且没有痕迹。**
+
+#### 18.13.1 搬了什么
+
+新增 `tests/`（7 个脚本 + 一个 `README.md` 索引），从 `D:/tmp` **移走**（原件已删）：
+
+| 文件 | 断言 | 钉住什么 |
+|---|---:|---|
+| `test_backoff.py` | 17 | 55 秒短退避发生在批次中途也要记一笔；残值不误记 |
+| `test_farm_root.py` | 18 | v3 农场路径归包（单根 / 多根嵌套 + 季层 / 老包不认领） |
+| `test_next_sleep.py` | 17 | `next_sleep()` 三档分级 + 单调性 |
+| `test_once_gate.py` | 24 | `--once` 闸门：间隔真落盘、真挡人；跳过文案说的是不是真原因 |
+| `test_orchestrator_state.py` | 24 | `state` 子命令：库不存在时**绝不许建文件**；须在读 config 前分派 |
+| `test_quota_trend.py` | 96 | 额度台账 A/B 双来源 + 互校 + 趋势 + 农场巡检判断 |
+| `test_remove_indexer.py` | 8 | `add-torznab-indexer.py --remove` 的字节保真与安全闸 |
+
+**合计 204 条断言，0 失败**；`python tests/<名>.py` 在**任一 cwd** 都能跑
+（路径改成按 `__file__` 解析：`Path(__file__).resolve().parent.parent` = 仓库根），
+全过退出码 0 —— 可以直接接 CI。
+
+★ 唯一改名的是 `test-remove.py` → `test_remove_indexer.py`：连字符名**不可导入**，
+和其余六个 `test_*.py` 不一致，顺手统一。
+
+#### 18.13.2 ★★ 顺手修掉两个**本来就存在**、只是没人跑才没暴露的毛病
+
+搬完**实跑**才发现 —— 这两个都不是搬运引入的：
+
+**① 控制台是 GBK 时 `⑪`(U+246A) 编不出去。** `test_quota_trend.py` 打印到 §⑪ 时
+`UnicodeEncodeError` 直接中断。★ 阴险之处在于：**已经过的断言打印全是 `ok`**，
+只有最后一行是异常 —— 看起来像"代码坏了"，其实是**输出编码**问题。
+成因：`①`..`⑩`(U+2460–U+2469) 在 GBK 里，**`⑪`(U+246A) 不在**。
+修法：每个脚本开头强制 `sys.stdout.reconfigure(encoding="utf-8")` ——
+**这个 guard 仓库里本来就有**（`test_remove_indexer.py` 自己带着），只是另外六个没跟上。
+
+**② `sys.path` 里塞 `Path` 对象没用。** `test_orchestrator_state.py` / `test_quota_trend.py`
+原先是 `REPO = Path(...)` 后 `sys.path.insert(0, REPO)` → `ModuleNotFoundError: No module named 'orchestrator'`
+（而且 `test_quota_trend` 后面还有 `REPO + "/scripts/drive-loop.py"` 这种**字符串拼接**）。
+修法：`REPO = str(Path(__file__).resolve().parent.parent)`。
+
+★ 教训同 §18.10.1：**"测试没红"不等于"测试跑过"**。这两条都是**一跑就现形**，
+而它们在此之前**从没在干净环境下被跑过** —— 上一次跑大概带着当时的环境（UTF-8 控制台 /
+cwd 恰好在仓库里），**环境把缺陷盖住了**。搬进仓库、换 cwd 实跑，才把它们逼出来。
+→ **搬家/迁移之后必须真跑一遍**，否则只是把"没人跑"换了个地方。
+
+#### 18.13.3 另一笔：`grep -c $'\r'` 数行尾是**不可靠**的
+
+判断这 7 个文件是 CRLF 还是 LF 时，`grep -c $'\r'` 在 Git Bash 里对**纯 LF** 的
+`test_backoff.py` 报出「178 行含 CR」（总行数 178）—— 看起来"全是 CRLF"。
+用 Python 数字节才是真相：`crlf=0, lf=178`，**纯 LF**。
+
+★ 顺带纠正一条一直记错的印象：**仓库 Python 的主流行尾是 LF 不是 CRLF** ——
+实测 `scripts/` 11 个里 10 个 LF、`orchestrator/` 11 个里 9 个 LF
+（只有 `scripts/reseed-state.py`、`orchestrator/config.py`、`orchestrator/qbit_client.py` 是 CRLF），
+与 `.gitattributes` 的 `* text=auto eol=lf` 一致。
+→ **判断行尾用 Python 数 `b"\r\n"`，别用 grep。**
+
+#### 18.13.4 引用同步
+
+README 1 处、SUMMARY 5 处（本次共 6 处）绝对路径改成 `tests/...`。
+★ 另外两处 `D:/tmp` 是**故意不动**的，别顺手改：README 里的
+`--notify-spool "D:/tmp/x"` 是**举例子说 spool 目录可以改到哪儿**，与测试无关。

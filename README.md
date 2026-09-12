@@ -82,6 +82,9 @@ prowlarr_cross-seed_autohardlink/   # NAS 部署目录（compose 就放这里，
 > 〔加站流程第 ③ 步的闸门，见 SUMMARY §18.11〕。
 > 其余工具要么跑在 NAS 上，要么是**手动**用的（不必进容器）。
 > ★ 2026-09-12 起电脑端只留 **`deploy.sh`** 一个用途，见「⛔ 电脑端已不参与」。
+> `tests/` 是**离线自测**（7 个脚本 / 204 条断言）—— 原先散在 `D:/tmp` 里**没有版本管理**，
+> 2026-09-12 搬进仓库。不联网、不碰生产、不碰真库，`python tests/<名字>.py`
+> **任一 cwd** 都能跑（路径按 `__file__` 解析），全过退出码 0。见 `tests/README.md`。
 > 由状态机导出的 `unmatched.tsv` /
 > `todo-paths.txt` 属运行时产物，已 gitignore。
 
@@ -989,7 +992,7 @@ schtasks /Delete /TN "reseed-drive-loop" /F
    缺的是 **`state`**，`status` **早就有了**。两者名字像、含义完全不同：
    `status` 看 **qB 快照**，`state` 看**我们自己的 sidecar 状态库**；
    它们对不上恰好是 §17.5.1 那类 bug 的症状。实现与四个决定见 **SUMMARY §11.10**，
-   测试 `D:/tmp/test_orchestrator_state.py`（21 条）。
+   测试 `tests/test_orchestrator_state.py`（24 条）。
    ✅ 容器里要用的那一步也做完了：给 compose 补了 `./drive-loop/hlink:/state:ro`
    （+ `RESEED_STATE_DB=/state/state.db`）。挂 **`ro`** 是必须的 —— `StateStore`
    打开库时会跑 schema 迁移（`ALTER TABLE`），rw 等于让一个**只读语义**的子命令
