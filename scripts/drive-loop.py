@@ -389,7 +389,16 @@ def check_indexers(args) -> None:
              body=(f"--indexers 列了：{', '.join(extra)}\n"
                    f"但 cross-seed 根本不会搜它们（不在它的 TORZNAB_URLS 里）。\n\n"
                    "后果：状态机会把这些站记成「搜过」，实际是假的 —— 片子永远不会被搜。\n\n"
-                   "修法：从 --indexers 里删掉（计划任务的 /TR 参数里也有一份，两处都要改）。\n"),
+                   "修法：从 --indexers 里删掉它们\n"
+                   "     ★ 改 **<compose>/drive-loop/run.sh** 里那一行"
+                   "（--indexers HDFans,NanyangPT）——\n"
+                   "       电脑端已退役，没有第二处要改了。\n"
+                   "     ⚠ 但删之前先分清是哪种「多了」—— 删错了会把新站**永远**排除：\n"
+                   "       ① 只在 --indexers 里写过、.env 里没有它 → 照上面删掉。\n"
+                   "       ② .env 的 TORZNAB_URLS 里**有**它 → 那是容器没重建\n"
+                   "          （env_file 的改动不重建容器不生效），正确修法是\n"
+                   "             sudo docker compose up -d --force-recreate cross-seed\n"
+                   "          **不是**删 --indexers。\n"),
              key=f"indexer-extra:{','.join(extra)}", metrics={"extra": len(extra)})
     if not (unnamed or missing or extra):
         LOG.info("索引器自检通过：cross-seed 实际会搜 %s，与 --indexers 一致。",

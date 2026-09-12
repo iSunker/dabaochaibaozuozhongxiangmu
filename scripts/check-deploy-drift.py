@@ -367,12 +367,21 @@ def main():
     # ---------- B 方向：本地仓库 ----------
     print("\n[ B ]  本地仓库：已跟踪、但没进白名单 / 也没声明「不部署」的")
     try:
-        r = subprocess.run(["git", "-C", str(REPO), "ls-files"],
-                           capture_output=True, text=True, check=True)
+        # ★ 必须 `-c core.quotepath=false`，且**不能用 text=True**：
+        #   git 默认把非 ASCII 路径转义成 `"\350\265\260..."` —— 一整串**纯 ASCII**，
+        #   于是 `走过的弯路.md` 拿着这串去匹配 LOCAL_ONLY 里的 `^走过的弯路\.md$`
+        #   永远匹配不上。表现恰好是本脚本最该防的那种坏法：**登记了，但静默失效**
+        #   （2026-09-12 自查发现：LOCAL_ONLY 第 103 行那条一直是死代码）。
+        #   关掉转义后 git 直接吐原始字节，所以显式按 utf-8 解码 ——
+        #   别图省事用 text=True：Windows 上 locale 是 GBK，会把 UTF-8 路径解成乱码，
+        #   比报假阳性更难查。
+        r = subprocess.run(
+            ["git", "-C", str(REPO), "-c", "core.quotepath=false", "ls-files"],
+            capture_output=True, check=True)
     except (OSError, subprocess.CalledProcessError) as e:
         print(f"✗ git ls-files 失败: {e}", file=sys.stderr)
         return 2
-    tracked = [f for f in r.stdout.split("\n") if f.strip()]
+    tracked = [f for f in r.stdout.decode("utf-8", "surrogateescape").split("\n") if f.strip()]
 
     rows = []
     for rel in tracked:
