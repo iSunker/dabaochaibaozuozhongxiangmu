@@ -225,6 +225,9 @@ ck("没有 --log：正文点名「跳过」", "跳过" in note, True)
 note, m = D.reconcile_watch(argparse.Namespace(log=[LOG_A], db=None, db_path=None))
 ck("有日志：fa / fb 是真数", (m["fa"], m["fb"]), (3, 3))
 ck("有日志：a − b", m["fd"], 0)
+# ★ 口径名必须出现在正文里：`info.current.log` **按天轮转**，所以这几个数天然是
+#   「从今天 00:00 到现在」。不写出来的话，"昨天 1011、今天日报 400" 会被念成判据坏了。
+ck("正文带口径名（当日日志）", "〔当日日志〕" in note, True)
 ck("没库：b−c 给 n/a", m["fb_c_all"], "n/a")
 ck("没库：无人认领给 n/a（不是 0）", m["unclaimed"], "n/a")
 ck("差值 0 时**不发**告警", events, [])

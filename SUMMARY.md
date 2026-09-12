@@ -6390,7 +6390,7 @@ Found 行共 1011 条
 #### 18.19.4 验收
 
 ```
-12 个脚本 / 373 条断言 / 0 失败           （+test_reconcile.py，41 条）
+12 个脚本 / 382 条断言 / 0 失败           （+test_reconcile.py，50 条）
 scan-secrets.py            rc=0
 check-deploy-drift.py      rc=0   A: 未知 0   B: 未登记 0
 audit-found-lines.py       a 1011 / b 1011 / 差 0，三道控制全过
