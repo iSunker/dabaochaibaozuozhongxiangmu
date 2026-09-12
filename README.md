@@ -31,7 +31,7 @@
 | 从零部署一台 | **部署步骤**（Phase 0→3，每步可独立验证）+ **验证清单** |
 | 跑起来 / 继续跑 | **当前状态与下一步** ← 最常用，先看这个 |
 | 我卡住了（报错 / 搜不到 / 不动了） | **常见问题** + **交接必读的坑** |
-| **想从电脑上手动跑点什么** | **⛔ 电脑端已不参与** ← 电脑只剩三个用途：`deploy.sh`（推代码）、`check-deploy-drift.py`（查漂移）、`scan-secrets.py`（推前扫凭据） |
+| **想从电脑上手动跑点什么** | **⛔ 电脑端已不参与** ← 电脑只剩诊断用途：`deploy.sh`（推代码）、`check-deploy-drift.py`（查漂移）、`scan-secrets.py`（推前扫凭据）、`audit-found-*.py`（对账 `Found` 行） |
 | **想知道 NAS 上有没有我不知道的文件** | **漂移哨兵** ← `python scripts/check-deploy-drift.py` |
 | **想推代码，但怕把密钥一起推上去** | **推前凭据扫描** ← `python scripts/scan-secrets.py`（绿了再 `git push`） |
 | 加站 / 换站 | **多站点** → SUMMARY §13.3（完整流程，可复用） |
@@ -85,11 +85,15 @@ prowlarr_cross-seed_autohardlink/   # NAS 部署目录（compose 就放这里，
 > `check-deploy-drift.py` **只读**的**漂移哨兵**（NAS 上有没有没登记的文件 / 仓库里有没有
 > 该部署却没进白名单的文件，见「漂移哨兵」一节，SUMMARY §18.14）、
 > `scan-secrets.py` **只读**的**推前凭据扫描**（按值的形状找漏进仓库的 cookie / apikey /
-> passkey，见「推前凭据扫描」一节，SUMMARY §18.15）。
+> passkey，见「推前凭据扫描」一节，SUMMARY §18.15）、
+> `audit-found-lines.py` / `audit-found-resolve.py` **只读**的两道**对账**
+> （`Found` 行：a−b 验「抓到的形状 = 正则认的形状」，b−c 验「抓到的行真的落到了某个单片」；
+> 直读 NAS 的 `info.current.log` 与 `state.db`〔后者 `query_only` 硬闸〕，见 SUMMARY §18.18）。
 > 其余工具要么跑在 NAS 上，要么是**手动**用的（不必进容器）。
 > ★ 2026-09-12 起电脑端只留 **`deploy.sh`**（推代码）、**`check-deploy-drift.py`**（查漂移）、
-> **`scan-secrets.py`**（推前扫凭据）三个用途，见「⛔ 电脑端已不参与」。
-> `tests/` 是**离线自测**（8 个脚本 / 229 条断言）—— 原先散在 `D:/tmp` 里**没有版本管理**，
+> **`scan-secrets.py`**（推前扫凭据）、**`audit-found-*.py`**（对账）几个用途，
+> 见「⛔ 电脑端已不参与」。
+> `tests/` 是**离线自测**（11 个脚本 / 332 条断言）—— 原先散在 `D:/tmp` 里**没有版本管理**，
 > 2026-09-12 搬进仓库。不联网、不碰生产、不碰真库，`python tests/<名字>.py`
 > **任一 cwd** 都能跑（路径按 `__file__` 解析），全过退出码 0。见 `tests/README.md`。
 > 由状态机导出的 `unmatched.tsv` /
@@ -844,7 +848,7 @@ python scripts/drive-loop.py --once --notify-spool "D:/tmp/x"    # 换个 spool
 | ~~**2**~~ | ~~**换一个站替换 BTSCHOOL**~~ ✅ **已关闭（2026-09-12 17:15）—— 是「当初的判据失效了」，不是「换好了」**：BTSCHOOL 现在**搜得出去、也匹配得到** —— `matched_indexers` = **23 部**，命中率 **23/46 = 50%**（四个站里最高），且这 23 部**全在 DC 包里、是那个包的最大贡献者**（压过 HDFans 的 21 部）；实时搜 `The Dark Knight 2008` 回 **24 条**、`Spider-Man No Way Home 2021` 回 **40 条**，Prowlarr 日志里它的 warn/error = **0**。要换它是因为 2026-09-11 它在 Prowlarr 出 CF 挑战页 → 后来重新启用、`/3/api` 加回 `.env`、容器重建，**那道坎过了，只是没人回来销账**。下站工具 `add-torznab-indexer.py --remove` 留着备用 | **真要换，按数据该换的是 `NanyangPT`（4/452 = 0.9%），不是它** —— 不过南洋可能只是片库对不上这批包，得先看目录 | §18.11.6 |
 | ~~**3**~~ | ~~四个新功能~~ ✅ **四条全部实现并部署**（农场巡检的**前置**、额度感知、趋势、**把农场巡检挂成定期任务**）；★ 最后一条已于 **2026-09-12 14:30 在生产实跑验证**——见 **SUMMARY §16.2.2.1「已在生产验证」** | ~~⬜ 只写了设计，均未实现~~ | §16 |
 | — | ~~**人工**：删掉 Windows 计划任务 `reseed-drive-loop`~~ ✅ **已确认根本不存在（2026-09-12 傍晚）** —— `schtasks /Query /TN "reseed-drive-loop"` 报「系统找不到指定的文件」，且全表 **375 个任务**里 `grep reseed` 命中 **0**。**不用删了** | ~~两边同时驱动会打出成片 429~~（风险已随退役消失） | §14.6 + §18.11.3 |
-| **4** | **把对账脚本收进 `scripts/`，然后跑一次「农场那条防线」的对账** —— ⚠ 现在脚本只在 `D:\tmp\audit-bc.py`，**不在版本库里**（`D:\tmp` 一清，这条待办就没法执行 —— 先收进 `scripts/` 并按惯例登记进漂移哨兵的「不部署」名单）。收好之后：等日志里出现 `[inject] … from dataDir (/volume1/video/download/reseed/reseed_farm/…)` 的 Found 行，跑同一个脚本 | 2026-09-12 晚跑出的 a−b=0 / b−c=0 **只覆盖「原路径」这条制度**：1011 条 Found 行**全部**是 `[webhook]`、组5 **全部**是原路径 ⇒ `_RE_FOUND` 的 `[inject]` 分支、以及 `_resolve_searchee_to_pack()` 的**农场分支**流量为 **0**。**v3 农场那条防线至今没在生产里被走到过** —— 绿，但绿可能是因为规则压根没参与匹配 | §18.18.2 |
+| **4** | **跑一次「农场那条防线」的对账** —— ✅ **前半已完（2026-09-12 晚）**：两个脚本已收进版本库并登记进漂移哨兵的「不部署」名单 —— `scripts/audit-found-lines.py`（对账 **a − b**）与 `scripts/audit-found-resolve.py`（对账 **b − c**，UNC 直读 `state.db`）。**只剩后半**：等日志里出现 `[inject] … from dataDir (/volume1/video/download/reseed/reseed_farm/…)` 的 Found 行，重跑 `audit-found-resolve.py` 一次 | 2026-09-12 晚跑出的 a−b=0 / b−c=0 **只覆盖「原路径」这条制度**：1011 条 Found 行**全部**是 `[webhook]`、组5 **全部**是原路径 ⇒ `_RE_FOUND` 的 `[inject]` 分支、以及 `_resolve_searchee_to_pack()` 的**农场分支**流量为 **0**。**v3 农场那条防线至今没在生产里被走到过** —— 绿，但绿可能是因为规则压根没参与匹配。★ 脚本里那格 `组5 落在农场根下 0` 就是这道判据的自检：**它恒为 0 时，上面那个 0 覆盖不到农场** | §18.18.2 |
 | **5** | **决定要不要给 `SyncReport` 加一格 `other_pack`** —— **设计决定，不是 bug 修**（现在没计数器**不影响正确性**，影响的是「出事了看不看得见」） | 三条通道里只有 `db.searched` 那条有计数器（`unresolved`），而 `other_pack`、`db.decisions` 循环、日志 `Found` 路径**全静默**。后果已实测钉住：searchee 漂到别的包 → SEEDING 塌成 PENDING，而报告里 `unresolved=0`、`from_db=0`，**一个字都不说**；换成「名字认不出」后果一模一样、只有它会被计数 | §18.18.5 + `tests/test_sync_empty_sets.py` §⑤⑥ |
 | — | **观察：`title mismatch` 的量** —— **只记着，未处理**。`[inject] Skipping match … with /…/reseed/reseed_farm/… due to title mismatch`：07 时 **197** / 08 时 **311** / 12 时 **128** / 16 时 **202** / 17 时 **70**。摘要是中文名、候选是英文发行名，看着像同一类；cross-seed 给的口子是 `--ignore-titles` | 若确实在**整类地**否掉本该注入的候选，那是**注入量**的损失 —— 而注入量直接决定做种数。**先量、再决定要不要给口子**，所以只记不动 | — |
 
@@ -1017,8 +1021,8 @@ python scripts/reseed-state.py drive --pack dc-collection --indexers HDFans,Nany
 ### ⛔ 电脑端已不参与（2026-09-12 退役）
 
 **一句话**：跑批、发信、建农场全在 NAS 上；Windows 只剩 **`deploy.sh`**（把代码推上去）、
-**`check-deploy-drift.py`**（查两边一不一致）、**`scan-secrets.py`**（推之前扫一遍凭据）
-三个用途。
+**`check-deploy-drift.py`**（查两边一不一致）、**`scan-secrets.py`**（推之前扫一遍凭据）、
+**`audit-found-*.py`**（对账 `Found` 行：只读 NAS 的日志与库）四个用途。
 
 为什么单独写一节：代码里**到处**都有"Windows 也能跑"的痕迹（UNC 路径兜底、
 `tasklist` 判活、计划任务包装器、git-bash 路径转换的告警……），
