@@ -662,8 +662,52 @@ def alert_blocked_indexers(args, *, now: datetime | None = None) -> int:
     return n
 
 
+# --------------------------------------------------------------------------- #
+# IYUU 辅种条数 —— §18.8 留下的**唯一生产级证伪点**
+# --------------------------------------------------------------------------- #
+# 搬迁（reseed_farm → reseed/）时推断：IYUU 不存目标目录、每次从 qB 现读，所以
+# 搬迁对它**透明**。**唯一能证伪这个推断的观测**，就是看它次日 01:45（它的
+# cron 是 `45 1 * * *`）跑完之后，`:3060` 上 `IYUU自动辅种` 的条数还在不在涨。
+#
+# ★ 只记账、**不告警**：这是个慢性观测（要几天才有结论），而即时 alert 通道必须
+#   留给急性故障 —— 否则就是 §16.1.3 警告过的"骚扰多了你去建过滤规则，然后连真
+#   告警一起过滤掉"。它冻住了也不该当场喊。
+# ★ 数字必须同时进 `metrics`：notify 的 TSV 流水只记 ts/kind/title/**metrics**，
+#   **不记正文**。只写在正文里，回头分析时是拿不到的。
+IYUU_TAG = "IYUU自动辅种"
+IYUU_BASELINE = 100     # 2026-09-12 搬迁实测（SUMMARY §18.8 的构成表）
+
+
+def iyuu_verdict(n: int, baseline: int = IYUU_BASELINE) -> str:
+    """条数 → 一句话结论。**纯函数**，好钉测试。"""
+    if n > baseline:
+        return f"仍在增长（基线 {baseline}）"
+    if n == baseline:
+        return f"与基线持平（{baseline}）"
+    return f"⚠ **低于**基线 {baseline}"
+
+
+def iyuu_watch(args) -> tuple[str, dict]:
+    """问 :3060 要 `IYUU自动辅种` 的条数 → (给正文的一行, 给 metrics 的字典)。
+
+    ★ **绝不抛**：它挂在每天一次的日报里，而日报挂在**每 15 分钟一批**的生产
+      循环里。一次 qB 抖动不该让整份日报消失（同本函数上面各节的规矩）。
+    ★ 读不到时 metrics 给 `n/a` —— **必须给**，否则 TSV 里"这次读失败了"和
+      "那天根本没跑"长得一模一样，事后分不开。
+    """
+    url = getattr(args, "qbit_url", None)
+    if not url:
+        return "IYUU 辅种条数：跳过（没有 --qbit-url）", {"iyuu": "no-url"}
+    try:
+        n = len(S.qbit_tagged(url, IYUU_TAG))
+    except Exception as e:              # noqa: BLE001 —— 附属观测，绝不拖垮日报
+        LOG.debug("读 IYUU 辅种条数失败", exc_info=True)
+        return f"IYUU 辅种条数：读不到（{type(e).__name__}: {e}）", {"iyuu": "n/a"}
+    return f"IYUU 辅种条数：**{n}** —— {iyuu_verdict(n)}", {"iyuu": n}
+
+
 def report_daily(args, *, force: bool = False, farm_note: str = "") -> bool:
-    """每天最多投一次的台账：额度（来源 A+C）+ 新增做种趋势。
+    """每天最多投一次的台账：额度（来源 A+C）+ 新增做种趋势 + IYUU 辅种条数。
 
     ★ 为什么必须自己记「今天发过没有」：notify 的**冷却只对 alert 生效**
       （`batch`/`info` 走 `.get(kind, "info")` → level=info，`_cooled` 根本不查）。
@@ -704,9 +748,14 @@ def report_daily(args, *, force: bool = False, farm_note: str = "") -> bool:
     if farm_note:
         parts.append(farm_note)
 
+    iyuu_note, iyuu_metrics = iyuu_watch(args)
+    parts.append(iyuu_note)
+
     body = "\n\n".join(parts)
+    # ★ 数字要进 `metrics` 才落得进 TSV 流水（notify 只记 ts/kind/title/metrics，
+    #   **不记正文**）—— 详见 iyuu_watch 的说明。
     if emit("batch", "每日台账", body=body, key="daily",
-            metrics={"day": today}):
+            metrics={"day": today, **iyuu_metrics}):
         _daily_set(today)
         LOG.info("已投递每日台账（额度 + 趋势）")
         return True

@@ -2275,20 +2275,40 @@ def wait_for_log_quiet(log_path: str | Path, *, quiet_sec: float = 90.0,
 # --------------------------------------------------------------------------- #
 # 这几个原本在 scripts/reseed-state.py 里（私有 `_xxx`），drive-loop.py 又各复制了
 # 一份公开版 —— 两份实现"改一个忘一个"就会静默算错数。集中到这里，两边都 import。
+def _qbit_torrents_info(url: str, params: dict[str, str], timeout: float) -> list[dict]:
+    """`GET /api/v2/torrents/info?<params>` —— `qbit_torrents` / `qbit_tagged` 共用。
+
+    ★ 抽出来是**故意的**，理由就是上面那三行：本项目已经栽过一次"两份实现改一个
+      忘一个"。与其再抄一份按 tag 取数的，不如让两条路走同一段 URL 拼装和同一段
+      错误语义 —— 将来要加超时/重试/鉴权，改一处就够。
+    """
+    import urllib.parse
+    import urllib.request
+
+    full = url.rstrip("/") + "/api/v2/torrents/info?" + urllib.parse.urlencode(params)
+    req = urllib.request.Request(full, headers={"Referer": url.rstrip("/")})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8")) or []
+
+
 def qbit_torrents(url: str, category: str, timeout: float = 30.0) -> list[dict]:
     """取 qB 某分类的全部种子。
 
     **失败会抛异常** —— 由调用方决定是忽略（无人值守的循环，宁可少一个数据源
     也不要整批挂掉）还是中止（诊断脚本，想知道 qB 是不是真的不通）。
     """
-    import urllib.parse
-    import urllib.request
+    return _qbit_torrents_info(url, {"category": category}, timeout)
 
-    q = urllib.parse.urlencode({"category": category})
-    full = url.rstrip("/") + "/api/v2/torrents/info?" + q
-    req = urllib.request.Request(full, headers={"Referer": url.rstrip("/")})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read().decode("utf-8")) or []
+
+def qbit_tagged(url: str, tag: str, timeout: float = 30.0) -> list[dict]:
+    """取 qB 上挂了某个 tag 的全部种子。**失败语义同 `qbit_torrents`。**
+
+    ★ 为什么不复用按分类那条：**同一个 :3060 上两个系统靠 tag 区分**。
+      我们的 cross-seed 打 `cross-seed`、IYUU Plus 打 `IYUU自动辅种`，
+      而两者的 `save_path` 落在**同一批站点子目录**里，IYUU 那 100 条还
+      **没有分类**（SUMMARY §18.8 的构成表）。按分类查会把两边混成一坨。
+    """
+    return _qbit_torrents_info(url, {"tag": tag}, timeout)
 
 
 def parse_alias(items: list[str] | None) -> dict[str, str]:

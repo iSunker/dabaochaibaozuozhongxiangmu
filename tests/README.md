@@ -12,7 +12,7 @@ python tests/test_backoff.py        # 任一 cwd 都行
 路径按 `__file__` 解析（不是 cwd），所以从哪儿跑都一样。
 每个脚本自己打印 `ok` / `FAIL`：**全过退出码 0，有失败退出码 1**，可以直接接 CI。
 
-2026-09-12 实测：**8 个脚本、229 条断言、0 失败**。
+2026-09-12 实测：**9 个脚本、259 条断言、0 失败**。
 
 ## 各测什么
 
@@ -26,6 +26,7 @@ python tests/test_backoff.py        # 任一 cwd 都行
 | `test_quota_trend.py` | 96 | 额度台账（A 来源滚动 24h + B 来源 Prowlarr + 两者互校）+ 趋势（按周按站）+ 农场巡检判断（**argv 里绝不出现 `--prune`**） |
 | `test_remove_indexer.py` | 8 | `add-torznab-indexer.py --remove` 的**字节保真**与安全闸（合成样本 + 假 key，绝不碰生产 `.env`） |
 | `test_scan_secrets.py` | 25 | 推前凭据扫描器 `scripts/scan-secrets.py`：阳性拦得住（值指纹 + 形状两条路）、阴性不误报；**形状层必须参与退出码**、**只拦「本次新引入」**、三类假阳性（读变量 / 英文短语 / 同字符重复）必须被规则认出来 |
+| `test_iyuu_watch.py` | 30 | IYUU 辅种条数（§18.8 的唯一生产级证伪点）：**重构没改行为**（`qbit_torrents` 的 URL 仍是老那个字面量 —— 它在每 15 分钟的热路径上）、中文 tag 必须被百分号编码（URL 要纯 ASCII）、`iyuu_watch` **三种情形都不许抛**、以及 **数字真的进了 `metrics`**（TSV 只记 metrics 不记正文，"看着发了其实没留痕"肉眼看不出来） |
 
 ## 写测试时踩过的坑（别再踩）
 
@@ -50,6 +51,13 @@ python tests/test_backoff.py        # 任一 cwd 都行
   去拿被测文件里的正则/函数：切点一改就**静默失效**，切出来的前半段照样能跑，
   只是少了后半个文件的定义。用 `importlib` 把**真的那份**载进来（吞掉 `SystemExit`、
   重定向 `stdout`）。
+- ★ **`importlib` 载进来的模块，必须先 `sys.modules[name] = mod` 再 `exec_module`。**
+  否则被测文件里只要有 **`@dataclass`** 就炸，而且报的是一个看着毫不相干的
+  `AttributeError: 'NoneType' object has no attribute '__dict__'` ——
+  因为 `dataclasses` 要 `sys.modules.get(cls.__module__).__dict__` 去找注解的命名空间，
+  而 `spec_from_file_location` **不会**替你登记。
+  **同一段 `_load` 代码对两个文件行为不同，原因却不在它们身上**：
+  `drive-loop.py` 没有 dataclass 所以先跑通了，一度让人以为只有 `state.py` 有问题。
 
 ## 约定
 
