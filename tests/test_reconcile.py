@@ -335,6 +335,57 @@ ck("无人认领发了 alert", [e[3] for e in events if e[0] == "alert"],
 ck("正文点名那条路径（只报数 = 换个地方藏）",
    FARM + "/0观影清单chrlee整理" in note, True)
 
+print("== ④ 声明点〔--packs〕：登记了却没被驱动 —— 没有别的判据看得见 ==")
+# ★★ 这一格钉的是 2026-09-12 实测的形状（NAS 只读）：`pack` 表 **3 行**
+#    （dc-collection / frds-top250-2024 / **mbf**）、`--packs` 默认值只有**前两个**
+#    → 差集 = {`mbf`}。而 `mbf` 在 unclaimed / report / trend 上**全绿**：
+#    pack 表有行、movie 表有 4 行、farm_root 也有。抓不到它**不是判据算错了**，
+#    是**没有一条判据的输入源包含 `--packs` 的实际值** —— 这正是 §18.18 那个形状
+#    （全绿，因为规则根本没参与）。
+#    合成库里用 alpha/beta 复刻：登记 2 个、只驱动 1 个。
+events.clear()
+note, m = D.reconcile_watch(
+    argparse.Namespace(log=[LOG_A], db=db2, db_path=None, packs="alpha"))
+ck("登记了没被驱动：计数", m["packs_undriven"], 1)
+ck("在名单里但没登记：0", m["packs_unreg"], 0)
+ck("正文点名那个包（只报数 = 换个地方藏）", "beta" in note, True)
+ck("发了 alert，key 固定", [e[3] for e in events if e[0] == "alert"], ["packs-mismatch"])
+
+print("== ④ 另一个方向：名单里有、库里没有 —— 比上一格更糟 ==")
+# ★ 方向不同、后果不同：`pack` 表 − 名单 = 白登记（片子永远搜不到）；
+#   名单 − `pack` 表 = 状态机看不见它的片子，整包会被判成 other_pack 而静默降级。
+events.clear()
+note, m = D.reconcile_watch(
+    argparse.Namespace(log=[LOG_A], db=db2, db_path=None, packs="alpha,gamma"))
+ck("名单里的 gamma 库里没有", m["packs_unreg"], 1)
+ck("同时 beta 仍没被驱动", m["packs_undriven"], 1)
+ck("两个方向各自点名", ("gamma" in note and "beta" in note), True)
+ck("alert 仍是同一条（一个差集一次）",
+   [e[3] for e in events if e[0] == "alert"], ["packs-mismatch"])
+
+print("== ④ 对得上 → 两个方向都是 0，且**不发** alert ==")
+events.clear()
+note, m = D.reconcile_watch(
+    argparse.Namespace(log=[LOG_A], db=db2, db_path=None, packs="alpha,beta"))
+ck("两个方向都是 0", (m["packs_undriven"], m["packs_unreg"]), (0, 0))
+ck("对得上时不发 alert", [e for e in events if e[0] == "alert"], [])
+
+print("== ④ 没给 packs / 库读不到 → 必须 n/a，不能是 0 ==")
+# ★ 与 `fa` / `unclaimed` 同一条规矩：「调用方没传」和「名单对得上」在 TSV 里
+#   长得一模一样，事后就分不开。而且**两种都不许发 alert**（没跑到 ≠ 有信号）。
+events.clear()
+note, m = D.reconcile_watch(
+    argparse.Namespace(log=[LOG_A], db=db2, db_path=None))
+ck("库在但没给 packs：两个方向都 n/a",
+   (m["packs_undriven"], m["packs_unreg"]), ("n/a", "n/a"))
+ck("没给 packs：不发 alert", [e for e in events if e[0] == "alert"], [])
+
+note, m = D.reconcile_watch(
+    argparse.Namespace(log=[LOG_A], db=None, db_path=None, packs="alpha"))
+ck("库读不到：两个方向都 n/a（不是 0）",
+   (m["packs_undriven"], m["packs_unreg"]), ("n/a", "n/a"))
+ck("库读不到：正文说清「没跑成」", "没跑成" in note, True)
+
 print()
 if fails:
     print(f"★ {len(fails)} 条失败：")

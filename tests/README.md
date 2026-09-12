@@ -12,7 +12,7 @@ python tests/test_backoff.py        # 任一 cwd 都行
 路径按 `__file__` 解析（不是 cwd），所以从哪儿跑都一样。
 每个脚本自己打印 `ok` / `FAIL`：**全过退出码 0，有失败退出码 1**，可以直接接 CI。
 
-2026-09-12 实测：**12 个脚本、397 条断言、0 失败**。
+2026-09-12 实测：**13 个脚本、431 条断言、0 失败**。
 
 ★ 这个总数**别手算**。测试脚本的"通过"有三种行形（`  ok  ` 前缀、
 `[n] 标签 : PASS` 后缀、`scan-secrets` 自带的一套），任何**单一** grep 都会漏掉
@@ -36,7 +36,8 @@ tot=0; for f in tests/test_*.py; do out=$(python "$f" 2>&1); rc=$?; \
 | `test_once_gate.py` | 24 | `--once` 闸门接线：算出的间隔**真的落盘、真的挡住下一批**；跳过文案说的是不是真原因；没待搜时农场巡检照样跑 |
 | `test_orchestrator_state.py` | 24 | `state` 子命令：**库不存在时绝不许把文件建出来**；且必须在读 `config.yml` **之前**分派（配置坏了它还得能用） |
 | `test_quota_trend.py` | 96 | 额度台账（A 来源滚动 24h + B 来源 Prowlarr + 两者互校）+ 趋势（按周按站）+ 农场巡检判断（**argv 里绝不出现 `--prune`**） |
-| `test_reconcile.py` | 65 | 观测对账三条判据：**合取 vs 单字面量**（`] Found ` 会吃到 `Found 0 torrents for {`，实测 2231 vs 靶心 1011）、**两口径不是同一个数**（三包共用一个 `farm_root` → 生产口径 other_pack 865/146/1011 而非 0）、**全场无人认领**（1888 条里恰好 1 条，且必须点名路径）。外加接线层**六格**：`reconcile_watch` **绝不抛**、读不到给 `n/a` 不给 0、正文里带口径名与留证行，以及 ★ **三个出口各钉一条 alert**（`reconcile-controls` 判据没走通 / `reconcile-empty` 空转 / `log-parse-miss` 形状对正则没吃下 —— 这三条此前**只有第三条有断言**，另两条整段删掉测试也不会红），以及 ★ **状态库不在时不许把空库建出来**（连父目录都不能建） |
+| `test_reconcile.py` | 79 | 观测对账三条判据：**合取 vs 单字面量**（`] Found ` 会吃到 `Found 0 torrents for {`，实测 2231 vs 靶心 1011）、**两口径不是同一个数**（三包共用一个 `farm_root` → 生产口径 other_pack 865/146/1011 而非 0）、**全场无人认领**（1888 条里恰好 1 条，且必须点名路径）。外加接线层：`reconcile_watch` **绝不抛**、读不到给 `n/a` 不给 0、正文里带口径名与留证行，★ **三个出口各钉一条 alert**（`reconcile-controls` 判据没走通 / `reconcile-empty` 空转 / `log-parse-miss` 形状对正则没吃下），★ **状态库不在时不许把空库建出来**（连父目录都不能建），以及 ★ **第四类「声明点〔--packs〕」**：两个方向的差集、各自点名、对得上时两个 0 且不发 alert、没给 `--packs` 与库读不到都给 `n/a` |
+| `test_roots_from_env.py` | 20 | `init --roots-from-env` 的**取值来源**：首选 `FARM_SOURCES`、缺席时退回 `DATA_DIRS`（★ 与 `build-farm.sh:132-155` 同一种优先顺序）。核心那格是**同一个 `.env`、同一句 `--match`**：`FARM_SOURCES` 在 → 挑得到，只有 `DATA_DIRS` → 挑 0 —— 差异只可能来自取值来源，所以它量的就是"键换对了"本身。另钉：退回时**必须说出来**（不静默）、两个键都没有时报错要点名两个键、`--match` 挑不中时文案点名**实际用的那个键** |
 | `test_remove_indexer.py` | 8 | `add-torznab-indexer.py --remove` 的**字节保真**与安全闸（合成样本 + 假 key，绝不碰生产 `.env`） |
 | `test_scan_secrets.py` | 25 | 推前凭据扫描器 `scripts/scan-secrets.py`：阳性拦得住（值指纹 + 形状两条路）、阴性不误报；**形状层必须参与退出码**、**只拦「本次新引入」**、三类假阳性（读变量 / 英文短语 / 同字符重复）必须被规则认出来 |
 | `test_sync_empty_sets.py` | 31 | `sync_movie` 整行覆盖写 + 四个空集的后果：**SEEDING 塌成 PENDING 是降级不是删行**（连 `searched_indexers` 都被抹掉），而 `indexer_seen` 是**合并**保留的 → `next_retry_at` 被推到未来一整个周期 = **额度悄悄烧掉一轮**；端到端钉「一条计数器 / 两条静默通道」——searchee 落到**别的包**（`other_pack`）与**认不出的名字**（`unresolved`）后果一模一样，**只有后者会喊** |

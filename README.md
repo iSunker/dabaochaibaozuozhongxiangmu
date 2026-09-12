@@ -94,7 +94,7 @@ prowlarr_cross-seed_autohardlink/   # NAS 部署目录（compose 就放这里，
 > ★ 2026-09-12 起电脑端只留 **`deploy.sh`**（推代码）、**`check-deploy-drift.py`**（查漂移）、
 > **`scan-secrets.py`**（推前扫凭据）、**`audit-found-*.py`**（对账）几个用途，
 > 见「⛔ 电脑端已不参与」。
-> `tests/` 是**离线自测**（12 个脚本 / 397 条断言）—— 原先散在 `D:/tmp` 里**没有版本管理**，
+> `tests/` 是**离线自测**（13 个脚本 / 431 条断言）—— 原先散在 `D:/tmp` 里**没有版本管理**，
 > 2026-09-12 搬进仓库。不联网、不碰生产、不碰真库，`python tests/<名字>.py`
 > **任一 cwd** 都能跑（路径按 `__file__` 解析），全过退出码 0。见 `tests/README.md`。
 > 由状态机导出的 `unmatched.tsv` /
@@ -284,7 +284,7 @@ cross-seed **不会排队、不会重试**：索引器被退避时，待搜索�
 PACK=frds-top250-2024
 N=//YOUR-NAS/docker_ssd/prowlarr_cross-seed_autohardlink
 
-# ★推荐：根清单直接从 cross-seed 的 .env 里派生 —— 永不与 cross-seed 漂移
+# ★推荐：根清单从 .env 派生（首选 FARM_SOURCES；缺席时退回 DATA_DIRS）
 python scripts/reseed-state.py init --pack $PACK --depth 2 \
   --roots-from-env .env --match "DouBan_IMDB" --exclude "0观影清单*"
 python scripts/reseed-state.py sync --pack $PACK \
@@ -299,8 +299,9 @@ python scripts/reseed-state.py drive --pack $PACK --indexers SiteA,SiteB --limit
 ```
 
 **`init` 的根怎么给** —— 推荐**从 `.env` 派生**（`--roots-from-env .env --match "<路径关键词>"`）：
-`.env` 的 `DATA_DIRS` 就是 cross-seed 实际会扫的清单，从它派生 ⇒ 状态机与 cross-seed **永不漂移**，
-DC 那种 47 个根的包也一行搞定。另有显式 `--root/--local-root`（可重复、**必须按序一一对应**）用于单根包。
+它读的是 `.env` 的 **`FARM_SOURCES`**（v3 之后的**源清单**；切换前那份源目录写在 `DATA_DIRS` 里，
+所以 `FARM_SOURCES` 缺席时会退回 `DATA_DIRS` —— 与 `build-farm.sh` 同一种顺序）。DC 那种
+47 个根的包也一行搞定。另有显式 `--root/--local-root`（可重复、**必须按序一一对应**）用于单根包。
 `--match` 可重复（OR），`--unc-host //YOUR-NAS` 把 NAS 路径翻成 UNC（不给则试着从
 `scripts/.nasrc` 的 `NAS_NAME` 推断），`--nas-prefix` 默认 `/volume1`。
 完整参数与多根用法见 SUMMARY §10.6。
@@ -543,18 +544,34 @@ sh build-farm.sh --verify           # 只校验农场 vs 源
 
 > 「哪个是大包」这个判断**从来不发生在代码里，只发生在人手写下的配置里**。
 
-**「包」被声明在三处，缺一处失败都是静默的：**
+**声明点清单 —— 分两档，因为「漏了会怎样」完全不同：**
 
-| 声明点 | 在哪 | 声明什么 | 漏了会怎样（静默） |
+**① 静默档：漏了没有任何人知道**（**只有这一档需要检测器**）
+
+| 声明点 | 在哪 | 声明什么 | 漏了会怎样（两边看起来都正常） |
 |---|---|---|---|
-| **`FARM_SOURCES`** | NAS `.env` | 哪些目录是**源根** | `build-farm.sh --verify` 期望集里没有它 → **连漂移都不报** |
-| **`pack` 表一行** | `<compose>/drive-loop/hlink/state.db` | 名字 + `roots` + `farm_root` + `max_depth` | 农场里的片**归不到任何包** → 静默 continue |
-| **`--packs`** | `drive-loop.py` 的**默认值**（`dc-collection,frds-top250-2024`；`run.sh` **没传**） | 哪个包**会被驱动** | 状态机有它、农场有它，**就是不排它**（`mbf` 就是这么被落下的） |
+| **`FARM_SOURCES`** | NAS `.env` | 哪些目录是**源根** | `build-farm.sh --verify` 期望集里没有它 → **连漂移都不报**（两边一致地当它不存在） |
+| **`pack` 表一行** | `<compose>/drive-loop/hlink/state.db` | 名字 + `roots` + `farm_root` + `max_depth` | 农场里的片**归不到任何包** → 静默 continue（只记进 `other_pack`） |
+| **`--packs`** | `drive-loop.py` 的 **`PACKS_DEFAULT`**（`dc-collection,frds-top250-2024`；`run.sh` **没传**） | 哪个包**会被驱动** | 状态机有它、农场有它，**就是不排它** —— `mbf` 就是这么被落下的 |
+| **`--indexers`** | `run.sh` | 哪些**站**会被搜 | 站没进名单 = 对每部片子来说「那个站从没搜过」**根本不会被表达出来** → HDtime 就是这么卡住的（§18.11） |
+| **文档里的 init 配方** | `SUMMARY §10.2` 与本节的示例 | 包名 + `--match` 关键词 | 照旧配方重跑 → 挑 0 条根；或**多建一个包行**（`mbf` 与 `my-brilliant-friend-s01-s04` 是同一包的两个名字） |
 
-> ★ 三处里的**每一处**都是「登记了却不在名单里」和「压根没登记」**长得一模一样**。
-> 同一个形状在**站**那一侧还有一份：`run.sh` 的 `--indexers`。
-> 2026-09-12 就是这么卡住的 —— HDtime 早在 Prowlarr 和 `.env` 里，名单里没它，
-> **224 部 UNMATCHED 一部都没往新站重搜**，而 Prowlarr / cross-seed 那边看起来一切正常。
+**② 会响档：漏了立刻报错**（不用盯，但**别和上面混成一张表**）
+
+| 声明点 | 在哪 | 漏了会怎样 |
+|---|---|---|
+| `DATA_DIRS` | NAS `.env` | cross-seed 扫不到东西 —— 农场空转，日志当场不对 |
+| `LINK_DIR` | NAS `.env` | 硬链接建不出来，cross-seed 报错 |
+| `TORZNAB_URLS` | NAS `.env` | 那个站压根不在容器里，`check_env_applied()` 下一批就喊 |
+
+> ★ **分档本身就是判据。** ② 漏了会自己喊；① 漏了**两边都正常** ——
+> 所以「要不要给它配检测器」这个问题，答案完全由落在哪一档决定。
+> 把两档并回一张"完整的声明点表"看起来更整齐，但会把这条判据抹掉。
+>
+> ★ ① 里的**每一处**都是「登记了却不在名单里」和「压根没登记」**长得一模一样**。
+> 2026-09-12 的 HDtime 就是活例 —— 它早在 Prowlarr 和 `.env` 的 `TORZNAB_URLS` 里，
+> 名单里没有它，**224 部 UNMATCHED 一部都没往新站重搜**，而 Prowlarr / cross-seed
+> 那一侧看起来一切正常。
 
 **看起来像识别、其实不是**：
 
@@ -563,10 +580,15 @@ python scripts/reseed-state.py init --roots-from-env .env --match "DouBan_IMDB"
 ```
 
 它是「**从人给的清单里，按人给的关键词挑**」，不是「识别出哪些是大包」——
-**关键词是人给的**，新包没进 `DATA_DIRS` 就永远挑不到。
-⚠ **v3 之后这条命令已经选不出根了**：`DATA_DIRS` 已切成农场 **1 条**，
-而它只读 `DATA_DIRS` → `--match` 一条都匹配不上。源根清单搬到了 **`FARM_SOURCES`**，
-**工具没跟着搬**（现状见 SUMMARY §19.1.3）。
+**关键词是人给的**，系统不生成关键词。所以新包没进**清单**，`--match` 也永远挑不到它。
+
+⚠ **v3 之后它一度连"挑"都做不到**：农场切换把 `DATA_DIRS` 从 49 条源目录改成
+**1 条**（农场本身），而它**只读 `DATA_DIRS`** → `--match "DouBan_IMDB"` 一条都匹配不上，
+直接报「没挑到任何根」。源根清单搬到了 **`FARM_SOURCES`**，**工具没跟着搬**。
+
+✅ **2026-09-12 已修**：`_roots_from_env()` 现在**首选 `FARM_SOURCES`、缺席时退回 `DATA_DIRS`**
+—— 照的是 `build-farm.sh:132-155` 里**早就写好**的同一种优先顺序（连退回时的报错文案
+`build-farm.sh:178-181` 都有），不是另立一套规矩。验收见 §19.1.3。
 
 **农场之后，「包」只剩两个用途**（搜索那一侧已经不需要它了）：
 
@@ -575,9 +597,15 @@ python scripts/reseed-state.py init --roots-from-env .env --match "DouBan_IMDB"
 
 > ★ 换句话说：**「包」现在是个纯账本概念** —— 决定怎么记账、发什么 webhook，**不决定搜什么**。
 
-**唯一一个盯着漏声明的计数器**：日报里的「全场无人认领」（§18.19.2）。
-基线 **1**（那条 `0观影清单chrlee整理` 的 xlsx）——**涨到 2 就是有人加了包忘了登记**。
-⚠ 它只管上面**第 2 处**；漏 `FARM_SOURCES` / 漏 `--packs` **今天没有检测器**。
+**盯着漏声明的两个计数器**（都在日报里，各配一条基线 —— 期望值都指回一条判据之外的真实记录）：
+
+| 计数器 | 覆盖 ① 的哪一处 | 基线 | 涨了意味着 |
+|---|---|---|---|
+| **全场无人认领**（§18.19.2） | `pack` 表 | **1**（那条 `0观影清单chrlee整理` 的 xlsx） | 有人加了包、忘了登记 `pack` 表 |
+| **声明点〔`--packs`〕**（§19.1.6） | `--packs` | **1**（`mbf`） | 有人又落下一个包 —— 或被驱动名单里的名字写错了 |
+
+⚠ 覆盖面仍要说清：① 里的 **`FARM_SOURCES`** 与 **文档里的 init 配方**今天**仍然没有检测器**
+—— 它们没有一条能自动对账的"另一侧"（前者要 NAS 上真去 build 才看得出，后者是文档）。
 
 ### 原理 B：搜索压力来自「分母」，不是「频率」
 

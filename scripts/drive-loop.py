@@ -97,6 +97,16 @@ LOG = logging.getLogger("drive-loop")
 # sidecar 状态库默认位置（与 reseed-state.py 的 DEFAULT_DB 保持一致）
 DEFAULT_DB = os.environ.get("RESEED_STATE_DB", str(ROOT / "hlink" / "state.db"))
 
+#: `--packs` 的默认名单 —— 本仓库里**唯一**一处「哪个包会被驱动」的声明。
+#: ★ 之所以提成模块常量、而不是留在 argparse 那一行里：这个值同时被**两处**引用
+#:   —— argparse 的默认值，和声明点清单里的对账（`reconcile_watch` 的第四类）。
+#:   两处各写一份字面量就会漂；今天已经漂过一次同形状的（文档里写的
+#:   `drive-loop.py:1487` 被我加几行注释推成了 1510）—— 所以**按符号引用，不按行号**。
+#: ★ 它**不是**一行等着被"消除"的代码债，是一个产品决定：名单从 2 个包变成 3 个，
+#:   会把 dc/frds 各自的**轮换频率从 1/2 掉到 1/3**（`once_round` 取模就是它），
+#:   而换上来的是 `mbf` —— 一个记录在案的 0 匹配包。要不要换，不是重构能定的。
+PACKS_DEFAULT = "dc-collection,frds-top250-2024"
+
 
 # --------------------------------------------------------------------------- #
 # cross-seed 的 compose 目录
@@ -745,9 +755,9 @@ def _redact(s: str) -> str:
 
 
 def reconcile_watch(args) -> tuple[str, dict]:
-    """三条对账的读数 → (给日报正文的一段, 给 metrics 的字典)。
+    """四类对账的读数 → (给日报正文的一段, 给 metrics 的字典)。
 
-    三条各自的对账基准（都指回判据之外的**真实记录**）：
+    四条各自的对账基准（都指回判据之外的**真实记录**）：
       · a − b：`] Found ` 那个字面量会吃到别的消息（实测 2231 vs 靶心 1011），
         所以判据是**六个字面量的合取**；a == b == 1011。
       · b − c：三包**共用一个 farm_root** → **生产口径**下 other_pack 恒非零
@@ -755,6 +765,13 @@ def reconcile_watch(args) -> tuple[str, dict]:
         并且 metrics 名带 `all` —— 不许念成"生产里没有静默丢行"。
       · 无人认领：实测 1888 条里恰好 1 条（`0观影清单chrlee整理`，只含一个 xlsx）。
         这个数才恒为 0，且非零时**每条都指得出名字**。
+      · 声明点〔`--packs`〕：`pack` 表 − `--packs` 的差集，两个方向各报一份。
+        实测 = 登记 3 个（`dc-collection` / `frds-top250-2024` / `mbf`）、名单 2 个
+        → 差集 = {`mbf`}。它是**唯一**那种"**认得出来、只是从来不排它**"的包：
+        `pack` 表有行、`movie` 表有 4 行、`farm_root` 也有 → 在 unclaimed /
+        report / trend 上**全绿**。抓不到它的原因不是判据算错了，是
+        **没有一条判据的输入源包含 `--packs` 的实际值**（§18.18 那个形状）。
+        基线 1；**涨到 2 就是又落下一个包**。
 
     ★ **口径的第三个维度：这次的读是「当日日志」，不是"全量"。**
       `--log` 指向的 `info.current.log` 由 cross-seed **按天轮转**
@@ -778,7 +795,8 @@ def reconcile_watch(args) -> tuple[str, dict]:
       四条分支在 `tests/test_reconcile.py` §④ 里**逐条钉了 key**。
     """
     m: dict = {"fa": "n/a", "fb": "n/a", "fd": "n/a",
-               "fb_c_all": "n/a", "fb_c_farm": "n/a", "unclaimed": "n/a"}
+               "fb_c_all": "n/a", "fb_c_farm": "n/a", "unclaimed": "n/a",
+               "packs_undriven": "n/a", "packs_unreg": "n/a"}
     lines: list[str] = []
 
     log_path = (getattr(args, "log", None) or [None])[0]
@@ -898,6 +916,68 @@ def reconcile_watch(args) -> tuple[str, dict]:
         LOG.debug("无人认领对账失败", exc_info=True)
         lines.append(f"观测对账〔无人认领〕：算不出（{type(e).__name__}: {e}）")
 
+    # ---- 声明点〔--packs〕：**登记了却没被驱动**的包 ----
+    # ★★ 为什么必须单独立一条：上面那条「无人认领」问的是「农场里有没有谁都认不出的
+    #    片」，而 `mbf` 这种「**认得出、只是从来不排它**」的包在它面前是**全绿**的 ——
+    #    `pack` 表有行、`movie` 表有 4 行、`farm_root` 也有。实测它从建包起一直躺到
+    #    今天没被驱动过一次，而**没有任何一条告警能抓到**：不是判据算错了，是
+    #    **没有一条判据的输入源包含 `--packs` 的实际值**（§18.18 那个形状 ——
+    #    全绿，因为规则根本没参与）。
+    # ★ 两个方向都要报，而且**方向不同、后果不同**：
+    #      pack 表 − `--packs` = 登记了却没被驱动 → 白登记：状态机有它、农场有它、
+    #                            就是不排它，它的片子**永远不会被搜到**
+    #      `--packs` − pack 表 = 在名单里但库里没登记 → 更糟：状态机看不见它的片子，
+    #                            整包会被判成「别的包」（other_pack）而静默降级
+    # ★ 基线 1（就是 `mbf`），跟上面那条「无人认领」一个写法：非空就发 alert、
+    #    key 固定、12h 冷却交给 notify。**别把基线写进代码** —— 写进去就分不清
+    #    「回到基线」和「判据死了」（§18.19 的教训）。
+    # ★ 「没给 `--packs`」必须给 `n/a` 而不是 0：调用方没传和名单对得上是两件事，
+    #    TSV 里两者长得一样就没法事后分开（同上面 `fa`/`unclaimed` 的规矩）。
+    try:
+        plist = getattr(args, "packs", None)
+        if store is None:
+            lines.append("声明点对账〔--packs〕：状态库读不到 —— "
+                         "登记 vs 驱动**没跑成**，别念成 0")
+        elif not plist:
+            lines.append(f"声明点对账〔--packs〕：跳过（调用方没给 `packs`；"
+                         f"默认值是 {PACKS_DEFAULT}）")
+        else:
+            driven = [p.strip() for p in str(plist).split(",") if p.strip()]
+            reg = [r["name"] for r in store.packs()]
+            undriven = [p for p in reg if p not in driven]
+            unreg = [p for p in driven if p not in reg]
+            m.update(packs_undriven=len(undriven), packs_unreg=len(unreg))
+            lines.append(
+                f"声明点对账〔--packs〕：登记 {len(reg)} 个 / 驱动 {len(driven)} 个\n"
+                f"   登记了却没被驱动（{len(undriven)}）："
+                f"{'、'.join(undriven) or '(无)'}\n"
+                f"   在名单里但库里没登记（{len(unreg)}）："
+                f"{'、'.join(unreg) or '(无)'}\n"
+                f"   ★ 前者是「白登记」：状态机有它、农场有它、**就是不排它** ——"
+                f"它的片子永远不会被搜到，\n"
+                f"     而它在 unclaimed / report / trend 上全是绿的。基线 1。")
+            if undriven or unreg:
+                emit(
+                    "alert", f"声明点对账：{len(undriven) + len(unreg)} 个包的名单对不上",
+                    body=("`pack` 表里登记的包，和 `--packs` 实际驱动的名单**不是同一批**。\n"
+                          "这个差集没有任何别的判据看得见 —— 两边各自看起来都正常。\n\n"
+                          f"  登记了却没被驱动（{len(undriven)}）："
+                          f"{'、'.join(undriven) or '(无)'}\n"
+                          "     ★ 白登记。它的片子永远不会被搜到，也不会有人报。\n"
+                          "      要驱动它：把名字加进 `run.sh` 的 `--packs`（或改 "
+                          f"`drive-loop.py` 的 `PACKS_DEFAULT`）；\n"
+                          "      不想驱动它：在 `state.db` 里删掉那一行，或把基线记下来。\n\n"
+                          f"  在名单里但库里没登记（{len(unreg)}）："
+                          f"{'、'.join(unreg) or '(无)'}\n"
+                          "     ★★ 更糟的一头 —— `--packs` 里的名字必须有 `pack` 表行，\n"
+                          "      否则状态机看不见它的片子，整包会被判成别的包而静默降级。\n\n"
+                          f"  当前名单：{PACKS_DEFAULT}（`--packs` 的默认值）\n"),
+                    key="packs-mismatch",
+                    metrics={"packs_undriven": len(undriven), "packs_unreg": len(unreg)})
+    except Exception as e:                  # noqa: BLE001
+        LOG.debug("--packs 对账失败", exc_info=True)
+        lines.append(f"声明点对账〔--packs〕：算不出（{type(e).__name__}: {e}）")
+
     try:
         if store is not None:
             store.con.close()
@@ -908,7 +988,7 @@ def reconcile_watch(args) -> tuple[str, dict]:
 
 def report_daily(args, *, force: bool = False, farm_note: str = "") -> bool:
     """每天最多投一次的台账：额度（来源 A+C）+ 新增做种趋势 + IYUU 辅种条数
-    + 观测对账（a−b / b−c〔全量口径〕/ 全场无人认领）。
+    + 观测对账（a−b / b−c〔全量口径〕/ 全场无人认领 / 声明点〔--packs〕）。
 
     ★ 为什么必须自己记「今天发过没有」：notify 的**冷却只对 alert 生效**
       （`batch`/`info` 走 `.get(kind, "info")` → level=info，`_cooled` 根本不查）。
@@ -952,7 +1032,7 @@ def report_daily(args, *, force: bool = False, farm_note: str = "") -> bool:
     iyuu_note, iyuu_metrics = iyuu_watch(args)
     parts.append(iyuu_note)
 
-    # 观测对账（a−b / b−c〔全量口径〕/ 全场无人认领）。
+    # 观测对账（a−b / b−c〔全量口径〕/ 全场无人认领 / 声明点〔--packs〕）。
     # ★ 放在**日报里**而不是每批：日报是这套系统里唯一"每天恰好一次"的观测出口，
     #   而 notify 只把 `metrics` 落进 TSV 流水（不记正文）—— 进日报的 metrics，
     #   这些数才真的留得下来。同 iyuu_watch。
@@ -1507,8 +1587,8 @@ def once_round(packs: list[str], args, api_key: str, min_sleep: float) -> int:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="反馈驱动循环：自动续跑 cross-seed 搜索")
-    ap.add_argument("--packs", default="dc-collection,frds-top250-2024",
-                    help="包顺序，逗号分隔（轮流推进），默认 dc-collection,frds-top250-2024")
+    ap.add_argument("--packs", default=PACKS_DEFAULT,
+                    help=f"包顺序，逗号分隔（轮流推进），默认 {PACKS_DEFAULT}")
     ap.add_argument("--once", action="store_true", help="只跑一轮（配合计划任务）")
     ap.add_argument("--max-rounds", type=int, default=0, help="最多跑几轮（0=不限）")
     ap.add_argument("--min-sleep", type=float, default=0, help="批间最小等待秒数（覆盖默认）")

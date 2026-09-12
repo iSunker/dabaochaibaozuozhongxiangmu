@@ -157,26 +157,54 @@ def _guess_unc_host() -> str | None:
 def _roots_from_env(envfile: str, matches: list[str] | None,
                     unc_host: str | None,
                     nas_prefix: str) -> tuple[list[str], list[str], list[str]]:
-    """从 `.env` 的 `DATA_DIRS` 里挑出属于某个包的根。
+    """从 `.env` 里挑出属于某个包的根 —— **首选 `FARM_SOURCES`，缺席时退回 `DATA_DIRS`**。
 
-    为什么这么做：`.env` 的 `DATA_DIRS` **就是 cross-seed 实际会扫的清单**，
-    所以"状态机的根"从它派生，就永远不会和 cross-seed 漂移 ——
-    比手抄 47 条路径安全得多。
+    ★★ v3 之后这两个键的语义**换了位置**，这里必须跟着换（2026-09-12 补）：
+
+        切换前   DATA_DIRS    = 那 49 条**源目录**  → 读它就等于读源清单，**正确**
+        切换动作 = 把 DATA_DIRS 改成农场那一条
+        切换后   DATA_DIRS    = `/…/reseed_farm`（cross-seed 的**输入**，不是源清单）
+                 FARM_SOURCES = 那 49 条源目录（compose 只透传 DATA_DIRS，
+                                cross-seed 压根看不到它）
+
+      ★ 切换之后还从 `DATA_DIRS` 派生，挑到的是**农场那一条** —— 于是
+        `--match <包关键词>` 一条都命中不了，直接报「没挑到任何根」。这是死路，
+        只是**不挡路**（只有真加包时才会踩）。
+
+    ★ 这不是一次新设计：`scripts/build-farm.sh:132-155` 早就是
+      「优先 `FARM_SOURCES`，退回 `DATA_DIRS`」，连退回时的报错文案都写好了
+      （`build-farm.sh:178-181`）。所以这里是**补上同一个切换里漏改的那一个工具**，
+      不是另立一套规矩 —— 同理，也不该有第二种"优先谁"的说法。
+
+    ★ 当初为什么选 `DATA_DIRS`：因为它是 cross-seed **实际会扫的清单**，从它派生就
+      不会和 cross-seed 漂移。这个理由**只在切换前成立** —— 切换后 cross-seed 扫的是
+      农场，而包的 `roots` 要的是**源路径**（webhook 发的就是 `movie.path`，
+      见 `state.py:1133`），两者的语义在 v3 里正好对调了。
 
     返回 `(NAS 根, 本地根, 说明)`。本地根 = 把 `nas_prefix` 换成 `unc_host`。
     """
     env = _read_env_file(envfile)
-    entries = [p.strip() for p in env.get("DATA_DIRS", "").split(",") if p.strip()]
+    src_key = "FARM_SOURCES"
+    entries = [p.strip() for p in env.get("FARM_SOURCES", "").split(",") if p.strip()]
+    fallback = ""
     if not entries:
-        return [], [], [f"{envfile} 里没有 DATA_DIRS，或它是空的"]
+        src_key = "DATA_DIRS"
+        entries = [p.strip() for p in env.get("DATA_DIRS", "").split(",") if p.strip()]
+        fallback = ("  ★ 用的是**退回来源**：`FARM_SOURCES` 在 .env 里不存在或为空。"
+                    "v3 切换后 `DATA_DIRS` = 农场那一条，若它挑不出你要的包，"
+                    "说明这个 .env 该补一行 `FARM_SOURCES=`（格式同 DATA_DIRS）。")
+    if not entries:
+        return [], [], [f"{envfile} 里既没有 FARM_SOURCES 也没有 DATA_DIRS，或两者都是空的"]
 
     pats = [m for m in (matches or []) if m]
     picked = [p for p in entries if any(m in p for m in pats)] if pats else list(entries)
     if not picked:
-        return [], [], [f"DATA_DIRS 共 {len(entries)} 条，没有一条包含 {pats}"]
+        return [], [], [f"{src_key} 共 {len(entries)} 条，没有一条包含 {pats}"]
 
-    notes = [f"从 {envfile} 的 DATA_DIRS（共 {len(entries)} 条）里挑了 {len(picked)} 条"
+    notes = [f"从 {envfile} 的 {src_key}（共 {len(entries)} 条）里挑了 {len(picked)} 条"
              + (f"，匹配 {pats}" if pats else "（未给 --match，全取）")]
+    if fallback:
+        notes.append(fallback)
 
     host = (unc_host or "").rstrip("/")
     if not host:
@@ -234,7 +262,7 @@ def cmd_init(args) -> int:
     local_roots = [r for r in (getattr(args, "local_root", None) or []) if r]
     notes: list[str] = []
 
-    # ---- 根的来源：显式 --root 列表，或从 .env 的 DATA_DIRS 派生（二选一）----
+    # ---- 根的来源：显式 --root 列表，或从 .env 派生（FARM_SOURCES → DATA_DIRS，二选一）----
     if args.roots_from_env:
         if nas_roots:
             _say("[!!] --root 与 --roots-from-env 是两种取根方式，只能选一种")
@@ -684,10 +712,10 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("--local-root", action="append",
                    help="本机可访问的等价路径（Windows 上填 //YOUR-NAS/video/...），只用于列目录。"
                         "多根包可重复传")
-    # ---- 从 .env 的 DATA_DIRS 派生根（多根包强烈推荐，免手抄 47 条）----
+    # ---- 从 .env 派生根（多根包强烈推荐，免手抄 47 条）----
     a.add_argument("--roots-from-env", metavar="ENVFILE",
-                   help="从该 .env 的 DATA_DIRS 派生根。★这是 cross-seed 实际会扫的清单，"
-                        "从它派生就不会与 cross-seed 漂移")
+                   help="从该 .env 的 FARM_SOURCES 派生根（★ 首选：v3 切换后的源清单；"
+                        "缺席时退回 DATA_DIRS）。从它派生就不会与源清单漂移")
     a.add_argument("--match", action="append", metavar="KEYWORD",
                    help="配合 --roots-from-env：只取路径里含该关键词的条目（可重复，OR）")
     a.add_argument("--unc-host", metavar="//HOST",
