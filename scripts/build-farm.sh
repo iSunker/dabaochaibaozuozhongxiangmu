@@ -19,17 +19,37 @@
 #   —— 同一个函数作用在同一批首层条目上，结果必然一样。
 #   镜像源目录结构（硬链接正好做到这点）是它成立的前提。
 #
+# 期望集从哪来：`FARM_SOURCES`（切换之后），不是 `DATA_DIRS`
+# -----------------------------------------------------------
+# ★ 2026-09-12 修，见 SUMMARY §16.2.1。这条不改的话 `--verify` 会**永远通过**。
+#   切换之前 DATA_DIRS = 49 条源目录，读它就等于读期望集，正确。
+#   而**切换这个动作本身**就是把 DATA_DIRS 改成农场那一条：
+#       DATA_DIRS=/volume1/video/download/reseed_farm     ← 源 == 农场
+#   于是校验变成**农场跟自己比**：0 漂移、永远 PASS、还每天报"一切正常"。
+#   ★ 一般原则：**校验的"期望值"绝不能来自被校验对象本身。**
+#     这种退化不报错、只静默地变成永远通过 —— 比不做校验更坏，因为它给你信心。
+#
+#   所以切换后由 .env 里的 **FARM_SOURCES** 承载那 49 条源目录（逗号分隔，同 DATA_DIRS 格式）。
+#   它**只给本脚本读** —— compose 只透传 DATA_DIRS，cross-seed 压根看不到它，
+#   所以加这一行**不影响容器行为、不需要重建容器**。
+#   读取顺序：FARM_SOURCES → 退回 DATA_DIRS（未切换时就是对的）。
+#   兜底还有一道自指闸：源里出现农场自己 → 直接停，不让它悄悄退化。
+#
 # 用法
 # ----
 #   sh build-farm.sh                  # 默认 dry-run：只统计和预演，一个文件都不建
 #   sh build-farm.sh --apply          # 真建（增量：已存在的跳过）
 #   sh build-farm.sh --apply --prune  # 顺带删掉"源已经没了"的农场条目
 #   sh build-farm.sh --verify         # 只校验农场 vs 源，不建不删
+#                                     # ★ 有漂移 → 退出码 1；无漂移 → 0（给计划任务判成败用）
 #
 # 环境变量
 #   COMPOSE_DIR  含 .env 的目录（默认 /volume2/docker_ssd/prowlarr_cross-seed_autohardlink）
-#   FARM         农场路径（默认 /volume1/video/download/reseed_farm）
+#   FARM         农场路径（默认 /volume1/video/download/reseed/reseed_farm）
+#                 ★ 2026-09-12 收进 reseed/ 父目录；改这里的同时必须改 .env 的
+#                   DATA_DIRS / LINK_DIR 两行（SUMMARY §18）
 #   SUDO         root 提权前缀（默认 sudo；已经是 root 就设 SUDO=）
+#   （期望集本身不在这里配 —— 它在 .env 的 FARM_SOURCES / DATA_DIRS，见上一节）
 #
 # 在哪里跑：NAS 本机 **或** Windows —— 两边都行
 # ---------------------------------------------
@@ -38,9 +58,13 @@
 # 是服务端真实硬链接。所以可以从 Windows 直接建场，少一道"拷脚本上去 + SSH"的工序。
 #
 # 从 Windows 跑时，`.env` 里的 `/volume1/...` 在本机不存在 → 用 --map 做前缀翻译：
-#   sh build-farm.sh --map "/volume1=//iSunker-DS423" \
-#     COMPOSE_DIR="//iSunker-DS423/docker_ssd/prowlarr_cross-seed_autohardlink" \
-#     FARM="//iSunker-DS423/video/download/reseed_farm" --apply
+#   COMPOSE_DIR="//iSunker-DS423/docker_ssd/prowlarr_cross-seed_autohardlink" \
+#   FARM="//iSunker-DS423/video/download/reseed/reseed_farm" \
+#   sh build-farm.sh --map "/volume1=//iSunker-DS423" --apply
+#   ★ COMPOSE_DIR / FARM 必须写成**命令前缀的环境变量**（如上行）。
+#     本文档原先把它们排在脚本名**之后** —— 那样它们是**位置参数**，会被下面的
+#     参数解析判成「未知参数: COMPOSE_DIR=...」并以退出码 2 结束。
+#     （2026-09-12 实测。改用前缀写法后 `--verify` 正常返回 0。）
 #
 # ★ 不管理论如何，脚本每次都**自证**硬链接真的建成了（见下面的探针）——
 #   所以"能不能建"不需要靠文档断言，跑一次就知道。
@@ -57,7 +81,7 @@
 set -eu
 
 COMPOSE_DIR="${COMPOSE_DIR:-/volume2/docker_ssd/prowlarr_cross-seed_autohardlink}"
-FARM="${FARM:-/volume1/video/download/reseed_farm}"
+FARM="${FARM:-/volume1/video/download/reseed/reseed_farm}"
 SUDO="${SUDO-sudo}"
 
 DRY=1
@@ -105,13 +129,83 @@ cd "$COMPOSE_DIR" 2>/dev/null || die "目录不存在: $COMPOSE_DIR"
   fi
 }
 
-# ---------- 1) 源清单：直接从 .env 的 DATA_DIRS 读，不另存一份，永不漂移 ----------
-DATA_DIRS=$(sed -n 's/^[[:space:]]*DATA_DIRS[[:space:]]*=[[:space:]]*//p' .env | head -1)
-[ -n "$DATA_DIRS" ] || die "从 $COMPOSE_DIR/.env 读不到 DATA_DIRS"
+# ---------- 1) 期望集：优先 FARM_SOURCES，退回 DATA_DIRS ----------
+# （为什么不能只用 DATA_DIRS 见文件头「期望集从哪来」）
+# ★★ 2026-09-12：`| tr -d '\r'` 不是装饰，是**必须**的。
+#   成因：`.env` 是 **CRLF 行尾**，而 `sed` 只认 `\n`、**不会剥掉行尾的 `\r`**，
+#   于是 `$(...)` 取回来的值末尾挂着一个 CR。按逗号切成 49 条之后，这个 CR
+#   落在**最后一条**的值末尾 —— 症状因此非常具有迷惑性：
+#       只有最后一条源目录「不存在」，其余 48 条全对。
+#   后果（实测踩到，2026-09-12 中午）：
+#       · `--verify` 报「源目录缺失 1」→ **退出码 1**，看着像真有漂移；
+#       · 那条目录的子项因此进不了期望集，农场里它们**反被当成孤儿** →
+#         谁要是照提示跑 `--apply --prune`，会**删掉一个完全正常的农场条目**；
+#       · 而这个坑要等挂上定期巡检才会天天报 —— 那正是最坏的一种：
+#         巡检本身成了噪音源，人很快就不看它了。
+#   ★ 教训：读逗号分隔的行时，**行尾符是这个值的一部分**。凡 `.env`（CRLF）
+#     取值都必须显式剥 CR。Python 那边用 `splitlines()` 天然没这个问题，
+#     出事的只会是 shell —— 所以 shell 里每条 `.env` 取值都该过一遍 tr。
+DATA_DIRS=$(sed -n 's/^[[:space:]]*DATA_DIRS[[:space:]]*=[[:space:]]*//p' .env | head -1 | tr -d '\r')
+FARM_SOURCES=$(sed -n 's/^[[:space:]]*FARM_SOURCES[[:space:]]*=[[:space:]]*//p' .env | head -1 | tr -d '\r')
+
+SRC_LIST="$FARM_SOURCES"; SRC_FROM="FARM_SOURCES"
+if [ -z "$FARM_SOURCES" ]; then
+  SRC_LIST="$DATA_DIRS"; SRC_FROM="DATA_DIRS（退回）"
+fi
+[ -n "$SRC_LIST" ] || die "$COMPOSE_DIR/.env 里既读不到 FARM_SOURCES 也读不到 DATA_DIRS"
+say "期望集来自   : $SRC_FROM"
+
+# ★ 自指闸：源里出现农场自己（或农场内的路径）= 清单还没跟农场拆开。
+#   这是**必须硬停**的两种情况，而且都不报错、只静默变正确：
+#     verify → 农场跟自己比，永远 0 漂移；
+#     apply --prune → 期望集若退化成空，会把**整个农场删光**。
+#   宁可停下让人看一眼，也不要它"顺利跑完"。
+set -f
+OLDIFS0=$IFS; IFS=,
+FARM_M=$(map_path "$FARM")
+N_SELF=0
+for dd in $SRC_LIST; do
+  [ -n "$dd" ] || continue
+  set +f
+  case "$(map_path "$dd")" in
+    "$FARM_M"|"$FARM_M"/*) N_SELF=$((N_SELF + 1)) ;;
+  esac
+  set -f
+done
+IFS=$OLDIFS0; set +f
+if [ "$N_SELF" -gt 0 ]; then
+  die "期望集里有 $N_SELF 条**就是农场自己**（$FARM_M）—— 拒绝继续。
+      .env 的 DATA_DIRS 已经切成农场这一条，所以不能再拿它当源清单了。
+      请在 .env 里另立一行 FARM_SOURCES=（逗号分隔的 49 条**源目录**，格式同 DATA_DIRS）：
+          FARM_SOURCES=/volume1/video/download/movies/xxx,/volume1/video/download/TV/yyy,...
+      它只给本脚本读：compose 只透传 DATA_DIRS，cross-seed 看不到它，
+      所以加这行**不用重建容器**。"
+fi
 
 # 清单文件放在农场**外面**（农场内任何文件都会被 cross-seed 枚举到，
 # 虽然 .tsv 扩展名会被它的 shouldIgnore 过滤掉，但没必要冒险）
-MANIFEST="$(dirname "$FARM")/.$(basename "$FARM").manifest.tsv"
+#
+# ★ 2026-09-12：落点从「农场旁边」= $(dirname "$FARM") 改到 **compose 目录的 hlink/**。
+#   原因：原来它跟 movies/ TV/ reseed_farm/ 挤在同一个媒体目录里，人看一眼分不清
+#   哪些是媒体、哪些是本项目的元数据（实测就是在这儿看见 .tmp 残留才发现清单放错地方）。
+#   hlink/ 本来就是本项目放元数据的地方 —— config.yml 在那儿，compose 里
+#   `./hlink:/config` 也是这个意思。**农场本身不动**，只是在硬盘上换了个记账本的位置。
+MANIFEST_DIR="$COMPOSE_DIR/hlink"
+mkdir -p "$MANIFEST_DIR" 2>/dev/null || die "建不出清单目录: $MANIFEST_DIR"
+MANIFEST="$MANIFEST_DIR/.$(basename "$FARM").manifest.tsv"
+
+# 旧落点的清单搬过来（只搬一次；新位置已有就**不覆盖** —— 免得把新的盖回旧的）
+# 只 mv 不 rm：搬不动时留在原处只是碍眼，删掉就真没了。
+OLD_MANIFEST="$(dirname "$FARM")/.$(basename "$FARM").manifest.tsv"
+if [ ! -f "$MANIFEST" ] && [ -f "$OLD_MANIFEST" ]; then
+  mv -f "$OLD_MANIFEST" "$MANIFEST" 2>/dev/null \
+    && say "  [迁移] 清单已从旧落点搬来: $MANIFEST"
+fi
+for _ext in .names .missing.tmp .tmp; do
+  [ -f "$OLD_MANIFEST$_ext" ] || continue
+  [ -f "$MANIFEST$_ext" ] && continue
+  mv -f "$OLD_MANIFEST$_ext" "$MANIFEST$_ext" 2>/dev/null || true
+done
 
 # 农场还不存在时（第一次跑），退到**最近的已存在祖先目录**取设备号 ——
 # mkdir -p 造出来的新目录必然落在那个祖先所在的文件系统上。
@@ -159,10 +253,22 @@ IFS=,
 N_NEW=0; N_HAVE=0; N_MISS=0; N_SRC=0; N_SKIP_DEV=0
 # 本次的「期望集」：名字列表（给 prune 做精确比对）+ 名字→源（给人看）
 NAMES_TMP="$MANIFEST.names.tmp"
+# 仅 --verify 用：期望集里有、农场里没有的（名字→源），供明细行打印
+MISSING_TMP="$MANIFEST.missing.tmp"
 : > "$NAMES_TMP"
-: > "$MANIFEST.tmp"
+: > "$MISSING_TMP"
+# ★ 只有真要落盘（--apply）才准备清单本体。verify/dry-run 写它纯属浪费 ——
+#   115 KB 要经 SMB 来回跑一趟，最后还是删掉。
+if [ "$DRY" = 0 ]; then : > "$MANIFEST.tmp"; fi
+# ★★ 2026-09-12：三个中间文件原先只在一个分支里删，**--verify 会漏掉 $MANIFEST.tmp**
+#    实测：跑完 --verify，/volume1/video/download/ 下留了一个 115632 字节的
+#    .reseed_farm.manifest.tsv.tmp（大小和真清单一模一样）。
+#    改成 trap 统一兜底：无论从哪条路出去（正常 exit / die / set -e 报错 /
+#    Ctrl-C）都会收干净。apply 成功后这两个文件已被 mv 走，rm -f 是空操作。
+trap 'rm -f "$PROBE_SRC" "$PROBE_DST" "$NAMES_TMP" "$MISSING_TMP" "$MANIFEST.tmp"' \
+  EXIT INT TERM
 
-for dd in $DATA_DIRS; do
+for dd in $SRC_LIST; do
   [ -n "$dd" ] || continue
   set +f
   dd=$(map_path "$dd")
@@ -190,7 +296,9 @@ for dd in $DATA_DIRS; do
     # ★ 无论新建还是已存在，都要记进**期望集** —— prune 靠它判断"哪些该留"。
     #   （早期版本只记新建的，结果 prune 把已存在的一律当成过期删光。）
     printf '%s\n' "$name" >> "$NAMES_TMP"
-    printf '%s\t%s\n' "$name" "$src" >> "$MANIFEST.tmp"
+    if [ "$DRY" = 0 ]; then
+      printf '%s\t%s\n' "$name" "$src" >> "$MANIFEST.tmp"
+    fi
 
     if [ -e "$dst" ]; then
       N_HAVE=$((N_HAVE + 1))
@@ -199,6 +307,8 @@ for dd in $DATA_DIRS; do
 
     if [ "$DRY" = 1 ]; then
       N_NEW=$((N_NEW + 1))
+      # verify 时顺手把"缺的那条"记下来，下面打印明细用
+      [ "$VERIFY_ONLY" = 1 ] && printf '%s\t%s\n' "$name" "$src" >> "$MISSING_TMP"
       set -f; continue
     fi
 
@@ -259,18 +369,81 @@ if [ "$PRUNE" = 1 ] && [ "$N_FARM" -gt 0 ]; then
 fi
 
 # ---------- 3b) 期望集落盘（apply 时；dry-run 不留任何东西）----------
+# ★ 注意这个魔改清单**只在 apply 时更新**：verify 不能刷新它，否则期望集又变成
+#   "农场自己写的"，等于把 §16.2.1 那个退化换个地方重演一遍。
 if [ "$DRY" = 0 ]; then
   mv -f "$NAMES_TMP" "$MANIFEST.names" 2>/dev/null || cp -f "$NAMES_TMP" "$MANIFEST.names"
   mv -f "$MANIFEST.tmp" "$MANIFEST" 2>/dev/null || cp -f "$MANIFEST.tmp" "$MANIFEST"
+  rm -f "$NAMES_TMP" "$MANIFEST.tmp" "$MISSING_TMP" 2>/dev/null || true
 fi
-rm -f "$NAMES_TMP" "$MANIFEST.tmp" 2>/dev/null || true
+
 # ---------- 4) 汇总 ----------
 say ""
 say "源直接子项合计 : $N_SRC   （= 本次期望集 $N_EXPECT 条）"
 if [ "$VERIFY_ONLY" = 1 ]; then
+  # 三条漂移各自是**不同的事**，不能合成一个数：
+  #   源有农场无 → 新内容没进农场（cross-seed 白跑，搜不到这部）
+  #   农场有源无 → **源删了/改名了，农场那条还留着**（cross-seed 照样拿去搜 = 白烧额度）
+  #   源目录本身缺失 / 跨卷 → 期望集不完整，**上面的数都不可信**（比有漂移更严重）
+  N_MISSING=$((N_EXPECT - N_HAVE))
+  N_ORPHAN=$((N_FARM - N_HAVE))
   say "农场现有条目   : $N_FARM"
-  say "源有但农场没有 : $((N_EXPECT - N_HAVE))"
-  say "农场有但源没有 : $((N_FARM - N_HAVE))   （加 --prune 的预演可看明细）"
+  say "源有但农场没有 : $N_MISSING"
+  say "农场有但源没有 : $N_ORPHAN"
+  [ "$N_MISS" -gt 0 ]     && say "源目录缺失     : $N_MISS"
+  [ "$N_SKIP_DEV" -gt 0 ] && say "跨卷跳过       : $N_SKIP_DEV"
+
+  if [ "$N_MISSING" -gt 0 ]; then
+    say ""
+    say "  [漂移] 源里有、农场里没有（跑 --apply 会补上）："
+    SHOWN=0
+    while IFS='	' read -r nm sp; do
+      [ -n "$nm" ] || continue
+      if [ "$SHOWN" -lt 20 ]; then
+        say "      $nm"
+        say "          ← $sp"
+      fi
+      SHOWN=$((SHOWN + 1))
+    done < "$MISSING_TMP"
+    [ "$SHOWN" -gt 20 ] && say "      …还有 $((SHOWN - 20)) 条"
+  fi
+
+  if [ "$N_ORPHAN" -gt 0 ]; then
+    say ""
+    say "  [漂移] 农场里有、源里没有（源被删或改名了）："
+    SHOWN=0
+    for dst in "$FARM"/*; do
+      [ -e "$dst" ] || continue
+      nm=$(basename "$dst")
+      grep -qxF "$nm" "$NAMES_TMP" 2>/dev/null && continue
+      if [ "$SHOWN" -lt 20 ]; then say "      $nm"; fi
+      SHOWN=$((SHOWN + 1))
+    done
+    [ "$SHOWN" -gt 20 ] && say "      …还有 $((SHOWN - 20)) 条"
+    say "      ★ 删不删由人定：确认源真的没了，再跑 --apply --prune。"
+    say "        本脚本**只报告、绝不自动删** —— 判「源没了」的依据就是上面这份清单，"
+    say "        拿它自动删等于把一次误判放大成不可逆的数据丢失。"
+  fi
+
+  if [ "$N_MISS" -gt 0 ] || [ "$N_SKIP_DEV" -gt 0 ]; then
+    say ""
+    say "  [!!] 有源目录不存在 / 跨卷被跳过 —— 期望集本身是**不完整的**，"
+    say "       它只是「能被读到的那些源」的子集，上面的漂移计数因此不可信。"
+    say "       先把这些修好（路径对不对？卷挂上了吗？）再谈漂移。"
+  fi
+
+  # 中间文件的清理交给上面那个 trap（原先这里只删两个、漏了 $MANIFEST.tmp，
+  # 实测在 --verify 后留下过 115 KB 的 .reseed_farm.manifest.tsv.tmp）。
+  say ""
+  # ★ 退出码：计划任务靠它判成败。§16.2.2 第 1 条 —— 以前只打印计数、
+  #   恒返回 0，挂上去的巡检**永远不会报警**。
+  if [ "$N_MISSING" -gt 0 ] || [ "$N_ORPHAN" -gt 0 ] || \
+     [ "$N_MISS" -gt 0 ] || [ "$N_SKIP_DEV" -gt 0 ]; then
+    say "★ 结论：有漂移（退出码 1）"
+    exit 1
+  fi
+  say "★ 结论：无漂移（退出码 0）"
+  exit 0
 elif [ "$DRY" = 1 ]; then
   say "★ 将要新建     : $N_NEW   （dry-run，什么都没建）"
   say "  已存在(跳过) : $N_HAVE"
@@ -286,9 +459,18 @@ else
   say "  跨卷跳过     : $N_SKIP_DEV"
   [ "$PRUNE" = 1 ] && say "  已删除       : $N_PRUNE"
   say ""
-  say "下一步（人工确认无误后）——把 cross-seed 的 dataDirs 从 49 条切成农场这一条："
-  say "  1) 本地 .env 里把 DATA_DIRS 改成：$FARM"
-  say "  2) python scripts/gen-nas-env-update.py   （生成新的 nas-update-env.sh）"
-  say "  3) 在 NAS 上跑 sh nas-update-env.sh       （改 .env + --force-recreate 容器）"
-  say "  4) 验证：drive-loop 日志里「索引器自检」与 searchee 数应与切换前一致"
+  # ★ 这一段只在「还没切换」时才有意义。切换过之后 DATA_DIRS 已经是农场了，
+  #   再往下走会把 dataDirs 指回 49 条 —— 那是**回退**，不是下一步。
+  if [ "$SRC_FROM" = "FARM_SOURCES" ]; then
+    say "下一步：本批新建的 $N_NEW 条已经在农场里了，cross-seed 下一轮就会看到它 —— 不用做别的。"
+    say "  校验：sh build-farm.sh --verify   （有漂移会返回退出码 1）"
+    say "  ★ 别再动 DATA_DIRS —— 它现在 = 农场这一条，是 cross-seed 的输入，不是源清单。"
+  else
+    say "下一步（人工确认无误后）——把 cross-seed 的 dataDirs 从 49 条切成农场这一条："
+    say "  1) 本地 .env 里把 DATA_DIRS 改成：$FARM"
+    say "  2) ★ 同一次改动里把原来那份 49 条清单另存成 FARM_SOURCES=（否则 --verify 从此永远通过）"
+    say "  3) python scripts/gen-nas-env-update.py   （生成新的 nas-update-env.sh）"
+    say "  4) 在 NAS 上跑 sh nas-update-env.sh       （改 .env + --force-recreate 容器）"
+    say "  5) 验证：drive-loop 日志里「索引器自检」与 searchee 数应与切换前一致"
+  fi
 fi

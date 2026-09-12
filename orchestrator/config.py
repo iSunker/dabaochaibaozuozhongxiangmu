@@ -59,7 +59,14 @@ class MatcherConfig:
     skip_recheck: bool = False
     link_type: str = "hardlink"  # hardlink | symlink | reflink
     # cross-seed 建链接（做种数据）的位置，必须与各大包源目录在同一物理卷
-    link_dir: str = "/volume1/video/download/reseed_singles"
+    # ★ 2026-09-12 目录搬迁：旧根 /volume1/video/download/reseed_singles 已废弃，
+    #   数据全在 reseed/ 父目录下（SUMMARY §18）。
+    #   ★ 这个默认值**实际是死代码** —— hlink/config.yml 里 `link_dir: "${LINK_DIR}"`
+    #     总会命中，而 load_config() 用 os.path.expandvars 从容器环境展开它。
+    #     但它是把**新路径**写错时的静默陷阱：一旦 config.yml 少写这一行，
+    #     这里就会悄悄退回一个**看起来合理、但已经不存在**的路径，
+    #     而不是报错。所以跟着一起改，别留旧的。
+    link_dir: str = "/volume1/video/download/reseed/reseed_singles"
     # 单次 run 里，触发匹配后最多等待做种确认的秒数
     wait_timeout_sec: int = 900
     poll_interval_sec: int = 15
