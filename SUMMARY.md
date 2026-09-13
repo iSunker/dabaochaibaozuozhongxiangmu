@@ -5037,7 +5037,7 @@ else:
 它们在"合并"下会全部成立：
 
 1. 农场自检把 cross-seed 建的链接当成孤儿 → `build-farm.sh --verify` **永久退出码 1**
-   （§3568 / §3646 的假象检验实测过：报 475 条缺失 + 2 条孤儿）；
+   （§16.2 的假象检验实测过：报 475 条缺失 + 2 条孤儿）；
 2. `dataDirs` 的直接子目录 = searchee → `HDFans/`、`NanyangPT (南洋)/`、`BTSCHOOL/`
    各变成一个**假 searchee**，每次全量白烧查询额度，且站越多垃圾越多；
 3. 输入输出同树：`reseed_singles` 是 cross-seed 的**输出**，农场是它的**输入**。
@@ -5475,7 +5475,9 @@ id=5 NanyangPT (南洋)        870 行   status=RATE_LIMITED  retry_after=09-12 
 `--indexers HDtime,HDFans,NanyangPT,BTSCHOOL`。★ **但 `deploy.sh` 要等当前批次跑完** ——
 跑批中的 `drive-loop/run.sh` 拿着旧偏移在读自己，中途被换掉会执行到错位的代码（§18.10.6）。
 
-**已沉淀成工具**：```
+**已沉淀成工具**：
+
+```bash
 python scripts/check-indexer-timestamps.py --expect HDtime,HDFans,NanyangPT,BTSCHOOL
 ```
 只读，退出码 0 = 闸门开。`--wait` 可先等下一批跑完再取数。
