@@ -50,6 +50,7 @@
 #     SUBJECT_PREFIX   主题前缀，便于邮箱里过滤
 #     NOTIFY_ROOT      spool/archive/log 的根目录
 #     MAX_MAILS_PER_RUN 单次最多发几封（默认 5，防止一次性喷一屏）
+#     MAX_SEND_TRIES   同一条告警连续发失败几次后放弃（默认 3，见下面「邮件风暴」）
 #     MAILER_CMD       手工指定发信程序（一般不用填 —— 自动探测 ssmtp/sendmail/
 #                      msmtp/mail，都没有就退到 python3 + smtplib）
 #
@@ -76,6 +77,35 @@
 #     那不是告警，是骚扰；结果一定是去建一条「来自 NAS 的邮件」过滤规则，
 #     连真正的告警一起过滤掉 —— 而「告警发得出来」正是这套东西存在的全部理由。
 #     要看结果就 SSH 上来跑一次，或直接看 notify/log/ 和 drive-loop/attempts.log。
+#
+# ★★ 2026-09-13 邮件风暴 —— 同一封告警被重发了约 6 次。读这一节能省一次排查。
+# -------------------------------------------------------------------------
+#   现象：12:40 那条「站点退避中：HDtime」在邮箱里每 5 分钟来一封。
+#   为什么「发出去」会变成「反复发」—— 三件事凑在一起：
+#     ① **重试无上界**。原先的失败分支只说「保留在 spool，下轮重试」，
+#        而「下轮」= 5 分钟后 —— 一条永远发不出去的告警会**无限重发**。
+#     ② **`say` 是致命的**。本脚本 `set -e`，而 `say "  [已发] $ti"` 当时
+#        正好夹在 `send_mail` 成功与 `log_event`/`mv` 之间。它的 stdout 一失败
+#        （那天 `/volume1` 剩 **0 字节**，写不进去），`echo` 返回非零 ⇒
+#        `set -e` 当场退出 ⇒ **信已发出、日志没记、文件还在 spool**。
+#     ③ 于是每趟任务都：读到那条文件 → 发信成功 → 在 `say` 上死掉 → 什么都不记。
+#   实测链条（全部只读取数，不是推理）：
+#     · 告警文件 `ts=12:40:44`，而 `notify/spool` 的目录 mtime 是 `13:10:02`
+#       ⇒ 它在 spool 里躺了 **30 分钟**、跨约 6 趟 5 分钟的任务 ⇒ 6 封。
+#     · `/volume1` 剩余 **0.00 GiB**（SMB `statvfs` 从 Windows 侧量到的，
+#       同一条路量 `docker_ssd` 是 301.90 GiB ⇒ 读法有效、能区分两个卷）。
+#     · 归档目录里那对 12:40 文件**没有对应的日志行**，而代码里 `log_event`
+#       在 `mv` 之前 —— 「归档了却没记账」这条路径在原代码里**不存在**，
+#       所以最后那次 spool→archive 不是本脚本干的（大概率是人手动挪的）。
+#   本脚本据此改了三处（都是为了**把「发一次」和「记一次」绑死**）：
+#     · `say`/`warn` 末尾加 `|| true` —— 打印进度绝不该决定一封信的生死；
+#     · 告警分支**先 log_event + mv，最后才 say** —— 顺序本身是第二道闸；
+#     · 加 `MAX_SEND_TRIES`（默认 3）：连续失败到上限就**归档 + 记一条
+#       `[未确认]` 告警**（进每日摘要），而不是永远重试。
+#   ★ 仍未定的一件事：触发①的那次失败到底是「`say` 撞满盘」还是
+#     「`send_mail` 假阴性（信其实到了、CLI 却返回非零）」。两者的**表现和修复
+#     完全一样**，所以上面三处改动对两种成因都成立；要分开它们需要看 DSM 那趟
+#     任务计划里 stdout 被重定向到了哪（以及风暴邮件的主题行）。
 # =====================================================================
 set -eu
 
@@ -87,6 +117,11 @@ MAIL_TO="${MAIL_TO:-}"
 MAIL_FROM="${MAIL_FROM:-}"
 SUBJECT_PREFIX="${SUBJECT_PREFIX:-[reseed]}"
 MAX_MAILS_PER_RUN="${MAX_MAILS_PER_RUN:-5}"
+#: ★ 同一条告警**连续发失败几次之后放弃**（默认 3）。
+#:   没有这个上界的话，一条「发不出去」的告警会随每趟任务无限重发 —— 见顶部
+#:   「2026-09-13 邮件风暴」那段。放弃时**归档并记一条 `[未确认]` 告警**，
+#:   让「有条告警我没收到」这件事进每日摘要，而不是只写在没人看的 stderr 上。
+MAX_SEND_TRIES="${MAX_SEND_TRIES:-3}"
 #: ssmtp 上游默认的配置文件路径。★ 本机上它是 0 字节空壳，而且 **DSM 的 ssmtp
 #: 并不读它**（读的是 /usr/syno/etc/synosmtp.conf）。保留这个变量只是因为
 #: python3 + smtplib 那条后备路要用。脚本只读、**从不打印其中的值**。
@@ -101,7 +136,7 @@ if [ -f "$CONF" ]; then
     esac
     _k=${_line%%=*}; _v=${_line#*=}
     case "$_k" in
-      MAIL_TO|MAIL_FROM|SUBJECT_PREFIX|NOTIFY_ROOT|MAX_MAILS_PER_RUN|SSMTP_CONF|MAILER_CMD)
+      MAIL_TO|MAIL_FROM|SUBJECT_PREFIX|NOTIFY_ROOT|MAX_MAILS_PER_RUN|MAX_SEND_TRIES|SSMTP_CONF|MAILER_CMD)
         # 只在环境变量**没给**时才用配置文件的值（env 优先，便于临时覆盖）
         eval "_cur=\${$_k-}"
         [ -n "$_cur" ] || eval "$_k=\$_v"
@@ -109,6 +144,13 @@ if [ -f "$CONF" ]; then
     esac
   done < "$CONF"
 fi
+
+# ★ MAX_SEND_TRIES 会被拿去做 `-ge` 比较，非数字会直接报错。兜一手：
+#   配错时退回默认 3，而不是让整趟排空死在算术上。
+case "$MAX_SEND_TRIES" in
+  ''|*[!0-9]*) warn "MAX_SEND_TRIES='$MAX_SEND_TRIES' 不是正整数，退回 3"; MAX_SEND_TRIES=3 ;;
+esac
+[ "$MAX_SEND_TRIES" -ge 1 ] || { warn "MAX_SEND_TRIES 至少为 1，已改成 1"; MAX_SEND_TRIES=1; }
 
 SPOOL="$NOTIFY_ROOT/spool"
 ARCHIVE="$NOTIFY_ROOT/archive"
@@ -128,8 +170,15 @@ while [ $# -gt 0 ]; do
   shift
 done
 
-say()  { echo "$@"; }
-warn() { echo "[!] $*" >&2; }
+# ★ 两个输出函数**都不许致命**（末尾的 `|| true`）。
+#   这不是洁癖，是 2026-09-13 邮件风暴的直接教训：本脚本 `set -e`，而
+#   `say "  [已发] …"` 当时**夹在 send_mail 成功和 log_event/mv 之间** ——
+#   它的 stdout 一失败（那天 /volume1 剩 0 字节，写不进去），`echo` 返回非零，
+#   `set -e` 当场把整趟排空带走 ⇒ **信已发出、日志没记、文件还在 spool**
+#   ⇒ 5 分钟一趟的任务把同一封告警**无限重发**。
+#   打印一条进度绝不该决定一封信的生死 —— 所以这里从根上让它不致命。
+say()  { echo "$@" || true; }
+warn() { echo "[!] $*" >&2 || true; }
 
 # ---------- 占位符防线 ----------
 # ★ 两个都要防 —— .example 里的值都是**非空**的，照抄不改就一路放行，
@@ -344,6 +393,49 @@ log_event() {
   } >> "$LOGDIR/$_d.tsv"
 }
 
+# ---------- 重试上界（2026-09-13 邮件风暴之后加的）----------
+# 计数放在事件文件**旁边**（<事件>.tries），理由：
+#   · 事件文件本身由 Windows 侧 notify.py 写，脚本不该改它的内容（改了就没法
+#     和 notify.py 对账，也容易被下一轮的写入踩掉）；
+#   · 计数丢了无非是「多给一次机会」，不会漏发 —— 失效方向是安全的。
+# do_drain 只收 `*.txt`、selftest/摘要的积压计数也只数 `*.txt`，
+# 所以 `.tries` 不会被误当成待发事件。
+tries_of() {
+  _t=0
+  if [ -f "$1.tries" ]; then
+    _t=$(cat "$1.tries" 2>/dev/null || echo 0)
+  fi
+  # 非数字（文件被写坏 / 是空文件）一律当 0 —— 别让半截内容把算数搞崩
+  case "$_t" in
+    ''|*[!0-9]*) _t=0 ;;
+  esac
+  printf '%s' "$_t"
+}
+
+# 失败一次 +1，回显新值
+bump_tries() {
+  _n=$(tries_of "$1"); _n=$((_n + 1))
+  printf '%s\n' "$_n" > "$1.tries" 2>/dev/null || true
+  printf '%s' "$_n"
+}
+
+# 放弃时记一条**告警**（kind=alert，会进每日摘要的「告警明细」）。
+# ★ 必须走日志而不是只 warn：warn 写 stderr，而 stderr 没人看。
+#   「有一条告警被放弃了」和「那条告警本身」一样重要 —— 前者是你
+#   「以为会收到、其实没有」的唯一提示。
+log_giveup() {
+  _f="$1"; _n="$2"
+  _d=$(date '+%Y-%m-%d')
+  [ "$DRY" = 1 ] && return 0
+  mkdir -p "$LOGDIR"
+  {
+    printf '%s\t' "$(field_of "$_f" ts)"
+    printf 'alert\t'
+    printf '[未确认] %s（连续 %s 次发不出去，已归档）\t' "$(field_of "$_f" title)" "$_n"
+    printf 'attempts=%s\n' "$_n"
+  } >> "$LOGDIR/$_d.tsv"
+}
+
 # 信封抬头：时间 + 主机，附在正文前
 with_header() {
   _f="$1"
@@ -417,6 +509,8 @@ do_selftest() {
   if [ -d "$SPOOL" ]; then
     say "  待发事件: $(find "$SPOOL" -maxdepth 1 -name '*.txt' 2>/dev/null | wc -l | tr -d ' ') 个"
     say "  .tmp（写了一半，会被忽略）: $(find "$SPOOL" -maxdepth 1 -name '*.tmp' 2>/dev/null | wc -l | tr -d ' ') 个"
+    # ★ 这个数 >0 就是「有告警正在反复发不出去」—— 2026-09-13 风暴的现场特征。
+    say "  .tries（重试计数；>0 = 有告警发不出去正在重试）: $(find "$SPOOL" -maxdepth 1 -name '*.tries' 2>/dev/null | wc -l | tr -d ' ') 个"
   fi
   say ""
   say "--- 结论 ---"
@@ -439,7 +533,7 @@ do_drain() {
   mkdir -p "$ARCHIVE" "$LOGDIR"
 
   LIST=$(mktemp); ALERTS=$(mktemp)
-  n_alert=0; n_info=0; n_sent=0; n_failed=0
+  n_alert=0; n_info=0; n_sent=0; n_failed=0; n_given_up=0
 
   for f in "$SPOOL"/*.txt; do
     [ -e "$f" ] || continue
@@ -476,18 +570,58 @@ do_drain() {
       while IFS= read -r f; do
         [ -n "$f" ] || continue
         ti=$(field_of "$f" title)
+
+        # ★★ 先看这条是不是**已经放弃过**（当时只是归档没成功）。
+        #   放弃过的**绝不再发** —— 少了这一条，「发不出去」会退化成
+        #   「每 5 分钟重发一次」，正是 2026-09-13 那场风暴的形状。
+        _t=$(tries_of "$f")
+        if [ "$_t" -ge "$MAX_SEND_TRIES" ]; then
+          if mv -f "$f" "$ARCHIVE/$(basename "$f")"; then
+            rm -f "$f.tries"; n_given_up=$((n_given_up + 1))
+            warn "  [放弃·补归档] $ti（此前已放弃，本轮未再发信）"
+          else
+            warn "  [!!] $ti 已放弃但归档仍失败，留待下轮（**不会发信**）"
+          fi
+          continue
+        fi
+
         tmp=$(mktemp)
         with_header "$f" > "$tmp"
         if send_mail "$SUBJECT_PREFIX 告警：$ti" "$tmp"; then
-          say "  [已发] $ti"
-          n_sent=$((n_sent + 1))
+          # ★★ 顺序是有意的：**先记账 + 归档，最后才打印**。
+          #   原先 `say "  [已发] $ti"` 在最前面，夹在 send_mail 和
+          #   log_event/mv 之间 —— 它一失败（stdout 撞满盘），`set -e` 当场
+          #   退出 ⇒ 信发了、日志没记、文件还在 spool ⇒ 无限重发。
+          #   say 现在自己也不致命了（见顶部），但**顺序**是第二道闸：
+          #   就算打印全坏，也绝不能让「已经发出去的信」丢掉记账。
           log_event "$f"
-          mv -f "$f" "$ARCHIVE/$(basename "$f")"
+          if mv -f "$f" "$ARCHIVE/$(basename "$f")"; then
+            rm -f "$f.tries"
+            n_sent=$((n_sent + 1))
+            say "  [已发] $ti"
+          else
+            # 信已经出去了、文件却还在 spool ⇒ 下轮会**再发一次**。
+            # 计入重试上界，别让「归档坏了」变成新一轮无限重发。
+            _t=$(bump_tries "$f")
+            warn "  [!!] 信已发出但归档失败（$_t/$MAX_SEND_TRIES），文件仍在 spool，下轮会再发一次：$ti"
+            n_failed=$((n_failed + 1))
+          fi
         else
-          warn "  [失败] 发信失败，保留在 spool（下轮重试）: $ti"
-          n_failed=$((n_failed + 1))
-          rm -f "$tmp"
-          continue          # 不归档 → 下轮重试
+          _t=$(bump_tries "$f")
+          if [ "$_t" -ge "$MAX_SEND_TRIES" ]; then
+            warn "  [放弃] $ti —— 连续 $_t 次发不出去。归档并记一条 [未确认]，不再重发。"
+            log_giveup "$f" "$_t"
+            if mv -f "$f" "$ARCHIVE/$(basename "$f")"; then
+              rm -f "$f.tries"
+            else
+              # 计数留着（= 上限）⇒ 下轮走「已放弃」分支：只补归档、绝不发信
+              warn "  [!!] 放弃后归档也失败了 —— 下轮只补归档、不会再发信"
+            fi
+            n_given_up=$((n_given_up + 1))
+          else
+            warn "  [失败] 第 $_t/$MAX_SEND_TRIES 次发信失败，保留在 spool（下轮重试）: $ti"
+            n_failed=$((n_failed + 1))
+          fi
         fi
         rm -f "$tmp"
       done < "$ALERTS"
@@ -521,20 +655,26 @@ do_drain() {
   fi
 
   # 非告警（batch/info）：不发信，只归档 —— 它们进每日摘要
+  # ★ 这里同样**一行失败不许带走整趟**：batch 事件不发信，所以没有风暴风险，
+  #   但它是日志的原料 —— 记账失败时**不归档**（归档=丢弃），留在 spool 等下轮。
   while IFS= read -r f; do
     [ -e "$f" ] || continue
     if [ "$(field_of "$f" kind)" != "alert" ]; then
       if [ "$DRY" = 1 ]; then
         say "[dry-run] 会归档（进摘要）: $(field_of "$f" title)"
       else
-        log_event "$f"
-        mv -f "$f" "$ARCHIVE/$(basename "$f")"
+        if log_event "$f"; then
+          mv -f "$f" "$ARCHIVE/$(basename "$f")" \
+            || warn "  [!] 记账已做但归档失败，留待下轮: $(field_of "$f" title)"
+        else
+          warn "  [!] 记账失败，**不归档**（归档=丢弃），留待下轮: $(field_of "$f" title)"
+        fi
       fi
     fi
   done < "$LIST"
 
   rm -f "$LIST" "$ALERTS"
-  say "排空完成：告警 $n_alert 条（已发 $n_sent / 失败 $n_failed），归档 $n_info 条"
+  say "排空完成：告警 $n_alert 条（已发 $n_sent / 失败 $n_failed / 放弃 $n_given_up），归档 $n_info 条"
   [ -n "$METHOD" ] || warn "⚠ 无可用发信方式 —— 只归档了，没人会收到通知"
   [ -n "$MAIL_TO" ] || warn "⚠ MAIL_TO 未配置 —— 只归档了，没人会收到通知"
 }
@@ -587,6 +727,8 @@ do_digest() {
     #   因为在这种情况下，你收不到告警邮件，只能靠**这封摘要**告诉你。
     _backlog=$(find "$SPOOL" -maxdepth 1 -name '*.txt' 2>/dev/null | wc -l | tr -d ' ')
     _backlog=${_backlog:-0}
+    _retrying=$(find "$SPOOL" -maxdepth 1 -name '*.tries' 2>/dev/null | wc -l | tr -d ' ')
+    _retrying=${_retrying:-0}
     printf '\n── 通知链路 ──\n'
     printf '发信方式  : %s\n' "${METHOD:-无}"
     printf 'spool 积压: %s 条告警\n' "$_backlog"
@@ -594,6 +736,11 @@ do_digest() {
       printf '  ⚠ 有告警**发不出去**，一直堆在 spool 里 —— 那些告警你没有收到。\n'
       printf '    跑 sh notify-spool.sh --selftest 看缺什么（多半是 MAIL_TO 没配，\n'
       printf '    或任务计划的用户不是 root —— /etc/ssmtp/ssmtp.conf 读不了）。\n'
+    fi
+    if [ "$_retrying" != "0" ]; then
+      printf '  ⚠ 其中 %s 条**已经在重试**（连续发失败）。到 MAX_SEND_TRIES 就会\n' "$_retrying"
+      printf '    归档并记一条 `[未确认]` 告警 —— **不会无限重发**。\n'
+      printf '    ★ 看到这里先去看那趟任务计划的 stdout 被重定向到了哪。\n'
     fi
   } > "$tmp"
 
