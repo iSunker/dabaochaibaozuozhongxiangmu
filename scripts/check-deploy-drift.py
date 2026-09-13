@@ -147,6 +147,12 @@ LOCAL_ONLY = [
     (r"^scripts/audit-found-lines\.py$",          "对账 a−b（在 Windows 上跑；只读 NAS 的 info.current.log，不碰库）"),
     (r"^scripts/audit-found-resolve\.py$",        "对账 b−c（在 Windows 上跑；UNC 直读 state.db，query_only 硬闸，绝不写）"),
     (r"^scripts/torznab-probe\.py$",              "手搜探针（在 Windows 上跑；读 NAS .env 的 TORZNAB_URLS 但**绝不回显**，只发一次 Torznab 查询）"),
+    # ★ 2026-09-13：qB 落点普查。它和上面那条是**同一形状** —— 都读本地 .env 的凭据
+    #   去连 NAS 上的服务，且都**只打聚合**（这条打的是 count / tag 名 / 路径前 4 段，
+    #   绝不打 torrent 名、tracker、content_path）。
+    #   ⇒ 判据是「**只读 + 不回显凭据 + 不打印可识别内容**」这三条同时成立，
+    #     不是「它碰没碰凭据」—— 后者会把所有有用的诊断工具都挡在门外。
+    (r"^scripts/qb-census-savepath\.py$",         "qB 落点普查（在 Windows 上跑；读本地 .env 的账号口令登录，只打聚合计数与路径前 N 段）"),
     # ★ 2026-09-13：#58「drive-loop 迁容器」的草案，**故意不进白名单**。
     #   它与 scripts/drive-loop-nas.sh 是同一层的东西（NAS 侧入口），差别只在
     #   后者**已经**在生产跑、前者还没有。白名单的语义是「两边必须一致」——
