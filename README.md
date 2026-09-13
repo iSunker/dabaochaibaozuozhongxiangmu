@@ -673,6 +673,17 @@ Farm 侧还显示 100%。
 **残留风险 / 边界**：
 - 只有 `strict` 安全；`flexible` 与 `partial` 在硬链接农场下**都不安全**。
 - 根上的解法是让做种数据与源**脱离同一 inode**（reflink 或独立副本）—— 那时才谈得上放宽匹配。
+  **★ 2026-09-13 确认：`/volume1` 就是 BTRFS**（`/dev/mapper/cachedev_1 /volume1 btrfs …`），
+  所以 **reflink（COW）是可用的** —— 而且这块卷已用满 100%（仅剩 ~19 GiB），
+  COW「不写不占空间」的特性在这里尤其划算。
+  注意 reflink 只保护**新建**的链接：改之前已建的 628 条仍是硬链接。
+  **写入面已实测（2026-09-13）**：qB 全部 931 条的 `save_path` **都**在
+  `reseed_singles/<站点>/`（HDFans 488 / 南洋 258 / BTSCHOOL 143 / HDtime 42），
+  **没有一条**落在 `reseed_farm` —— 所以面很窄，只有这一处要改。
+  但**造这些链接的不止 cross-seed**：`orchestrator/hardlink.py::prestage()` 也在
+  往这个目录硬链接，而它写死 `os.link`、**根本不读** `matcher.link_type`
+  （那个键在 `config.py` 里只被定义和校验，全仓库没有第二处引用）——
+  改 reflink 时两边都得改，否则一半链接仍是硬链接。
 - 已被改写的文件**无备份可恢复**：`net view` 没有任何备份共享，4 处 `#snapshot` 均不存在，
   `download/可删` 与 `download/temp` 为空。
 - inode 基线存档在 **`D:\tmp\reseed-inode-baseline\`**（**仓库外** —— 里面有完整文件名）。
