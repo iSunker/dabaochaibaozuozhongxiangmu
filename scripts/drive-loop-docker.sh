@@ -8,6 +8,8 @@
 #    —— 推上去本身无害（没人调用它），但会制造一个假一致：
 #    生产上有这个文件、看起来「这就是在用的那套」，而实际上 DSM 任务调的还是
 #    `drive-loop/run.sh`。**先验，后进白名单**，顺序别倒。
+#    ★ 2026-09-13 冒烟实测：它依赖的 `reseed-orchestrator:0.1.0` **本机不存在**，
+#      走之前必须先 build（详见下方「镜像」一节）。即**当前连冒烟都还跑不起来**。
 #
 # 为什么要有这一层（它和 run.sh 的分工）
 # --------------------------------------
@@ -86,10 +88,27 @@
 #       镜像里的是 PATH 上的 `python`。`SUDO=` 同理由：镜像里没有 sudo，
 #       而 `build-farm.sh` 用的是 `${SUDO-sudo}`，给空串它就跳过（那步本来也 `|| true`）。
 #
-# ★ 本包装**不建新镜像**：复用 `reseed-orchestrator:0.1.0`（`python:3.12-slim`）。
-#   它自带 python3 与 `/bin/sh`；代码是**挂进去**的（见挂载 ①），不靠 `COPY`。
-#   唯一的坑是它的 `ENTRYPOINT ["python","-m","orchestrator.main"]` —— 所以这里
-#   用 `--entrypoint sh` 盖掉，否则参数会被接到 `orchestrator.main` 后面去。
+# ★★ 镜像：**不新写 Dockerfile，但要先把它 build 出来** —— 前提已被实测证伪。
+#   原设想是「复用现成的 `reseed-orchestrator:0.1.0`」。2026-09-13 在 NAS 上冒烟，
+#   原样返回：
+#       Unable to find image 'reseed-orchestrator:0.1.0' locally
+#       docker: Error response from daemon: pull access denied for reseed-orchestrator,
+#       repository does not exist or may require 'docker login'
+#   ⇒ 这个 tag **本机不存在**（也从没 push 到任何 registry）。`compose.yaml` 里写着
+#     `image: reseed-orchestrator:0.1.0` 只表示**build 出来的产物该叫什么**，
+#     不等于它已经 build 过 —— 「声明了 image 名」和「镜像在本地」是两件事，
+#     这个坑和下面那条「看起来像名字的字符串」是同一个形状。
+#   ⇒ 走 B 之前必须先 `sudo docker compose build reseed-orchestrator`
+#     （或改 `IMAGE=` 指向任何一个自带 python3 的镜像）。**没 build 就跑，
+#     报错是 pull 失败 —— 一条"看着像网络/权限问题"的路。**
+#
+#   build 出来之后，这份包装确实**不需要自己的 Dockerfile**：
+#     它自带 python3 与 `/bin/sh`；代码是**挂进去**的（见挂载 ①），不靠 `COPY`。
+#     唯一的坑是它的 `ENTRYPOINT ["python","-m","orchestrator.main"]` —— 所以这里
+#     用 `--entrypoint sh` 盖掉，否则参数会被接到 `orchestrator.main` 后面去。
+#   ★ 这条 `--entrypoint sh` 成立的前提是镜像里有 `/bin/sh`：`python:3.12-slim`
+#     （Debian 底）有；**换任何 alpine/distroless 系镜像都要重新确认**，
+#     而没有 sh 的表现是 create 阶段直接失败，倒还好 —— 不会静默。
 #
 # ★ 为什么不用 `docker run --network A --network B` 一次写完
 #   `docker run` 的 `--network` 在旧版 Engine 上**只认最后一个**，而且**不报错**
@@ -115,6 +134,20 @@
 #   ③ 挂载整个 compose 目录后的**属主/权限**：宿主那份 `run.sh` 由 DSM 以 root 跑，
 #      所以容器这边也**不要**加 `--user`（混用会让 `.state` 文件出现 root 属主、
 #      另一边写不进去）。现在两边都是 root，一致。
+#   ④ **镜像能力未验** —— build 出来的镜像里这些外部命令在不在，没实测过，
+#      而它们**全部在关键路径上**，缺一个就静默退化：
+#        · `python`     —— 已设 `PY=python`（默认值 `/usr/bin/python3` 是 DSM 自带，
+#                          镜像里没有）。★ 这条**必须验**，缺了就是「跑了但什么都没发生」。
+#        · `sh`         —— 见上方 `--entrypoint sh`。缺了在 create 阶段就失败（响）。
+#        · `find` `stat` `sed` `tr` `basename` `dirname` `head` `mkdir` `mv` `cp` `rm`
+#                       —— `drive-loop/run.sh` 与 `build-farm.sh` 都在用。
+#                          `python:3.12-slim`（Debian）这些都有，但**是"应该"不是"验过"**。
+#      ⇒ 一条命令同时验完（只读，不起容器，不需要批次空档）：
+#          sudo docker compose -f /volume2/docker_ssd/prowlarr_cross-seed_autohardlink/compose.yaml \
+#               run --rm --entrypoint sh reseed-orchestrator -c \
+#               'command -v python sh find stat sed tr basename dirname head mkdir mv cp rm'
+#        ★ 输出应当**恰好 12 行**；少一行就是少一个命令 —— 而少的那一行，
+#          正是"为什么这批跑完什么都没干"的答案。
 # =====================================================================
 set -eu
 
