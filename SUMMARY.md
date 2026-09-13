@@ -7334,9 +7334,34 @@ dc-collection,frds-top250-2024      →   dc-collection,mbf,frds-top250-2024
 三个观测点，**全只读**：
 
 1. `drive-loop.log` 该批的 `跑包 mbf（第 2/3 个）` 行 —— 先确认**真的轮到它**了。
-2. cross-seed `info.current.log` 在**那一批的时间窗内**：`Found … by HDtime` 有几条。
+2. cross-seed `info.current.log` 在**那一批的时间窗内**：「`on HDtime by`」的行有几条。
+   ★ **顺序别写反**：站名在 `on` 后面，`by` 后面跟的是**决策类型**
+   （`MATCH` / `MATCH_PARTIAL` / `MATCH_SIZE_ONLY`）。本文件里那条解析正则
+   （`\[(?:webhook|inject)\] Found (.+?) \[([0-9a-f]{8})\.\.\.\] on (\S+) by (\w+) …`）
+   的捕获组顺序就是证据。写成 `grep "by HDtime"` 会得到 **0 条** —— 而 0 条在
+   下表里**正好**是「HDtime 对这个包没货」，**看着像结论，其实是 grep 写错了**。
+   （本节初稿就写成了 `Found … by HDtime`，2026-09-13 改。）
 3. `state.db` 的 `movie` 表 `pack='mbf'` 那 4 行的 `stage` / `searched_indexers` /
    `indexer_seen`（后两列是 **JSON 文本**）—— **HDtime 出现在里面 = 搜过了**。
+
+三处合起来才能分开下面这四种情形 —— **单看 `matched_indexers` 是不够的**：
+
+| `searched_indexers` 有 HDtime | `matched_indexers` 有 HDtime | `on HDtime by` 条数 | 结论 |
+|---|---|---|---|
+| ❌ | — | — | 前提没成立（站压根没搜）⇒ 先查 `--indexers` / 容器，**不是**退出条件 |
+| ✅ | ❌ | 0 | HDtime 对这个包就是没货 ⇒ **执行处置**（移出 `--packs`） |
+| ✅ | ❌ | > 0 | ★ HDtime **有货**，是「季包跳过单集」（§12.3.1）⇒ **不移出**，另开待办 |
+| ✅ | ✅ | — | 保留 `mbf`，什么都不用改 |
+
+★ 第 2、3 行**长得一模一样**（`matched_indexers` 都是空集）而处置**相反** ——
+所以「日志里搜到几条」不是锦上添花，是**必需**的那一格。
+
+> **第 3 点用什么读法**：直读 UNC + `PRAGMA query_only=1`（§18.18.3）—— 这是项目
+> 既有做法，`state.py:_open_csdb` 就是这么写的，实测 0.00s，读前读后 `ls` 旁边都
+> **没有** `-wal` 冒出来。**别拷副本**：`state.db` 自己是 `journal_mode=delete`，
+> 拷副本这回不吃亏；但同一个动作在 `cross-seed.db` 上吃过亏（§13.6 坑 2，WAL 里
+> 未 checkpoint 的数据丢了，看着像「新站没注册」）—— **一种读法通吃两个库**，
+> 比逐库判断少一条岔路。
 
 **处置**：确认 0 匹配 ⇒ 把 `mbf` 从 `PACKS_DEFAULT` 移出。`undriven` 会自己涨回 1，
 而且是**静默采纳**（不告警）—— 同 §20.2 的规矩：
