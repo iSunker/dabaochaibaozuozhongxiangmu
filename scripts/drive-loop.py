@@ -826,6 +826,100 @@ def iyuu_watch(args) -> tuple[str, dict]:
 
 
 # --------------------------------------------------------------------------- #
+# qB「卡 999」—— 停滞的未完成种子
+# --------------------------------------------------------------------------- #
+# 判据本体在 `orchestrator/state.py` 的 `qb_999_band`，**不在这个文件里** ——
+# 理由与对账那几条一样：本进程跑在 NAS 宿主机上，判据只有一份才谈得上两侧一致。
+#
+# 立这一节的动机（2026-09-13）：这个 qB 只挂拆大包的种子（**全员硬链接**），
+# 本不该下载任何东西。而 99.x% 是其中唯一「**既不报错也不完成**」的静默档 ——
+# 它同时躲过 error 计数和 seeding 计数，从所有现有观测里一起漏出去。
+# 硬链接一旦被重新下载就断了（qB 写新数据 = 新 inode = 与源文件脱钩），
+# 所以「卡住」与「在重下」这两类都值得记账。
+#
+# ★ 只记账、**不告警**（同 `iyuu_watch`）：慢性观测，即时 alert 通道留给急性故障。
+#
+# ★ 基线：不配就是「**每天发同样一封**」—— 那正是 #59 邮件风暴教训的**反面**
+#   （那次是同一封重发 6 次，这次是会天天重发）。现状不是新闻，只报**新增**。
+#   形状照抄 #47「无人认领」：首读只记基线不响、与基线一致则静默、
+#   缩回静默采纳但**在正文里写出来**（否则「清掉了」和「判据没读到」分不开）。
+QB_999_BASELINE_KEY = "_qb_999_baseline"
+
+
+def _qb_999_norm(d) -> list:
+    """把基线归一成**排序后的 hash 列表**（老版本 / 坏形状一律当空）。
+
+    ★ 归一在**读**这一侧做（同 `_unclaimed_norm`）：老版本写下的文件可能没有
+      `hashes` 键，读的时候不补就会 KeyError。
+    """
+    if isinstance(d, dict):
+        d = d.get("hashes") or []
+    return sorted(x for x in (d if isinstance(d, list) else []) if x)
+
+
+def qb_999_watch(args) -> tuple[str, dict]:
+    """问 :3060 要「卡 999」的条数 → (给日报正文的一段, 给 metrics 的字典)。
+
+    ★ **绝不抛**：它挂在每天一次的日报里，而日报挂在每 15 分钟一批的生产循环里。
+      一次 qB 抖动不该让整份日报消失（同 `iyuu_watch`）。
+    ★ 读不到时 metrics 给 `n/a` —— **必须给**，否则 TSV 里「这次读失败了」和
+      「那天根本没跑」长得一模一样，事后分不开（同 `iyuu_watch`）。
+    ★ `qb_total`（分母）**必须跟着条数一起进 metrics**：单说「2 条」没有量纲，
+      判不了是 2 / 932 还是 2 / 5。
+    """
+    url = getattr(args, "qbit_url", None)
+    if not url:
+        return ("qB 卡 999：跳过（没有 --qbit-url）",
+                {"qb_999": "no-url", "qb_total": "no-url"})
+    try:
+        r = S.qb_999_band(S.qbit_all_torrents(url), time.time())
+    except Exception as e:              # noqa: BLE001 —— 附属观测，绝不拖垮日报
+        LOG.debug("读 qB 卡 999 失败", exc_info=True)
+        return (f"qB 卡 999：读不到（{type(e).__name__}: {e}）",
+                {"qb_999": "n/a", "qb_total": "n/a"})
+
+    # ★★ 读 → 改 → 写必须**紧挨着**，中间不许夹别的写入者。
+    #    `_reconcile_write` 是**整文件覆盖**，而 `reconcile_watch` 会把自己那份
+    #    快照（`prev_ok`，见 :1071）**攥着走完整个函数体**、到末尾才写回。
+    #    所以真正的约束**不是「谁先谁后」**（两个函数是顺序执行的，后跑的那个
+    #    读到的就是先跑那个写下的，先后都安全），而是：**本函数绝不能卡在
+    #    `reconcile_watch` 的「读」与「写」之间被调用** —— 那会被它连同快照
+    #    一起覆盖掉。今天 `report_daily` 里是并列调用，安全；将来若有人把它
+    #    挪进 `reconcile_watch` 内部、或起个线程去调，这个键会被**静默抹掉**：
+    #    抹的那一刻不报错，要到次日发现基线「自己没了」才看得见。
+    live = _reconcile_read()
+    raw = live.get(QB_999_BASELINE_KEY)
+    first = raw is None                 # ★ 与「基线记过一个空集」是两回事
+    base = set(_qb_999_norm(raw))
+    cur = set(r["hashes"])
+    new = sorted(cur - base)
+    live[QB_999_BASELINE_KEY] = sorted(cur)      # ★ 写 == cur，**不是 base ∪ cur**
+    _reconcile_write(live)
+
+    if first:
+        # ★ 首读**不响**（#47 立的规矩）：现存的那几条是「已接受的现状」，
+        #   不是今天新冒出来的。响一次就得配冷却，而那正是要避免的噪音。
+        verdict = f"首次读数，记基线（{r['n']} 条）"
+    elif new:
+        verdict = f"新增 {len(new)} 条"
+    elif cur == base:
+        verdict = "与基线一致"
+    else:
+        # 缩回（含清空）：静默采纳，但**必须在正文里写出来** —— 否则「清掉了」
+        # 和「判据没读到」从外面看一模一样（#47 的教训，别省这一句）。
+        # ★ 这里**不许**打印「与基线一致」：基线刚刚被改写成 cur，那句是假话。
+        gone = len(base) - len(cur)
+        verdict = f"比基线少 {gone} 条（已采纳）" + ("—— 已清空" if not cur else "")
+
+    note = (f"qB 卡 999（分母 {r['total']}）\n"
+            f"  卡 999（停滞 > 24h，progress ≥ 0.99）： {r['n']} 条 —— {verdict}")
+    # ★ 只报数量，**不报种子名**（用户 2026-09-13 钉的口径）。
+    #   `hashes` 只参与基线的集合运算，不进正文、不进 metrics。
+    return note, {"qb_999": r["n"], "qb_999_new": 0 if first else len(new),
+                  "qb_total": r["total"]}
+
+
+# --------------------------------------------------------------------------- #
 # 观测对账：a − b / b − c / 全场无人认领
 # --------------------------------------------------------------------------- #
 # ★ 判据本体**不在这个文件里**，在 `orchestrator/state.py`
@@ -1312,7 +1406,8 @@ def reconcile_watch(args) -> tuple[str, dict]:
 
 def report_daily(args, *, force: bool = False, farm_note: str = "") -> bool:
     """每天最多投一次的台账：额度（来源 A+C）+ 新增做种趋势 + IYUU 辅种条数
-    + 观测对账（a−b / b−c〔全量口径〕/ 全场无人认领 / 声明点〔--packs〕）。
+    + qB 卡 999（停滞的未完成种子）+ 观测对账（a−b / b−c〔全量口径〕/
+    全场无人认领 / 声明点〔--packs〕）。
 
     ★ 为什么必须自己记「今天发过没有」：notify 的**冷却只对 alert 生效**
       （`batch`/`info` 走 `.get(kind, "info")` → level=info，`_cooled` 根本不查）。
@@ -1364,11 +1459,18 @@ def report_daily(args, *, force: bool = False, farm_note: str = "") -> bool:
     if rec_note:
         parts.append(rec_note)
 
+    # qB「卡 999」（停滞的未完成种子；见本节函数上方的说明）。
+    # ★ 与 `reconcile_watch` **并列**调用，**不能挪进它内部**：那个函数对
+    #   `.reconcile.state` 是「开头读一份快照、末尾整文件覆盖写回」，夹在它的
+    #   读与写之间的写入会被连同快照一起抹掉（详见 `qb_999_watch` 里的说明）。
+    qb_note, qb_metrics = qb_999_watch(args)
+    parts.append(qb_note)
+
     body = "\n\n".join(parts)
     # ★ 数字要进 `metrics` 才落得进 TSV 流水（notify 只记 ts/kind/title/metrics，
     #   **不记正文**）—— 详见 iyuu_watch 的说明。
     if emit("batch", "每日台账", body=body, key="daily",
-            metrics={"day": today, **iyuu_metrics, **rec_metrics}):
+            metrics={"day": today, **iyuu_metrics, **rec_metrics, **qb_metrics}):
         _daily_set(today)
         LOG.info("已投递每日台账（额度 + 趋势）")
         return True

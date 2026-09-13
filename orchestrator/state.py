@@ -2598,7 +2598,12 @@ def _qbit_torrents_info(url: str, params: dict[str, str], timeout: float) -> lis
     import urllib.parse
     import urllib.request
 
-    full = url.rstrip("/") + "/api/v2/torrents/info?" + urllib.parse.urlencode(params)
+    # ★ 无参数时**不留那个光秃秃的 `?`**：`torrents/info` 全量取数（`qbit_all_torrents`）
+    #   走的就是空 params，留着会拼出 `.../torrents/info?` —— 能用，但它是那种
+    #   "看着像有查询、其实没有"的 URL，日志里读起来要愣一下。带参数时**一字不变**
+    #   （`test_iyuu_watch.py` 钉着按分类那条的字面量）。
+    q = urllib.parse.urlencode(params)
+    full = url.rstrip("/") + "/api/v2/torrents/info" + (f"?{q}" if q else "")
     req = urllib.request.Request(full, headers={"Referer": url.rstrip("/")})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read().decode("utf-8")) or []
@@ -2622,6 +2627,87 @@ def qbit_tagged(url: str, tag: str, timeout: float = 30.0) -> list[dict]:
       **没有分类**（SUMMARY §18.8 的构成表）。按分类查会把两边混成一坨。
     """
     return _qbit_torrents_info(url, {"tag": tag}, timeout)
+
+
+def qbit_all_torrents(url: str, timeout: float = 30.0) -> list[dict]:
+    """取 qB 上的**全部**种子（不加 category / tag 过滤）。
+    **失败语义同 `qbit_torrents`。**
+
+    ★ 为什么必须有第三条：前两条各自带一个过滤条件，而「卡 999」那条判据要的是
+      **全量** —— `total`（分母）就是全部种子数。按任一过滤取，**分母就错了**，
+      而错的分母不会报错，只会让比例失真到没法判（"2 条"到底是 2/932 还是 2/5）。
+    """
+    return _qbit_torrents_info(url, {}, timeout)
+
+
+# --------------------------------------------------------------------------- #
+# qB「卡 999」—— 停滞的未完成种子
+# --------------------------------------------------------------------------- #
+# 立这个判据的现场（2026-09-13）：这个 qB 只挂拆大包的种子（全员硬链接），
+# **本不该下载任何东西**。任何「没下完」的种子都是异常，而 99.x% 是其中唯一
+# **既不报错也不完成**的静默档 —— 它不进 error 计数，也不进 seeding 计数，
+# 于是从所有现有观测里同时漏出去。
+#
+# 判据：progress >= 0.99  且  amount_left > 0  且  (now - last_activity) > 24h
+#
+# ★ 为什么**故意不写上界**（不写 `progress < 1.0`）：
+#   `progress` 是浮点，末尾只剩几个字节的种子会被舍入成 1.0 —— 写上界会
+#   **误杀正是要抓的那一类**。而 `amount_left > 0` 已经排除了真正下完的，
+#   所以上界只有风险没有收益。实测（#67）：现场 2 条 `amount_left>0 且
+#   progress>=0.99` 的原始值是 0.9999955830701261 / 0.997501052321974，
+#   **恰好 == 1.0 的 0 条** —— 也就是说「写上界」与「不写」今天同值，
+#   差别只在将来，而将来那次差别是不写这边对的。
+#
+# ★ 为什么用 `last_activity` 而不是 `state == "stalledDL"`：
+#   不必等 qB 自己宣布 stalled —— 实测 932 条 **0 缺失**（int，范围
+#   2 天前 ~ 14 秒前）。
+#
+# ★ 为什么停滞闸**必须有**：现场同时挂着一条 progress=0.9975 的
+#   **健康下载中**的种子（`last_activity` 是 0.0 小时前）。只按
+#   `amount_left > 0` 判会把它一起记进去。这条就是
+#   `tests/test_qb_999_band.py` 里那条「不命中」用例的来源。
+#
+# ★ 为什么要配基线（不在这里，在 drive-loop 侧）：不配就会天天发同样一封
+#   —— 那正是 #59 邮件风暴教训的反面。见任务 #70。
+QB_999_MIN_PROGRESS = 0.99
+QB_999_STALL_SEC = 24 * 3600     # 24h 本身就是闸，**不再另配稳定性闸**（任务 #66 的答案 2）
+
+
+def qb_999_band(torrents: list[dict], now: float) -> dict:
+    """从 `torrents/info` 的原始列表里挑出「卡 999」的那些。
+
+    返回 `{"n": 条数, "hashes": [升序 hash], "total": 分母}`。
+      · `hashes` 给基线比对用（#70），**只出 hash 不出 name** ——
+        上层只报数量，名字不该有机会流到正文或日志里。
+      · `total` = 传进来的全部种子数。**分母必须跟着数一起走**：
+        单说「2 条」没有量纲，判不了是「2 / 932」还是「2 / 5」。
+
+    `now` 是**参数**、不是函数里 `time.time()` —— 否则这个函数没法测
+    （时间在跑，断言写不住），而它恰恰是「阈值取 24h」唯一能被钉住的地方。
+
+    **不抛异常**：字段缺失 / 为 None 一律当「不命中」。调用方挂在每天一次的
+    日报里，一次字段变动不该让整份日报消失（同 `iyuu_watch` 的失败语义）。
+
+    ★ `last_activity` 缺失或为 0 时**按「停了很久」算**（`or 0`）—— 这是
+      **故意的**，与 `test_backoff.py` 那条「认不出种类时按真失败算
+      （宁可吵不可静默）」同一条原则：判不了的时候，漏报的坏法
+      （永远看不见）比误报的坏法（基线响一次就静默）重。
+    """
+    hits: list[str] = []
+    for t in torrents or []:
+        if (t.get("amount_left") or 0) <= 0:
+            continue                                    # 下完了（或字段缺失）
+        if t.get("state") == "error":
+            continue                                    # error 有独立口径，不重复记
+        if (t.get("progress") or 0.0) < QB_999_MIN_PROGRESS:
+            continue                                    # 没到 99%
+        if (now - (t.get("last_activity") or 0)) <= QB_999_STALL_SEC:
+            continue                                    # 还在动 —— 健康下载中，不是卡住
+        h = t.get("hash")
+        if h:
+            hits.append(h)
+    hits.sort()                                         # 定序：让基线与断言都稳定
+    return {"n": len(hits), "hashes": hits, "total": len(torrents or [])}
 
 
 def parse_alias(items: list[str] | None) -> dict[str, str]:
