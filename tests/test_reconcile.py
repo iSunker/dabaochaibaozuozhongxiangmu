@@ -359,10 +359,56 @@ note, m = D.reconcile_watch(argparse.Namespace(log=[LOG_A], db=db2, db_path="<st
 ck("b − c〔全量口径〕", m["fb_c_all"], 0)
 ck("农场行计数", m["fb_c_farm"], 1)
 ck("无人认领 = 1（SNAP 里那条）", m["unclaimed"], 1)
-ck("无人认领发了 alert", [e[3] for e in events if e[0] == "alert"],
-   ["unclaimed-searchee"])
+# ★★ 无人认领改成「只报变化」（2026-09-13）：
+#   那 1 条是**已接受**的现状，配上 alert 的 12 小时冷却就是"每天响两次、永远"
+#   —— 现状不是新闻（同 `--packs` 那条）。所以**首读只记基线、不响**。
+ck("★ 首读记基线、**不发** alert",
+   [e[3] for e in events if e[0] == "alert"], [])
+ck("正文说明这是首读", "首次读数" in note, True)
 ck("正文点名那条路径（只报数 = 换个地方藏）",
    FARM + "/0观影清单chrlee整理" in note, True)
+ck("基线已落盘",
+   D._reconcile_read().get(D.UNCLAIMED_BASELINE_KEY),
+   [FARM + "/0观影清单chrlee整理"])
+
+# ★★ 本节的核心那格：**同一个集合连读两次，第二次必须静默。**
+#   少了这一格，「首读不响」可以被实现成「永远不响」而照样全绿。
+events.clear()
+note, m = D.reconcile_watch(argparse.Namespace(log=[LOG_A], db=db2, db_path="<stub>"))
+ck("★ 同一批连读两次：第二次**静默**", [e[0] for e in events], [])
+ck("第二次仍是 1", m["unclaimed"], 1)
+ck("正文说明与基线一致", "与基线一致" in note, True)
+
+# 出现**新的**一条 → 这才该响，且要点名新那条（只报总数 = 换个地方藏）
+SNAP2 = CrossSeedSnapshot(searchee_paths=dict(
+    SNAP.searchee_paths, **{"新混进来的杂物": FARM + "/新混进来的杂物"}))
+D.S.read_crossseed_db = lambda _p, *a, **k: SNAP2
+events.clear()
+note, m = D.reconcile_watch(argparse.Namespace(log=[LOG_A], db=db2, db_path="<stub>"))
+ck("新增 1 条 → unclaimed = 2", m["unclaimed"], 2)
+ck("★ 新增才发 alert",
+   [e[3] for e in events if e[0] == "alert"], ["unclaimed-searchee"])
+ck("★ 告警正文点的是**新增**那条", "新混进来的杂物" in events[0][2], True)
+ck("★ metrics 把「总数」和「新增数」分开",
+   (events[0][4].get("unclaimed"), events[0][4].get("unclaimed_new")), (2, 1))
+
+# 缩回（新的那条没了）→ 静默采纳新基线，**但正文要写出来** ——
+# 否则「那个目录被清掉了（预期）」和「判据今天没读到（故障）」在日报里长得一样。
+D.S.read_crossseed_db = _fake_read
+events.clear()
+note, m = D.reconcile_watch(argparse.Namespace(log=[LOG_A], db=db2, db_path="<stub>"))
+ck("缩回：不告警", [e[0] for e in events], [])
+ck("缩回后 = 1", m["unclaimed"], 1)
+ck("★ 缩回也在正文里写出来（不是静默无痕）", "比基线**少**" in note, True)
+
+# ★ 反向控制：缩回采纳了新基线 ⇒ 它**再长回来必须被抓住**。
+#   少了这一格，「缩回静默采纳」可以被实现成「顺手把基线也删了」而照样绿。
+D.S.read_crossseed_db = lambda _p, *a, **k: SNAP2
+events.clear()
+note, m = D.reconcile_watch(argparse.Namespace(log=[LOG_A], db=db2, db_path="<stub>"))
+ck("★ 缩回后再长回来 → **必须报**",
+   [e[3] for e in events if e[0] == "alert"], ["unclaimed-searchee"])
+D.S.read_crossseed_db = _fake_read
 
 print("== ④ 声明点〔--packs〕：只报**变化**，不报现状（2026-09-12 深夜改） ==")
 # ★★ 这一格钉的形状照 2026-09-12 实测（NAS 只读）：`pack` 表 **3 行**

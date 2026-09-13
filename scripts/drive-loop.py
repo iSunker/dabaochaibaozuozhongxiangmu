@@ -10,6 +10,9 @@
     ★ 但退避**按实际等待时长分级**（见 next_sleep）：站点打 1 分钟喷嚏不该罚 2 小时
   * `newly_seeding` 稳定产出、无退避           → 站点健康 → 下次间隔收紧
   * `aborted`（> --max-wait 提前中止）         → 休整 + 间隔拉满
+    ★ 但它有**两种性质完全不同**的来源，看 `aborted_kind`（见 DriveStats）：
+      站点退避超时是**良性**（剩下的条目下轮重排），webhook 鉴权/路径才是真故障。
+      两者分开计数、分开报警 —— 见 update_abort_streak（#45）。
 然后在 DC / FRDS / (MBF) 三个包之间轮流推进。
 一批做完重跑同一条命令即可推进 —— 本脚本把「重跑」自动化了。
 
@@ -254,41 +257,108 @@ def next_sleep(stats: S.DriveStats) -> tuple[float, str]:
 # 跑一晚上没人知道。所以连续失败要跨过阈值就大声喊；全部干完也要喊一声。
 ABORT_ALERT_AFTER = 3
 
+#: `S.DriveStats.aborted_kind` 里属于**良性**的那一种（见那边的说明）。
+#: 良性 = 本批条目**没有失败**，只是站点还在退避、等到超过 `--max-wait` 就先收工，
+#: 剩下的条目**下轮会重新排上**。它和「批失败」是两件事，不能共用一个计数。
+BACKOFF_ABORT_KIND = "indexer-backoff"
 
-def update_abort_streak(prev: int, stats: S.DriveStats | None, *,
-                        failed: bool = False) -> int:
-    """维护"连续失败批数"。
 
-    算失败：提前中止（`stats.aborted`）、整批异常（`failed=True`）。
-    正常跑完（含"本包无待搜"）清零。
+def _abort_kind(stats: S.DriveStats | None, failed: bool) -> str | None:
+    """归一化出「这批为什么没跑完」。返回 `None` = 正常跑完。
+
+    ★ 兜底方向是**宁可吵**：`aborted` 非空却认不出种类时按真失败算 ——
+      把真故障误判成良性会**静默**，把良性误判成故障只是多喊一声。
     """
-    aborted = failed or bool(stats is not None and stats.aborted)
-    if not aborted:
-        return 0
-    n = prev + 1
-    reason = stats.aborted if (stats is not None and stats.aborted) else "整批异常"
+    if failed:
+        return "batch-exception"
+    if stats is None or not stats.aborted:
+        return None
+    return getattr(stats, "aborted_kind", None) or "unknown"
+
+
+def update_abort_streak(prev: tuple[int, int], stats: S.DriveStats | None, *,
+                        failed: bool = False) -> tuple[int, int]:
+    """维护两个**分开的**连续计数，返回 `(真失败批数, 良性收工批数)`。
+
+    正常跑完（含"本包无待搜"）把**两个都清零**。
+
+    ★ 为什么必须拆成两个（#45）：原先只有一个计数、只看 `stats.aborted` 的真假，
+      于是**站点退避超时**被念成「批失败」。实测 2026-09-13 的 TSV 里**同一批**
+      既写 `ok=22 failed=0`、又写「连续 3 批失败（索引器 HDtime 要等到 …）」
+      —— 一个名字盖了两种模型，和 `NanyangPT` vs `NanyangPT (南洋)` 同一个形状。
+    ★ 两个计数**互不干扰**，谁都不清零对方 —— 这一条是**被测试逼出来的**：
+      起初写成"互相清零"，于是「鉴权炸了、但中间夹了一批站点退避」时，
+      真失败的计数会被反复冲回 0，**永远到不了 3** ⇒ 那个告警存在的意义
+      （无人值守下抓住持续故障）正好被抹掉。所以：
+      本次是哪一种，就只涨哪一种；另一种**原样留着**；只有**正常跑完**才两个都清零。
+      于是 `hard + backoff` = 「距离上一次正常跑完过了几批」，谁也别想被掩盖。
+    """
+    kind = _abort_kind(stats, failed)
+    if kind is None:
+        return 0, 0                     # 一次正常跑完 → 两个都清零
+
+    hard, backoff = prev
+    reason = (stats.aborted if (stats is not None and stats.aborted)
+              else "整批异常")
+
+    if kind == BACKOFF_ABORT_KIND:
+        n = backoff + 1
+        total = hard + n                # 距上次正常跑完过了几批
+        # ★ 只在两种混着出现时才补这句 —— 常见情况下 n == total，补了是噪音。
+        mixed = f"（共 {total} 批没跑成）" if total != n else ""
+        if n < ABORT_ALERT_AFTER:
+            LOG.warning("连续第 %d 批提前收工（%s）", n, reason)
+            return hard, n
+        LOG.warning("!" * 62)
+        LOG.warning("⚠ 已连续 %d 批提前收工%s（最近：%s）", n, mixed, reason)
+        LOG.warning("  这**不是**「批失败」—— 本批条目没失败，只是站点还在退避。")
+        LOG.warning("  解禁后自己会恢复；长期如此就考虑把这个站从 --indexers 摘掉。")
+        LOG.warning("!" * 62)
+        # ★ key 与 `consec-abort` **不同**：这是两个问题，各自的 12 小时冷却。
+        emit("alert",
+             f"连续 {n} 批提前收工（站点退避中）{mixed}",
+             body=(f"最近一次：{reason}\n提前收工批数：{n}{mixed}\n\n"
+                   "★ 这条**不是**「批失败」：本批的条目**没有失败**"
+                   "（metrics 里是 `failed=0`），\n"
+                   "  只是站点还在退避、等到超过 `--max-wait` 就先收工，"
+                   "**剩下的条目下轮会重新排上**。\n\n"
+                   "要不要管它：\n"
+                   "  · 偶尔几次 —— 不用管，退避解禁后自己恢复；\n"
+                   "  · 连续多批都这样 —— 那个站长时间在限流。看 Prowlarr 里它的状态，\n"
+                   "    必要时把它从 `--indexers` 里摘掉，别让一个站拖住另外几个。\n"),
+             key="consec-backoff",
+             metrics={"streak": n, "streak_total": total,
+                      "kind": BACKOFF_ABORT_KIND})
+        return hard, n
+
+    n = hard + 1
+    total = n + backoff
+    mixed = f"（共 {total} 批没跑成）" if total != n else ""
     if n < ABORT_ALERT_AFTER:
         LOG.warning("连续第 %d 批失败（%s）", n, reason)
-        return n
+        return n, backoff
     LOG.warning("!" * 62)
-    LOG.warning("⚠ 已连续 %d 批失败（最近：%s）", n, reason)
+    LOG.warning("⚠ 已连续 %d 批失败%s（最近：%s）", n, mixed, reason)
     LOG.warning("  无人值守下这通常意味着两种可能：")
-    LOG.warning("   ① 站点持续 502 / 限流（看 Prowlarr 里各站状态）")
+    LOG.warning("   ① 鉴权 / 路径问题（webhook 返回 400/401/403 时最可能）—— 看 key 与 URL")
     LOG.warning("   ② .env 改了但没 force-recreate（容器里还是旧配置，见 SUMMARY §13.6）")
     LOG.warning("  请人工看一眼 cross-seed 日志与 Prowlarr。")
     LOG.warning("!" * 62)
     # 推给对方。★ 固定 key + 12 小时冷却 = 问题不修每天最多提醒 2 次：
     #   连续失败第 4、5、6… 批都命中同一个 key，不会变成每 30 分钟一封。
     emit("alert",
-         f"连续 {n} 批失败（{reason}）",
-         body=(f"最近一次失败：{reason}\n连续失败批数：{n}\n\n"
+         f"连续 {n} 批失败（{reason}）{mixed}",
+         body=(f"最近一次失败：{reason}\n连续失败批数：{n}{mixed}\n\n"
                "无人值守下通常意味着：\n"
-               "  ① 站点持续 502 / 限流（看 Prowlarr 里各站状态）\n"
-               "  ② .env 改了但容器没 force-recreate（见 SUMMARY §13.6）\n\n"
+               "  ① 鉴权 / 路径问题（webhook 返回 400/401/403 时最可能）—— 看 key 与 URL\n"
+               "  ② .env 改了但容器没 force-recreate（见 SUMMARY §13.6）\n"
+               "  ③ 跑批抛异常 —— 看 drive-loop.log 的 traceback\n\n"
                "请人工看一眼 cross-seed 日志与 Prowlarr。\n"
+               "★ 「站点退避超时」**不算在这里**（那是良性的，见 `consec-backoff`）。\n"
                "（本条同 key 12 小时内不重复发；修好后自然消失。）"),
-         key="consec-abort", metrics={"streak": n})
-    return n
+         key="consec-abort", metrics={"streak": n, "streak_total": total,
+                                      "kind": kind})
+    return n, backoff
 
 
 def alert_if_all_done(packs: list[str], db: str) -> bool:
@@ -373,7 +443,18 @@ def check_indexers(args) -> None:
                        "   ① .env 里删了这个站，但容器没重建（容器里还留着它）\n"
                        "   ② 该站被 Prowlarr 禁用了\n"
                        "   ③ 站点返回 410/403 或卡 Cloudflare\n\n"
-                       "  查证：docker inspect reseed-cross-seed | grep TORZNAB_URLS\n"),
+                       # ★ 查证命令必须**自带脱敏**（2026-09-13）：
+                       #   `TORZNAB_URLS` 是一串逗号分隔的 URL，**每条各带一个
+                       #   `apikey=`**，值就是 Prowlarr 的应用级 key —— 它**完全控制
+                       #   Prowlarr**，而 Prowlarr 里存着所有 PT 站的 cookie。
+                       #   原样 `grep TORZNAB_URLS` 出来 = 把凭据打进终端/聊天。
+                       #   sed 只把 `apikey=` 的**值**换成 `<redacted>`，键名与 `/N/api`
+                       #   都留着 —— 判「容器里还剩哪个站」靠的是那两样，不是 key。
+                       "  查证（★ 先脱敏再看，**别把原样输出粘进聊天/命令行**）：\n"
+                       "    docker inspect reseed-cross-seed | grep TORZNAB_URLS"
+                       " \\\n      | sed -E 's/(apikey=)[^,&]+/\\1<redacted>/g'\n"
+                       "  ★ 上面那行里每个 URL 都带一个 apikey=（Prowlarr 的 key），\n"
+                       "    原样 grep 出来就是明文凭据；sed 只是把它换成 <redacted>。\n"),
                  key=f"indexer-unnamed:{lbl}", metrics={"indexer": lbl})
     if missing:
         LOG.warning("⚠ cross-seed 实际会搜 %s，但 --indexers 没列 ——"
@@ -766,6 +847,20 @@ RECONCILE_FILE = HERE / ".reconcile.state"
 #:   碰不到它，所以它会被原样带过去，不会被误当成"某个格子从没读到过"。
 PACKS_BASELINE_KEY = "_packs_baseline"
 
+#: `.reconcile.state` 里存「无人认领基线」的保留键（**已接受**的那些路径的集合）。
+#: ★ 和 `_packs_baseline` 同一个理由、同一个形状：`unclaimed == 1`
+#:   （`0观影清单chrlee整理`，只含一个 `.xlsx`）是**已接受的现状**，
+#:   而告警有 12 小时冷却 ⇒ 只要那个目录还在，就**每天响 1~2 次、永远**。
+#:   现状不是新闻 —— 只报**新增**：出现基线里没有的路径才响，缩回（含清空）静默采纳。
+UNCLAIMED_BASELINE_KEY = "_unclaimed_baseline"
+
+
+def _unclaimed_norm(d) -> list:
+    """把基线归一成**排序后的路径列表**（老版本/坏形状一律当空）。"""
+    if isinstance(d, dict):
+        d = d.get("paths") or []
+    return sorted(x for x in (d if isinstance(d, list) else []) if x)
+
 
 def _packs_norm(d) -> dict:
     """把基线/本次读数归一成可比较的形状（缺字段补空、排序）。
@@ -817,6 +912,10 @@ def reconcile_watch(args) -> tuple[str, dict]:
         并且 metrics 名带 `all` —— 不许念成"生产里没有静默丢行"。
       · 无人认领：实测 1888 条里恰好 1 条（`0观影清单chrlee整理`，只含一个 xlsx）。
         这个数才恒为 0，且非零时**每条都指得出名字**。
+        ★ **只报新增**（同 `--packs` 那条）：那 1 条是**已接受的现状**，
+          配上 alert 的 12 小时冷却就是"每天响两次、永远" —— 现状不是新闻。
+          基线（已接受的那几条路径）存 `.reconcile.state` 的 `_unclaimed_baseline`；
+          出现基线里没有的路径才响，缩回（含清空到 0）静默采纳但**在正文里写出来**。
       · 声明点〔`--packs`〕：`pack` 表 − `--packs` 的差集，两个方向各报一份。
         实测 = 登记 3 个（`dc-collection` / `frds-top250-2024` / `mbf`）、名单 2 个
         → 差集 = {`mbf`}。它是**唯一**那种"**认得出来、只是从来不排它**"的包：
@@ -860,6 +959,7 @@ def reconcile_watch(args) -> tuple[str, dict]:
     lines: list[str] = []
     prev_ok = _reconcile_read()             # #34：每一格上次真的读到数是什么时候
     packs_baseline = None                   # 本次算出的新基线（没算就保持 None，别抹掉旧的）
+    unclaimed_baseline = None               # 同上（无人认领的已接受路径集合）
 
     log_path = (getattr(args, "log", None) or [None])[0]
     text = None
@@ -971,25 +1071,61 @@ def reconcile_watch(args) -> tuple[str, dict]:
         if store is not None and snap is not None:
             un = S.unclaimed_searchees(store, snap)
             m.update(unclaimed=len(un))
-            if un:
-                listing = "\n".join(f"   {p}" for _, p in un[:10])
-                more = f"\n   …还有 {len(un) - 10} 条" if len(un) > 10 else ""
-                lines.append(f"观测对账〔全场无人认领〕：**{len(un)}** 条\n{listing}{more}\n"
-                             f"   ★ 三包合起来都不认它 —— 别的包的 searchee 会落进"
-                             f"〔生产口径〕的 other_pack，\n"
-                             f"     只有这个数才指得出**谁都不归**的那些。")
-                emit("alert", f"农场里有 {len(un)} 条 searchee 谁都不归",
-                     body=("cross-seed 库里的 searchee，**三个包合起来都认不出**。\n"
-                           "它们不在任何包的 `dir_paths` 里，所以状态机看不见它们 ——\n"
-                           "既是「白搜」（cross-seed 照搜，额度照烧），\n"
-                           "也不会有任何片子因为它们的匹配而前进。\n"
-                           "★ 常见形状：农场里混进了非媒体文件/目录"
-                           "（实测那条是一个 `.xlsx` 清单）。\n\n"
-                           f"共 {len(un)} 条：\n{listing}{more}\n"),
-                     key="unclaimed-searchee", metrics={"unclaimed": len(un)})
+            cur_paths = sorted(p for _, p in un)
+            unclaimed_baseline = cur_paths      # 无论告不告警都采纳
+            prev_u = _unclaimed_norm(prev_ok.get(UNCLAIMED_BASELINE_KEY))
+
+            listing = "\n".join(f"   {p}" for p in cur_paths[:10])
+            more = f"\n   …还有 {len(cur_paths) - 10} 条" if len(cur_paths) > 10 else ""
+            if not cur_paths:
+                head = ("观测对账〔全场无人认领〕：**0** 条"
+                        "（三包合起来认得出库里每一条 searchee）")
             else:
-                lines.append("观测对账〔全场无人认领〕：**0** 条"
-                             "（三包合起来认得出库里每一条 searchee）")
+                head = (f"观测对账〔全场无人认领〕：**{len(cur_paths)}** 条\n"
+                        f"{listing}{more}\n"
+                        f"   ★ 三包合起来都不认它 —— 别的包的 searchee 会落进"
+                        f"〔生产口径〕的 other_pack，\n"
+                        f"     只有这个数才指得出**谁都不归**的那些。")
+
+            if UNCLAIMED_BASELINE_KEY not in prev_ok:
+                # 第一次读数：现状不是新闻 → 记基线，**不告警**。
+                # ★ 这一步正是「那条 `.xlsx` 目录不再每天喊」的开关。
+                lines.append(head + "\n   ★ 首次读数 → 已记为基线，**不告警**"
+                                    "（现状不是新闻；往后只报变化）。")
+            else:
+                new = [p for p in cur_paths if p not in prev_u]
+                if new:
+                    new_list = "\n".join(f"   ★ {p}" for p in new[:10])
+                    new_more = (f"\n   …还有 {len(new) - 10} 条"
+                                if len(new) > 10 else "")
+                    lines.append(head + "\n   ★ 与基线相比**有新增** —— 已告警。")
+                    emit("alert",
+                         f"农场里有 {len(new)} 条 searchee 谁都不归（**新增**）",
+                         body=("cross-seed 库里的 searchee，**三个包合起来都认不出**。\n"
+                               "它们不在任何包的 `dir_paths` 里，所以状态机看不见它们 ——\n"
+                               "既是「白搜」（cross-seed 照搜，额度照烧），\n"
+                               "也不会有任何片子因为它们的匹配而前进。\n\n"
+                               "★ 本判据只报**新增**：已经记进基线的那几条不再每天喊"
+                               f"（现存 {len(cur_paths)} 条，其中 {len(new)} 条是新的）。\n"
+                               "★ 常见形状：农场里混进了非媒体文件/目录"
+                               "（实测第一条是一个 `.xlsx` 清单）。\n\n"
+                               f"新增 {len(new)} 条：\n{new_list}{new_more}\n\n"
+                               f"全部 {len(cur_paths)} 条：\n{listing}{more}\n"),
+                         key="unclaimed-searchee",
+                         metrics={"unclaimed": len(cur_paths),
+                                  "unclaimed_new": len(new)})
+                else:
+                    gone = [p for p in prev_u if p not in cur_paths]
+                    if gone:
+                        # 缩了也是好消息 —— 但**要写出来**：否则"baseline 少了"
+                        # 在日报里和"什么都没发生"长得一样，就分不清
+                        # 「那个目录被清掉了（预期）」和「判据今天没读到（故障）」。
+                        note = (f"   ★ 比基线**少** {len(gone)} 条 —— 不告警"
+                                f"（清掉了不必喊；新基线已采纳，**再长回来会报**）：\n"
+                                + "\n".join(f"   − {p}" for p in gone[:10]))
+                    else:
+                        note = "   ★ 与基线一致 —— 不告警（只报变化，不再每天喊）。"
+                    lines.append(head + "\n" + note)
     except Exception as e:                  # noqa: BLE001
         LOG.debug("无人认领对账失败", exc_info=True)
         lines.append(f"观测对账〔无人认领〕：算不出（{type(e).__name__}: {e}）")
@@ -1124,6 +1260,9 @@ def reconcile_watch(args) -> tuple[str, dict]:
         #   必须保留旧基线 —— 否则一次抖动就把「已接受的现状」抹成空，
         #   下一轮会把 `mbf` 这个老问题当成「新变化」再喊一遍（正是要避免的噪音）。
         live[PACKS_BASELINE_KEY] = packs_baseline
+    if unclaimed_baseline is not None:
+        # 同上：库读不到的那几轮保留旧基线，别把已接受的那几条当成新增再喊。
+        live[UNCLAIMED_BASELINE_KEY] = unclaimed_baseline
     _reconcile_write(live)
     return "\n".join(lines), m
 
@@ -1714,7 +1853,11 @@ def once_round(packs: list[str], args, api_key: str, min_sleep: float) -> int:
              key=f"batch-exception:{pack}", metrics={"pack": pack})
     finally:
         # 连续失败计数跨进程持久化（无人值守下没人盯着，只能靠日志喊）
-        streak = update_abort_streak(int(st.get("consec_abort") or 0), stats, failed=failed)
+        # ★ 两个计数（真失败 / 良性提前收工）各存各的 —— 见 update_abort_streak
+        prev_streak = (int(st.get("consec_abort") or 0),
+                       int(st.get("consec_backoff") or 0))
+        streak, backoff_streak = update_abort_streak(prev_streak, stats,
+                                                     failed=failed)
         # ★ last_sleep_sec 必须落盘 —— 下一轮的闸门读它（见 once_round 开头）。
         #   sleep_sec 为 None（没跑成 / 本包无待搜）时写 0，即「没有退避证据」，
         #   闸门退回 min_sleep 下限。
@@ -1722,6 +1865,7 @@ def once_round(packs: list[str], args, api_key: str, min_sleep: float) -> int:
         #   heartbeat_ts 清掉，否则残留的心跳会让下一轮误判「上一批还在跑」）。
         write_state({"running_pid": None, "last_end_ts": time.time(),
                      "last_pack_idx": idx, "consec_abort": streak,
+                     "consec_backoff": backoff_streak,
                      "last_sleep_sec": clamp(sleep_sec) if sleep_sec else 0.0})
     LOG.info("--once 完成。")
     return rc
@@ -1863,7 +2007,7 @@ def main() -> int:
     round_no = 0
     # 包轮流：记录上次跑到哪个包，下次从下一个开始
     cur_pack_idx = 0
-    consec_abort = 0     # 连续失败批数（跨过阈值就大声报警）
+    consec = (0, 0)      # (连续真失败批数, 连续良性收工批数)，各自跨阈值报警
     while args.max_rounds == 0 or round_no < args.max_rounds:
         pack = packs[cur_pack_idx % len(packs)]
         round_no += 1
@@ -1898,7 +2042,7 @@ def main() -> int:
                        "常见原因：cross-seed 没起来 / state.db 被占用 / NAS 掉线。\n"
                        "★ 连续异常会自动累计：到 3 批会再发一条「连续批失败」告警。\n"),
                  key=f"batch-exception:{pack}", metrics={"pack": pack})
-            consec_abort = update_abort_streak(consec_abort, None, failed=True)
+            consec = update_abort_streak(consec, None, failed=True)
             if args.once:
                 return 1
             time.sleep(BACKOFF_SLEEP)
@@ -1907,7 +2051,7 @@ def main() -> int:
 
         if stats is None:
             LOG.info("[%s] 本批无动作（没待搜或计划为空），跳过该包", pack)
-            consec_abort = update_abort_streak(consec_abort, None)   # 正常，清零
+            consec = update_abort_streak(consec, None)   # 正常，两个计数都清零
             # 全部包都没待搜 → 全部完成，退出
             cur_pack_idx += 1
             if cur_pack_idx % len(packs) == 0:
@@ -1919,7 +2063,7 @@ def main() -> int:
             continue
 
         sleep_sec, reason = next_sleep(stats)
-        consec_abort = update_abort_streak(consec_abort, stats)
+        consec = update_abort_streak(consec, stats)
         LOG.info("[第 %d 轮] %s | 原因：%s | 下次间隔 %.0f 分钟",
                  round_no, stats.render().splitlines()[0] if stats else "?",
                  reason, sleep_sec / 60)

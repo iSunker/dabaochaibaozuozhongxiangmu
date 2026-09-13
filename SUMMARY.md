@@ -7117,3 +7117,260 @@ SMB 下 SQLite 一般会抛，所以概率很低，**不动**。
 「沉默 = 没新增」是**代码保证**的；「沉默 = 跑了且没事」**不是** ——
 后者要**加一次正文读数**才成立。**把前者说成后者，就是又造了一个「看着绿」的判据。**
 
+---
+
+### 20.7 首读兑现 + 三条修正（2026-09-13）
+
+首读成功，而且**基线按预测落盘**。首读本身又读出三个问题，本轮一并修掉。
+
+#### 20.7.1 首读结果（`notify/log/2026-09-13.tsv`，00:38:28）
+
+```
+day=2026-09-13  iyuu=100  fa=76 fb=76 fd=0  fb_c_all=0 fb_c_farm=0
+unclaimed=1  packs_undriven=1 packs_unreg=0
+```
+
+| 格 | 读数 | 记录的期望 | 判定 |
+|---|---|---|---|
+| `fa` / `fb` / `fd` | 76 / 76 / 0 | 不变式 `a == b`、`fd = 0` | ✓（★ 不是 1011，见 20.7.2） |
+| `fb_c_all` | 0 | 0（b−c 全量口径） | ✓ |
+| `fb_c_farm` | 0 | **0**（自检） | ✓（★ README 写的是 1，见 20.7.2） |
+| `unclaimed` | 1 | 基线 1 | ✓ |
+| `packs_undriven` / `packs_unreg` | 1 / 0 | 基线 1 / 0 | ✓ **首读** |
+| `iyuu` | 100 | 基线 100 | ✓（09-14 才是首个有意义的读） |
+
+**八格无一个 `n/a`** ⇒ 新代码走到了（第 1 条是第 2、3 条的前提）。
+
+`_packs_baseline` 落盘，**与预测逐字相同**（SMB 只读 `.reconcile.state`）：
+
+```json
+"_packs_baseline": {"undriven": ["mbf"], "unreg": []}
+```
+
+`packs-mismatch` **没响** ✓。八格的「上次成功读数」时间戳都是
+`2026-09-13 00:38:28`，与日报落盘时刻吻合。
+
+#### 20.7.2 首读读出来的三条（都已修）
+
+| # | 问题 | 证据（指回真实记录） | 修法 |
+|---|---|---|---|
+| ① | **`unclaimed=1` 会每天响** —— 而 `1` 是文档写明的**基线** | `drive-loop.py` 是 `if un:` → 立刻 alert；alert 有 **12h 冷却**（`notify.py:95`）⇒ 只要那目录还在，**每天 1~2 封、永远** | 同 `_packs_baseline`：只报**新增** |
+| ② | **「站点退避超时」被念成「批失败」**（#45） | **同一条 TSV 里上下两行打架**：`ok=22 failed=0` 与「连续 3 批失败（索引器 HDtime 要等到 …）」。且它的正文把人指去查 `force-recreate` —— 对退避场景是**误导** | `DriveStats.aborted_kind` + 两个分开的计数 |
+| ③ | README 两处**期望值指不回真实记录** | `fb_c_farm` 写 `1`，而 SUMMARY `:6309` 与当日实读**都是 0**；`fa == fb == 1011` 是**全天**数，而日报读的是**当日日志**（`drive-loop.py:828-834` 自己写了）⇒ 日报里永远是日初小数 | 改成 `0/0` 与不变式 `a == b` |
+
+★ ① 和 ② 是**同一个形状**：**现状/良性被当成了新闻/故障**。
+一个把已接受的现状每天喊（噪音 ⇒ 真出问题时没人看），
+一个把良性收工喊成故障、还把排查方向指错。
+
+#### 20.7.3 ★ 一个被**测试逼出来**的设计错误
+
+`update_abort_streak` 的第一版写成「两个计数**互相清零**」。
+测试立刻打脸：`真失败 ×2 → 夹 1 批良性 → 真失败不为 0` 那格返回 `(1, 0)`。
+
+**这不是测试写窄了，是设计错了**：真故障（webhook 401）与站点退避会**交替**出现
+—— 退避检查在发 webhook **之前**跑（`state.py` 的 `wait_out_backoff`），
+所以一个持续 401 的故障完全可能被交替出现的退避批次反复冲回 0，
+**永远到不了 3** ⇒ **那条告警存在的意义（无人值守下抓住持续故障）正好被抹掉。**
+
+改成**互不干扰**：本次是哪一种就只涨哪一种，另一种**原样留着**；
+**只有正常跑完才一起清零**。于是 `hard + backoff` = 「距上次正常跑完过了几批」，
+谁也别想被掩盖。混着出现时标题补一句「共 N 批没跑成」，免得把 N 念成"连续"。
+
+> ★ 这正是 `tests/README.md` 那条约定「**测试自己也是判据 —— 报红时先怀疑断言本身**」
+> 的**反面**用法：这一次**先怀疑断言、再回来看代码，发现该怀疑的是代码**。
+> 两次都要看，不能默认哪一边对。
+
+#### 20.7.4 这一轮的落点
+
+三条修正全部是**同一个动作**：把「名字」和「期望值」拉回到**能指得回真实记录**的位置。
+没有一条是新判据 —— 判据算得都对，错的是**怎么念**。
+
+★ 参照 §19.1.3 那张风险表：**「漏声明 → 包静默不存在」那一行现在多了一个检测器**
+（`unclaimed` 从"每天喊"变成"只报新增"，于是它**重新变得有人看**）——
+一个天天响的告警和一个没有的告警，在无人值守下**等价**。
+
+
+---
+
+## §20.8 告警正文也在教人做事 —— 查证命令自带脱敏（2026-09-13）
+
+**一句话：告警正文里那条「照着敲」的命令，等于让程序替我们决定"这时候会把什么打到终端上"。**
+
+### 20.8.1 现场
+
+`drive-loop.py` 的 `check_indexers()` 里，`索引器拉不到名字`（`prowlarr#N`，
+即 cross-seed 取不回 caps）那条 alert 的正文原本以这样一句结尾：
+
+```
+查证：docker inspect reseed-cross-seed | grep TORZNAB_URLS
+```
+
+而 `TORZNAB_URLS` 的**值是逗号分隔的一串 URL，每条各带一个 `apikey=`**，
+那个 key 就是 **Prowlarr 的应用级 key**。
+
+### 20.8.2 为什么这条比"不小心贴了一次"更糟
+
+| 面 | 事实 |
+|---|---|
+| 那个 key 能干什么 | §7「凭据泄露面」记的：它能**完全控制 Prowlarr**，而 Prowlarr 里存着**所有 PT 站的 cookie** |
+| 触发时机 | 索引器出问题时 —— **人最急着查的那一刻**，正是最可能照着敲、并且顺手把输出贴进聊天的时候 |
+| 防护形状 | 靠的是"人记得先脱敏"。而这条链上**已经漏过一次**（§18.15：①值指纹那道网因为本地 `.env` 是存根而**几乎为空**，绿了也不代表安全）—— **覆盖薄的那道网，不能当防线用** |
+| 受众 | 告警是**给未来的自己**看的。写正文的那一刻不觉得，读正文的那一刻（凌晨、出事中）不会想 |
+
+★ 结论：**规矩必须写在命令里，不能写在"记得别看"里。**
+
+### 20.8.3 改法
+
+```diff
+- 查证：docker inspect reseed-cross-seed | grep TORZNAB_URLS
++ 查证（★ 先脱敏再看，别把原样输出粘进聊天/命令行）：
++   docker inspect reseed-cross-seed | grep TORZNAB_URLS \
++     | sed -E 's/(apikey=)[^,&]+/\1<redacted>/g'
++ ★ 上面那行里每个 URL 都带一个 apikey=（Prowlarr 的 key），
++   原样 grep 出来就是明文凭据；sed 只是把它换成 <redacted>。
+```
+
+★ sed 咬的是 **`apikey=` 后面那段值**（`[^,&]+`：`&` 是 URL 内部的分隔符、
+`,` 是 URL 之间的分隔符），**键名 `apikey=` 与 `/N/api` 都留着** ——
+要判的是「容器里还剩哪个站」，这两样就够了，**那个值对判读毫无用处**。
+
+> **Python 里写 sed 的 `\1` 要写 `\1`。** 否则 `"\1"` 会被解释成 `chr(1)`
+> 这个八进制转义，命令里插进一个不可见控制字符 —— 而**看起来很对**。
+> 这一条已用 `ast` 回读实际正文字符串确认过（不是"读源代码看着对"）。
+
+### 20.8.4 钉回测试（`test_check_indexers.py` ⑤，42 → 45 条）
+
+| 断言 | 防的是什么 |
+|---|---|
+| 正文含 `sed -E` 且含 `<redacted>` | 命令**自带**脱敏，不是"我们记得脱敏" |
+| 正文含 `(apikey=)[^,&]+` | sed 咬的是**值**；写成 `s/apikey=.*//g` 那种会把键名也吃掉，判读就没依据了 |
+| 正文含「别把原样输出」 | 光有命令拦不住手快 —— 命令给脱敏版、话还要说一句 |
+
+### 20.8.5 落点
+
+* 代码 `scripts/drive-loop.py`；测试 `tests/test_check_indexers.py`；
+  文档 README「通知 / 告警」节新增一条 ⚠ 说明 + 「下一步」第 **9** 行。
+* ⬜ **尚未部署** —— 与 §20.7 那三条一起，**等批次间隙**（覆盖正在跑的
+  `run.sh`/`drive-loop.py` 会打出假的 `exit=127`，见 README「还没做」第 8 条）。
+
+---
+
+## §21 IYUU 辅种的保存目录从哪来 + 22 条旧根漏网（2026-09-13）
+
+### 21.1 问的是什么
+
+用户问：**IYUU 辅种时把目录指向哪里？**「监控文件夹 / 目录文件夹 / 种子文件夹」都用的默认值、
+「创建多文件夹子目录」已勾选 —— **要不要手动配 IYUU 的文件目录？**
+并给了四条猜测：① 容器路径映射不一致 ② IYUU 记的是搬迁前的路径 ③ qB 分类 save path 覆盖 ④ 孤本。
+
+### 21.2 源码三跳 —— 辅种目录是「抄 qB 的」，不是「IYUU 自己造的」
+
+三处都在 `\iSunker-DS423\docker_ssd\iyuuplus\iyuu`（只读）：
+
+```php
+// ① 取：把 qB 的种子列表编成 infohash → save_path 的字典
+//    composer/bittorrent-client/src/Driver/qBittorrent/Client.php:726
+$hashArray['hashString'] = array_column($res, "save_path", 'hash');
+
+// ② 存：发现可辅种时，把这目录**快照**进库
+//    app/admin/services/reseed/ReseedServices.php:322,379
+$downloadDir = $hashDict[$infohash];              // 辅种目录
+... 'directory' => $downloadDir, ...
+
+// ③ 发：辅种时原样当 savepath 发给 qB
+//    app/admin/services/reseed/ReseedDownloadServices.php:149
+$contractsTorrent->savePath = $reseed->directory;
+```
+
+⇒ **辅种目录 = qB 里「同 infohash 那条已有种子」自己的 `save_path`，原样回灌。**
+qB 报什么就用什么，所以它**天然落在 qB 的命名空间里**。
+
+| 猜测 | 裁定 | 依据 |
+|---|---|---|
+| ① 容器路径映射不一致 | ★ **对辅种目录不成立**。IYUU 容器把宿主 `/volume1/video` 映成 `/video`，qB 容器映成 `/volume1/video` —— 但这个不一致**碰不到辅种目录**，因为它不是 IYUU 算出来的。它只对 `watch_path`/`torrent_path` 成立，而那两者**空转** | 21.2 + 21.3 |
+| ② 记的是搬迁前的路径 | **成立**，且这正是 21.4 那 22 条的成因 —— `directory` 是**入库那一刻的快照** | 21.4 |
+| ③ qB 分类 save path 覆盖 | ★ **已被代码防住**：`autoTMM='false'` 硬关（qB 只在自动种子管理开启时才拿分类保存路径去移动种子） | 21.3 |
+| ④ 孤本 | **机制真实**，成因是 `root_folder` 与既有布局不一致；**本次核对是「对的」** | 21.3 + 21.5 |
+
+### 21.3 唯一参与路径决策的字段：`root_folder`
+
+```php
+// ReseedDownloadServices.php:203-209（qB 分支）
+$contractsTorrent->parameters['autoTMM'] = 'false'; // ★ 关闭自动种子管理
+$contractsTorrent->parameters['paused']  = 'true';  // 添加任务校验后是否暂停
+$contractsTorrent->parameters['root_folder'] = $clientModel->root_folder ? 'true' : 'false';
+```
+
+* 「**创建多文件夹子目录**」→ qB 的 `root_folder` 参数。**勾着是对的**，盘上核对：
+
+  | 站点目录 | 内容形态 | `root_folder=true` |
+  |---|---|---|
+  | `…/reseed_singles/HDFans` | 276 个子**目录**（每个里 17 个文件） | ✅ 内容就在 `<save_path>/<名>/` 下 |
+  | `…/reseed_singles/HDtime` | 30 个**单个 .mkv** 直接躺着 | ✅ 无害（单文件种不吃这个开关） |
+
+* 那一格**必须对着盘核**，不能"勾上就行"：若某类既有种子的内容**直接躺在 save_path 下**，
+  勾上它 qB 就会去 `<save_path>/<名>/` 找 → 校验失败 → **重下 → 多一份**。这就是 ④ 的成因。
+* 另外三个框（`watch_path` / `save_path` / `torrent_path`）在 `sendDownloader()` 这条路上
+  **一次都没被读** —— 辅种走的是 WebAPI 注入（`addTorrentByMetadata`），不是往监控目录丢 .torrent。
+  且 `cn_folder`（IYUU 的目录映射表）**零行**、两个辅种任务的 `path_filter` 都是空串
+  ⇒ 排除列表为空，**不需要手动配任何目录**。
+
+### 21.4 22 条旧根漏网 —— 已收拢
+
+`:3060` 902 条种子的 `save_path` 原本分两个根：
+
+```
+880 条  /volume1/video/download/reseed/reseed_singles/<站点名>   ← 新根
+ 22 条  /volume1/video/download/reseed_singles/<站点名>          ← 旧根（南洋 14 + HDFans 8）
+```
+
+生产 `.env` 的 `LINK_DIR` **早已是新根**，所以这 22 条**不是配置问题，是搬迁漏网**。
+
+★ **判归属要看 tag，不能看 category**（§18.10 的老教训）：22 条**全是 IYUU 的**
+（tag `IYUU自动辅种`，category 空）；我们那 599 条（tag `cross-seed`）一条不漏已在新根。
+⇒ 所以收拢**必须带 `--all-tags`**（脚本默认只搬 tag `cross-seed` 的，那 22 条会被它挡下）。
+
+过程照 §18.10 的老规矩：
+
+```
+python scripts/migrate-reseed-dirs.py --all-tags            # 只读预检：22 条，无一在途
+python scripts/migrate-reseed-dirs.py --limit 1 --all-tags --apply   # 试跑：每组各 1 条 → 实际 2 条
+python scripts/migrate-reseed-dirs.py --all-tags --apply    # 全量 20 条
+```
+
+结果：**902/902 全部落新根，0 条指旧根**。
+状态分布 `stalledUP 706 / checkingDL 169 / error 24 / stalledDL 2 / pausedDL 1`。
+
+> ★ **那 19 条 `error` 是搬之前就 error 的**，不是搬迁弄坏的 —— 试跑只对 **2 个 hash**
+> 下过 `setLocation`，不可能把另外 19 条打成 error。它们只是**带着 error 状态搬到了新根**。
+> error 总数 23 → 24（**+1，未归因**），如实记着。
+
+### 21.5 旧根盘上还留着 52.42 GB / 10 条目 —— ★ 别对 UNC 跑 rm
+
+| 站点 | 旧根条目 | 与新根**同名**（= 重复） | 只存在于旧根 |
+|---|---:|---:|---:|
+| HDFans | 3 | **2** | 1（`149.V字仇杀队…`，4.21 GB） |
+| NanyangPT (南洋) | 6 | **6** | 0 |
+
+现在**没有任何 qB 种子指向旧根** ⇒ 这是一批**无引用残留**。
+
+> ⚠⚠ **不能据此断言它占 52 GB 实空间。** cross-seed 建的是**硬链接**，同名条目很可能
+> 与新根那份**共享 inode**（额外占用 = 0）。SMB 读不到 inode，**这件事只能在 NAS 上判**：
+> `du -sh` 对比 `du -sh --apparent-size`，或 `find <新根路径> -samefile <旧根路径>`。
+> **别按"52 GB"这个数去删。** 且删只许在 NAS 上/DSM File Station 做（UNC 上 `rm` 是禁区）。
+> `149.V字仇杀队…` 主 qB（opencd）也不引用它（opencd 的 `/downloads` = `/volume1/video/music`），
+> 但删前照样先确认它是不是硬链接。
+
+### 21.6 顺带查出一个潜伏雷：`qbittorrent-reseed` 的 `/downloads` **没挂载**
+
+| qB | compose 里的挂载 | `Session\DefaultSavePath` | 结果 |
+|---|---|---|---|
+| `qbittorrent-opencd` (:3020) | `/volume1/video/music:/downloads` ✅ | `/downloads/` | 落在 `/volume1/video/music`，实的 |
+| `qbittorrent-reseed` (:3060) | 只有 `/downloads/incomplete` ⚠ | `/downloads/` | ★ **`/downloads` 是容器可写层** |
+
+`:3060` 上任何**不带 savepath** 的添加（手动拖进 WebUI、别的工具）都会落到**容器可写层**：
+**宿主上看得见吗？看不见**；**重建即丢**；也不会与农场共享硬链接。
+
+⇒ 现状无害（cross-seed 与 IYUU **都显式传 savepath**），但这是一颗**潜伏的**雷 ——
+它的形态正是本项目反复栽的那一类：**失败的样子是「看起来正常」**。
+要不要补挂 `/downloads`（或把 `DefaultSavePath` 改到已挂载的目录），列入待办。

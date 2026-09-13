@@ -162,6 +162,10 @@ db6 = make_db([(2, "HDFans", "RATE_LIMITED",
 st6, _, _ = run_session(db6, n=12, max_wait=1800.0)
 ck("中止", bool(st6.aborted), True)
 ck("一条都没发", st6.sent, 0)
+# ★★ 中止要**分类**（#45）：这一种是**良性**的 —— 站点在退避、等到超过上限就先收工，
+#    剩下的条目下轮重新排上。它和「webhook 401」是两件事，下游据此分开计数。
+ck("★ 分类是 indexer-backoff（**良性**，不是真故障）",
+   st6.aborted_kind, "indexer-backoff")
 
 print("\n== ⑦ check_secs 关掉（=0）时退回老行为：只按条数检查 ==")
 db7 = make_db([(2, "HDFans", "OK", None, 1)])
@@ -175,6 +179,100 @@ def hit_429_7(call_no, clock):
 st7, _, _ = run_session(db7, n=6, check_secs=0.0, on_item=hit_429_7)
 ck("条数没到就不看（6 条 < 10）", st7.backoff_hits, 0)
 ck("也就没有等待", st7.waited_sec, 0.0)
+
+print("\n== ⑧ ★★ 两个计数分开：站点退避超时**不是**「批失败」（#45） ==")
+# ★ 这一节钉的是**2026-09-13 生产里看到的那一格**：同一批的 TSV 既写
+#   `ok=22 failed=0`，又写「连续 3 批失败（索引器 HDtime 要等到 …）」——
+#   一个名字盖了两种模型（同 `NanyangPT` vs `NanyangPT (南洋)` 的形状）。
+#   下面每一格都对着那条真实记录。
+import importlib.util as _ilu                       # noqa: E402
+
+_spec = _ilu.spec_from_file_location(
+    "drive_loop_backoff", str(pathlib.Path(__file__).resolve().parent.parent
+                              / "scripts" / "drive-loop.py"))
+dl = _ilu.module_from_spec(_spec)
+_spec.loader.exec_module(dl)
+
+_ev = []
+dl.emit = lambda kind, title, body="", *, key=None, metrics=None: (
+    _ev.append((kind, title, body, key, metrics)) or True)
+
+
+def _backoff(reason="索引器 HDtime 要等到 2026-09-13 03:00:11（169 分钟 > 上限 30 分钟）"):
+    return S.DriveStats(aborted=reason, aborted_kind="indexer-backoff", ok=22)
+
+
+def _auth():
+    return S.DriveStats(aborted="webhook 返回 401（鉴权/路径问题），已停",
+                        aborted_kind="webhook-auth")
+
+
+_ev.clear()
+ck("良性收工 1 批 → (真失败, 收工) = (0, 1)",
+   dl.update_abort_streak((0, 0), _backoff()), (0, 1))
+ck("★ 只涨「收工」，**一点失败都没涨**", dl.update_abort_streak((0, 0), _backoff())[0], 0)
+
+n = (0, 0)
+for _ in range(3):
+    n = dl.update_abort_streak(n, _backoff())
+ck("连 3 批良性 → 计数到 3", n, (0, 3))
+ck("★ 发的 alert key 是 consec-backoff（**不是** consec-abort）",
+   [e[3] for e in _ev], ["consec-backoff"])
+ck("★ 标题**不**出现「批失败」", "批失败" in _ev[0][1], False)
+ck("★ 正文点明「不是失败」+ 说清下轮会重排",
+   ("不是" in _ev[0][2] and "重新排上" in _ev[0][2]), True)
+ck("★ 正文**不**再把人指去 force-recreate（那是上一版对退避场景的误导）",
+   "force-recreate" in _ev[0][2], False)
+
+# 反向：真故障走另一条路，key 与文案都不一样
+_ev.clear()
+ck("真故障 → (1, 0)：良性那格空着，不动",
+   dl.update_abort_streak((0, 0), _auth()), (1, 0))
+_ev.clear()
+n = (0, 0)
+for _ in range(3):
+    n = dl.update_abort_streak(n, _auth())
+ck("连 3 批真故障 → (3, 0)", n, (3, 0))
+ck("★ 真故障的 key 是 consec-abort", [e[3] for e in _ev], ["consec-abort"])
+ck("★ 真故障才说「批失败」", "批失败" in _ev[0][1], True)
+
+# ★★ 互不干扰：中间夹一批良性，**不许**把真失败冲回 0 ——
+#    这一格是本节存在的一半理由：写成"互相清零"的话，真实故障会被
+#    交替出现的退避批次反复掩盖，**永远到不了 3**，告警等于没有。
+_ev.clear()
+_after = dl.update_abort_streak(dl.update_abort_streak((2, 0), _backoff()), _auth())
+ck("★★ 真失败 ×2 → 夹 1 批良性 → 真失败**不被冲掉**", _after, (3, 1))
+ck("★★ 而且这一批就报了（3 批真失败，中间那批良性没掩盖它）",
+   [e[3] for e in _ev], ["consec-abort"])
+# 反向：良性也不被真失败冲掉，且**总数**把两边都算进去（谁也别想被掩盖）
+_ev.clear()
+_s = dl.update_abort_streak((0, 0), _auth())        # 1 批真失败
+for _ in range(3):
+    _s = dl.update_abort_streak(_s, _backoff())     # 再 3 批良性
+ck("真失败 1 + 良性 3 → (1, 3)", _s, (1, 3))
+ck("★ 良性这边到 3 就报（那批真失败没把它冲回 0）",
+   [e[3] for e in _ev], ["consec-backoff"])
+ck("★ 混着出现时，标题把「共 4 批没跑成」写出来（否则 3 会被念成「连续 3 批」）",
+   "共 4 批没跑成" in _ev[0][1], True)
+# ★ 反向控制：**整批异常**也按真失败算（它可一点都"良性"不起来）
+_ev.clear()
+ck("整批异常 → 真失败",
+   dl.update_abort_streak((0, 0), None, failed=True), (1, 0))
+# ★ 兜底方向：`aborted` 非空却认不出种类 → **按真失败算**（宁可吵，不可静默）
+ck("★ 认不出种类 → 按真失败算（宁可吵不可静默）",
+   dl.update_abort_streak((0, 0), S.DriveStats(aborted="说不清的原因")), (1, 0))
+# ★ 正常跑完（含"本包无待搜"）→ **两个都清零**（这是唯一的清零路径）
+ck("★★ 正常跑完 → 两个计数都清零",
+   dl.update_abort_streak((5, 5), S.DriveStats(ok=50)), (0, 0))
+ck("没跑（stats=None 且没 failed）→ 也清零",
+   dl.update_abort_streak((5, 5), None), (0, 0))
+# ★ 常见情况下不补那句括号（补了是噪音）—— 上一条刚确认 5+5 被清零了，
+#   这里单独跑一条干净的 3 连良性，确认标题就是简单的「连续 3 批提前收工」。
+_ev.clear()
+n = (0, 0)
+for _ in range(3):
+    n = dl.update_abort_streak(n, _backoff())
+ck("★ 单一成因时不啰嗦（标题里没有「共 … 批」）", "共 " in _ev[0][1], False)
 
 print()
 if fails:

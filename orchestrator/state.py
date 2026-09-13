@@ -2344,6 +2344,15 @@ class DriveStats:
     waited_sec: float = 0.0
     backoff_hits: int = 0
     aborted: str | None = None
+    #: `aborted` 的**机器可读**分类。`aborted` 是给人看的一句话，这个给判据看。
+    #: ★ 为什么必须分开：`aborted` 有两种**性质完全不同**的来源 ——
+    #:   `"indexer-backoff"` 站点在退避、等到超过 `--max-wait` 就先收工
+    #:     （**良性**：本批条目没失败，剩下的下轮重新排上），
+    #:   `"webhook-auth"` webhook 返回 400/401/403（**真故障**：鉴权/路径问题）。
+    #:   下游 `update_abort_streak()` 原先只看 `aborted` 的真假，于是良性的那种
+    #:   被算成「批失败」。实测 2026-09-13 的 TSV 里**同一批**既写 `ok=22 failed=0`，
+    #:   又写「连续 3 批失败（索引器 HDtime 要等到 …）」—— 名字指不回真实记录。
+    aborted_kind: str | None = None
     #: 打完之后再同步一次的结果
     resync: SyncReport | None = None
     #: 打完还处于 SKIPPED 的片子（= 又被退避了）
@@ -2489,6 +2498,7 @@ class DriveSession:
             if delta <= 0:
                 return True
             if delta > self.max_wait:
+                self.stats.aborted_kind = "indexer-backoff"
                 self.stats.aborted = (
                     f"索引器 {names} 要等到 {soonest:%Y-%m-%d %H:%M:%S}"
                     f"（{delta / 60:.0f} 分钟 > 上限 {self.max_wait / 60:.0f} 分钟）")
@@ -2529,6 +2539,7 @@ class DriveSession:
             self._on_event("sent", pth, code, i, self.stats.total)
 
             if code in (400, 401, 403):
+                self.stats.aborted_kind = "webhook-auth"
                 self.stats.aborted = f"webhook 返回 {code}（鉴权/路径问题），已停"
                 self._on_event("abort", self.stats.aborted)
                 break

@@ -160,6 +160,16 @@ ck("metrics 里带的是标签而不是个数",
 ck("★ 正文点明「#N = /N/api，不是 Prowlarr 界面序号」（别找错站）",
    "/N/api" in s[0]["body"], s[0]["body"])
 ck("给了解析命令", "docker inspect reseed-cross-seed" in s[0]["body"], s[0]["body"])
+# ★★ 查证命令必须**自带脱敏**（2026-09-13）：`TORZNAB_URLS` 里每条 URL 各带一个
+#    `apikey=`，值就是 Prowlarr 的应用级 key —— 而 Prowlarr 存着所有 PT 站 cookie。
+#    原样 grep 出去 = 把凭据打进终端/聊天。这一格钉的是"命令本身就脱敏"，
+#    而不是"我们自己记得别看"（靠人记得的那种防护，早就漏过了）。
+ck("★★ 解析命令自带 sed 脱敏（不许把 apikey 原样打出来）",
+   "sed -E" in s[0]["body"] and "<redacted>" in s[0]["body"], s[0]["body"])
+ck("★ sed 必须咬住 apikey 的**值**（`(apikey=)[^,&]+`）",
+   "(apikey=)[^,&]+" in s[0]["body"], s[0]["body"])
+ck("★ 而且必须明说「别原样粘贴」——光有命令拦不住手快",
+   "别把原样输出" in s[0]["body"], s[0]["body"])
 ck("★ unnamed 不该被算成 missing（它压根没法比名字）",
    "missing" not in s[0]["key"], s[0]["key"])
 
