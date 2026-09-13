@@ -148,7 +148,9 @@ LOCAL_ONLY = [
     #   那条每行都带 apikey=<Prowlarr 应用级 key>，而判「哪个站、什么状态」
     #   靠 id/name/status 就够；出口再统一过一遍 redact() 兜底（**两条都要**）。
     #   另外三个只看三份 md，不碰网络。产物目录 out/ 已进 .gitignore。
-    (r"^tools/doc-audit/",                        "文档审计工具（在 Windows 上跑；只读 md + UNC 只读 + HTTP 只读；不选 indexer.url 列，出口统一 redact()）"),
+    #   INDEX-USAGE.md 是这些投影的**用法 + 两周观察基线**（09-13 建 / 09-20 复跑 /
+    #   09-27 决策）—— 给人和工具看的说明，**不是第三份事实源**。
+    (r"^tools/doc-audit/",                        "文档审计工具 + 索引用法（在 Windows 上跑；只读 md + UNC 只读 + HTTP 只读；不选 indexer.url 列，出口统一 redact()）"),
     (r"^deploy\.sh$",                             "同步工具本身（在 Windows 上跑）"),
     (r"^scripts/check-deploy-drift\.py$",         "本哨兵（在 Windows 上跑）"),
     (r"^scripts/scan-secrets\.py$",               "推前凭据扫描（在 Windows 上跑；读本地 .env，但绝不打印命中到的值）"),
