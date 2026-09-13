@@ -31,8 +31,36 @@ module.exports = {
   linkDirs: csv(process.env.LINK_DIR),
   linkType: process.env.LINK_TYPE || "hardlink", // hardlink | symlink | reflink
 
-  // 匹配严格度（取值随版本，见顶部说明）。内容匹配偏保守可用 partial/flexible。
-  matchMode: process.env.MATCH_MODE || "partial",
+  // ★★★ 2026-09-13：硬链接农场下这里**只能 strict**，不跟随 .env ★★★
+  // 机理（已实证，见 README「源文件被写穿」）：
+  //   matchMode=partial/flexible 会让 cross-seed 把「名称+大小匹配、但 piece 不一致」
+  //   的单种也注入。qB 校验(recheck)发现 piece 对不上 → **就地重下那几个 piece**；
+  //   而 linkDirs 是硬链接（与 reseed_farm、download/movies|TV 同一个 inode），
+  //   于是这次重下**写穿到源文件**，无声改写库里的母本，且 Farm 侧仍显示 100%。
+  //   官方文档对 partial 的描述恰好印证这一点：
+  //     "Nearly all partial matches recheck to 99.9% rather than 100%"
+  //   —— 上游把它当作预期行为；在硬链接农场里它就是事故。
+  //   实证（2026-09-13）：
+  //     · 哥谭.全5季 ih=04421b52 决策 MATCH_PARTIAL，完成 09-13 16:35，
+  //       对应源文件 mtime 15:57/16:05/16:35 —— 分秒吻合；
+  //     · 教父1972  ih=db7be3ac 决策 MATCH_PARTIAL，完成 09-12 09:49，
+  //       对应源文件 mtime 09-12 09:49 —— 分秒吻合；
+  //     · 同一份《致命魔术》被 5 条 MATCH 注入（完成 09-12 19:22）源毫发无伤，
+  //       第 6 条 MATCH_PARTIAL 卡在 99.9996% 正在重下。
+  // 故**硬编码 strict**：只注入完全匹配，源永不被重下。.env 的 MATCH_MODE 保留
+  // 仅为兼容，非 strict 一律忽略并告警（绝不静默放行）。
+  // 要恢复宽松匹配，前提是让做种数据与源脱离同一 inode（reflink / 独立副本），
+  // 而不是把这里改回去。
+  matchMode: (() => {
+    const m = String(process.env.MATCH_MODE || "").trim().toLowerCase();
+    if (m && m !== "strict") {
+      console.warn(
+        "[config] 忽略 MATCH_MODE=" + m + "：硬链接农场下非 strict 注入会写穿源文件，" +
+          "已强制 strict。要放宽请先让做种数据与源脱离同一 inode（reflink/独立副本）。"
+      );
+    }
+    return "strict";
+  })(),
 
   // --- 命中后的动作：注入 qBittorrent ---
   action: "inject",
@@ -42,8 +70,10 @@ module.exports = {
   linkCategory: process.env.QBIT_CATEGORY || "reseed-singles",
   duplicateCategories: false,
 
-  // 内容匹配（名称+大小，非哈希）→ 注入后务必让 qB 校验(recheck)确认数据一致，
-  // 校验通过才做种，避免喂错数据被 H&R。true 仅适用于哈希已保证一致的场景。
+  // ★ 校验必开（false）。但**别把 recheck 当安全网** —— 2026-09-13 的教训：
+  //   recheck 不通过时 qB 不会拒绝，而是**就地重下**缺失 piece，直接改写源文件。
+  //   真正挡住事故的是上面的 matchMode: "strict"（不匹配的根本不注入）。
+  //   这个键保持 false，只是为了让万一漏进来的不匹配尽早暴露出来，而不是"修好"它。
   skipRecheck: bool(process.env.SKIP_RECHECK || "false"),
 
   // --- 守护进程 / API ---

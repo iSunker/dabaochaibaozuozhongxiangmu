@@ -636,6 +636,47 @@ python scripts/reseed-state.py init --roots-from-env .env --match "DouBan_IMDB"
 | `UNMATCHED` 的「软性节流」会**突然释放** | 靠 `SKIPPED`/`PENDING` 还多撑着 | 无 —— **不可观测** |
 | 站上「后来才有人发种」的机会被漏掉 | 14 天周期是当前兜底 | 无 |
 | 「按片预测会不会命中」这条路 | **没采用，也不该采用** —— 判据只有模型自己一个来源 | 见 SUMMARY §19.2.5 |
+| **源文件被 qB 就地重下写穿**（partial 注入 × 硬链接） | 2026-09-13 起改 `strict`；**存量 551 条**已注入的仍在 | 只挡住"新增"，存量无解 —— 见下节 |
+
+### 源文件被写穿 —— partial 匹配 × 硬链接农场（2026-09-13 发现）
+
+**一句话**：cross-seed 以 `matchMode: partial` 把「名称+大小匹配、但 piece 哈希不一致」的
+单种也注入 qB；qB 校验(recheck)不通过时**不报错**，而是**就地重下**那几个 piece；
+而 `linkDirs` 是硬链接 —— 于是这次重下**直接写进源文件**，无声改写库里母本，
+Farm 侧还显示 100%。
+
+**三个前提各自都"合理"，叠在一起才致命**：
+① partial 是官方推荐的高命中模式；
+② `skipRecheck: false` **看起来**是安全网（实际上它不通过时 qB 只会重下，不会拒绝）；
+③ 硬链接是为了零磁盘开销。
+上游文档甚至把这个现象写成正常行为：
+
+> Nearly all partial matches recheck to **99.9%** rather than 100% *(expected due to piece hashing)*
+
+**实证**（两处时间**分秒吻合**）：
+
+| 包 | 注入种 decision | 种子完成时刻 | 对应源文件 mtime |
+|---|---|---|---|
+| 哥谭.全5季 `04421b52` | `MATCH_PARTIAL` | 09-13 16:35 | 15:57 / 16:05 / 16:35 |
+| 教父 1972 `db7be3ac` | `MATCH_PARTIAL` | 09-12 09:49 | 09-12 09:49 |
+
+反证（天然对照）：同一份《致命魔术》被注入 **6 次** —— 5 条 `MATCH`（完成 09-12 19:22）
+源**毫发无伤**，第 6 条 `MATCH_PARTIAL` 卡在 `99.9996%` 正在重下。
+
+规模：已注入的 629 条里 **551 条（88%）来自非完整匹配**（`MATCH_PARTIAL` 472 +
+`MATCH_SIZE_ONLY` 79 —— 后者只按大小匹配）。
+
+**处置**：`cross-seed/config.js` 里**硬编码** `matchMode: "strict"`，不再跟随 `.env` 的
+`MATCH_MODE`（非 strict 会忽略并打告警）。改代码层而不是 `.env`，有两个理由：
+`.env` 不在 `deploy.sh` 白名单里（改不动），且代码层强制更不容易被以后误改回去。
+
+**残留风险 / 边界**：
+- 只有 `strict` 安全；`flexible` 与 `partial` 在硬链接农场下**都不安全**。
+- 根上的解法是让做种数据与源**脱离同一 inode**（reflink 或独立副本）—— 那时才谈得上放宽匹配。
+- 已被改写的文件**无备份可恢复**：`net view` 没有任何备份共享，4 处 `#snapshot` 均不存在，
+  `download/可删` 与 `download/temp` 为空。
+- inode 基线存档在 **`D:\tmp\reseed-inode-baseline\`**（**仓库外** —— 里面有完整文件名）。
+  日后谁再被改写，拿这份比即可。
 
 ---
 
