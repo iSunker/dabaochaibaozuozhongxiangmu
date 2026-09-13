@@ -552,7 +552,7 @@ sh build-farm.sh --verify           # 只校验农场 vs 源
 |---|---|---|---|
 | **`FARM_SOURCES`** | NAS `.env` | 哪些目录是**源根** | `build-farm.sh --verify` 期望集里没有它 → **连漂移都不报**（两边一致地当它不存在） |
 | **`pack` 表一行** | `<compose>/drive-loop/hlink/state.db` | 名字 + `roots` + `farm_root` + `max_depth` | 农场里的片**归不到任何包** → 静默 continue（只记进 `other_pack`） |
-| **`--packs`** | `drive-loop.py` 的 **`PACKS_DEFAULT`**（`dc-collection,frds-top250-2024`；`run.sh` **没传**） | 哪个包**会被驱动** | 状态机有它、农场有它，**就是不排它** —— `mbf` 就是这么被落下的 |
+| **`--packs`** | `drive-loop.py` 的 **`PACKS_DEFAULT`**（`dc-collection,mbf,frds-top250-2024`；`run.sh` **没传**） | 哪个包**会被驱动** | 状态机有它、农场有它，**就是不排它** —— `mbf` 就是这么被落下很久的（2026-09-13 已排进去，见第 7 条） |
 | **`--indexers`** | `run.sh` | 哪些**站**会被搜 | 站没进名单 = 对每部片子来说「那个站从没搜过」**根本不会被表达出来** → HDtime 就是这么卡住的（§18.11） |
 | **文档里的 init 配方** | `SUMMARY §10.2` 与本节的示例 | 包名 + `--match` 关键词 | 照旧配方重跑 → 挑 0 条根；或**多建一个包行**（`mbf` 与 `my-brilliant-friend-s01-s04` 是同一包的两个名字） |
 
@@ -602,7 +602,7 @@ python scripts/reseed-state.py init --roots-from-env .env --match "DouBan_IMDB"
 | 计数器 | 覆盖 ① 的哪一处 | 基线 | 涨了意味着 |
 |---|---|---|---|
 | **全场无人认领**（§18.19.2） | `pack` 表 | **1**（那条 `0观影清单chrlee整理` 的 xlsx） | 有人加了包、忘了登记 `pack` 表 |
-| **声明点〔`--packs`〕**（§19.1.6） | `--packs` | **1**（`mbf`） | 有人又落下一个包 —— 或被驱动名单里的名字写错了 |
+| **声明点〔`--packs`〕**（§19.1.6） | `--packs` | **0**（2026-09-13 起 —— `mbf` 已排进 `PACKS_DEFAULT`；此前恒为 1） | 有人又落下一个包 —— 或被驱动名单里的名字写错了 |
 
 ⚠ 覆盖面仍要说清：① 里的 **`FARM_SOURCES`** 与 **文档里的 init 配方**今天**仍然没有检测器**
 —— 它们没有一条能自动对账的"另一侧"（前者要 NAS 上真去 build 才看得出，后者是文档）。
@@ -987,7 +987,7 @@ python scripts/drive-loop.py --once --notify-spool "D:/tmp/x"    # 换个 spool
 | — | **观察：`title mismatch` 的量** —— **只记着，未处理**。`[inject] Skipping match … with /…/reseed/reseed_farm/… due to title mismatch`：07 时 **197** / 08 时 **311** / 12 时 **128** / 16 时 **202** / 17 时 **70**。摘要是中文名、候选是英文发行名，看着像同一类；cross-seed 给的口子是 `--ignore-titles` | 若确实在**整类地**否掉本该注入的候选，那是**注入量**的损失 —— 而注入量直接决定做种数。**先量、再决定要不要给口子**，所以只记不动 | — |
 
 | **6** | **`packs` 差集改成「只报变化」+ 基线** ✅ **代码已部署**（NAS 上 md5 与本地**逐字节相同**）、`615b03d` 已推 main —— ★ **首读在 09-13 当天首批跑完时**：那天会打一次 `★ 首次读数 → 已记为基线，不告警`，此后**只有差集新增才响** | 原先 `mbf` 是**已接受**的现状，每天喊一次只会把告警喊成噪音 —— 而噪音的代价是**真出问题时没人看** | §20.1 / §20.2 |
-| **7** | **决定 `mbf` 要不要排进 `--packs`** —— ★ **可以推迟**（基线已让它不天天喊，不必现在拍板）。代价：`PACKS_DEFAULT` 是**驱动名单与轮转集合同一份**，2 包 → 3 包会把 dc/frds 的节奏从 1/2 压到 **1/3（−33%）** | 排进去 = HDFans 那 4 个季包也被驱动（实测 0 匹配，见下「⚠ MBF」）；不排 = 保持现状。★ **两个选项的代价都与基线无关** —— 基线只让它不提醒你，**没让它变小** | §20.3.3 |
+| **7** | **决定 `mbf` 要不要排进 `--packs`** ✅ **已决：排进去（2026-09-13，#40）** —— `PACKS_DEFAULT` 已改为 `dc-collection,mbf,frds-top250-2024`。代价照旧：驱动名单与轮转集**同一份**，2 包 → 3 包把 dc/frds 的节奏从 1/2 压到 **1/3（−33%）**。★ 但这是**几轮，不是永远** —— 退出条件写在那个常量正上方：**HDtime 上也 0 匹配就把 `mbf` 移出名单**，频率立刻复原 1/2 | 理由**不是**"`mbf` 可能命中"（HDFans 实测 4 季包全 `Found 0 torrents`），是**不排它 = 一个不可观测的盲区**：它在 unclaimed / report / trend 上**全绿**，而"到底能不能搜到"永远没有读数。★ `HDtime` 2026-09-12 才进 `TORZNAB_URLS`，mbf 从没在它上面搜过（`UNMATCHED` 遇没搜过的索引器自动解锁）⇒ **驱动一轮**就能拿到那个此前拿不到的读数 | §20.9 |
 
 | **8** | **兑现 09-13 首读读出来的三条**（✅ 代码已改、测试已过 —— ⬜ **还差部署**）—— ① `unclaimed` 也改成**只报新增**（不然那条 `.xlsx` 目录配 12h 冷却 = 每天响两次、永远）② `stats.aborted` 拆 `aborted_kind`：「站点退避超时」不再算「批失败」（09-13 的 TSV 里同一批既 `failed=0` 又「连续 3 批失败」，正文还指去 force-recreate）③ README 两处**期望值**修正（`fb_c_farm` 1→0；`1011` 是全天数、日报里应为不变式 `a == b`）。★ **部署要等批次间隙**（覆盖正在跑的 `run.sh`/`drive-loop.py` 会打出假的 `exit=127`，见「还没做」第 8 条） | 三条都是**名字/期望值指不回真实记录**：一条是噪音、一条是把良性念成故障、两条是把全天数当日初数 | §20.7 |
 
@@ -1037,7 +1037,7 @@ python scripts/scan-secrets.py            # 0 可以推 / 1 有新引入的凭�
 > | `fa` / `fb` / `fd` | ★ **不变式：`a == b`、`fd = a − b = 0`**（**不是** 1011 —— 见下） | 当日 `info.current.log` 里的 `Found` 行 |
 > | `fb_c_all` / `fb_c_farm` | `0` / `0`（全量口径 / 农场行计数） | `hlink/state.db` 的 `pack`+`movie` |
 > | `unclaimed` | **基线 1**（`0观影清单chrlee整理`），**只报新增** | 农场里那个只有 `.xlsx` 的目录 |
-> | `packs_undriven` / `packs_unreg` | **基线 1 / 0**（`mbf` 登记了没被驱动） | `--packs` 的实际取值 vs `pack` 表 |
+> | `packs_undriven` / `packs_unreg` | **基线 0 / 0**（2026-09-13 起 —— `mbf` 已排进 `PACKS_DEFAULT`；此前恒为 1 / 0） | `--packs` 的实际取值 vs `pack` 表 |
 >
 > ★ **为什么 `fa` 不是 1011**：日报在**当天首批**跑，而它读的是**当日日志**
 > （`info.current.log` 按天轮转）⇒ 天然是「**今天 00:00 到现在**」，会随一天推进而涨。
@@ -1059,7 +1059,8 @@ python scripts/scan-secrets.py            # 0 可以推 / 1 有新引入的凭�
 >   ⇒ 静默采纳新基线，**但正文会把「比基线少 N 条」写出来**，所以不是无痕；
 >   将来**再长回来会被抓住**（当新增报）。
 > * **`unclaimed` / `packs_*` 都只报「变化」，不报「现状」**（2026-09-12 深夜 / 09-13 改）：
->   现状（`mbf` 登记了却一直没被驱动、农场里那条 `.xlsx` 谁都不归）是**已接受**的，
+>   现状（农场里那条 `.xlsx` 谁都不归；`mbf` 登记了却一直没被驱动是 **2026-09-12 之前**的现状
+>   —— 09-13 已排进 `--packs`）是**已接受**的，
 >   非空就每天喊一次只会把告警喊成噪音 —— 而噪音的代价是真的出问题时没人看。规则：
 >   **出现基线里没有的 → 发 alert**；与基线一致、或缩回基线之内 → 不发。
 >   基线存在 `.reconcile.state` 的 `_packs_baseline` / `_unclaimed_baseline` 里
@@ -1103,7 +1104,7 @@ python scripts/scan-secrets.py            # 0 可以推 / 1 有新引入的凭�
 |---|---|---|
 | `frds-top250-2024` | 486 | ✅ 根目录子目录即发布名 |
 | `dc-collection` | 115 | ⚠ 根下多一层中文标签，见「多包支持 → 嵌套结构」 |
-| `mbf` | 4 | ⚠ HDFans 上 **0 匹配**（4 个季包全 `Found 0 torrents`） |
+| `mbf` | 4 | ⚠ HDFans 上 **0 匹配**（4 个季包全 `Found 0 torrents`）；**2026-09-13 起已排进 `--packs` 被驱动**（#40）—— 若 HDtime 上也 0 匹配就移出名单 |
 
 ```bash
 DB="//YOUR-NAS/docker_ssd/prowlarr_cross-seed_autohardlink/drive-loop/hlink/state.db"

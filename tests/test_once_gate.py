@@ -225,6 +225,46 @@ dl.once_round(["dc-collection", "frds-top250-2024"], args_ns(), "k", dl.MIN_SLEE
 ck("  真跑了批次 → 这里**不**重复调（那条路由 after_batch_reports 负责）",
    len(farm_calls), 0)
 
+print("\n== ⑩ ★ 轮转存的是**下标不是名字** —— 顺序即调度 ==")
+# 背景（#40，2026-09-13）：`mbf` 被排进 `PACKS_DEFAULT` 的**中间**（index 1），
+# 为的是让**已经落盘**的 `last_pack_idx=0`（含义仍是"dc-collection 刚跑完"）
+# 保持不变、而**下一批**就轮到 mbf（一批就拿到读数，排在最末要等两三批）。
+# 整套推理押在「once_round 按下标轮转」这个行为上 ——
+# 而它此前**一个断言都没有**（本节所有用例都传 `last_pack_idx: -1`）。
+# ★ 所以这里既钉轮转本身，也钉**它的代价**：改这个常量的顺序 = 偷偷改"下一批跑谁"。
+PACKS3 = dl.PACKS_DEFAULT.split(",")
+ck("★ 生产名单 = dc / mbf / frds 三个，#40 的决定（改它就要连这里一起改）",
+   PACKS3, ["dc-collection", "mbf", "frds-top250-2024"])
+
+_seen = []
+
+
+def _capture(pack, args, api_key):
+    _seen.append(pack)
+    return S.DriveStats(ok=1)
+
+
+dl.run_round = _capture
+for _start, _want in ((0, "mbf"), (1, "frds-top250-2024"), (2, "dc-collection")):
+    _seen.clear()
+    write_state({"last_end_ts": time.time() - 3 * 3600, "last_sleep_sec": 0.0,
+                 "last_pack_idx": _start, "consec_abort": 0, "running_pid": None})
+    dl.once_round(PACKS3, args_ns(), "k", dl.MIN_SLEEP)
+    ck(f"  last_pack_idx={_start} → 下一批跑 {_want}", _seen[0], _want)
+    ck(f"    ↳ 落盘 last_pack_idx={(_start + 1) % 3}",
+       read_state()["last_pack_idx"], (_start + 1) % 3)
+
+# ★ 代价：同一个 `last_pack_idx=0`，只把 mbf 挪到末尾 → 下一批从 mbf 变成 frds。
+#   这不是"测个边角" —— 它是「为什么 mbf 必须放中间」的**证据**：
+#   如果哪天有人为了"整齐"把 mbf 挪到最后，读数会**晚两三批**才拿到，
+#   而日志上看不出任何异常。
+_seen.clear()
+write_state({"last_end_ts": time.time() - 3 * 3600, "last_sleep_sec": 0.0,
+             "last_pack_idx": 0, "consec_abort": 0, "running_pid": None})
+dl.once_round(["dc-collection", "frds-top250-2024", "mbf"], args_ns(), "k", dl.MIN_SLEEP)
+ck("★ 同一个 last_pack_idx=0，mbf 挪到末尾 → 下一批变成 frds（顺序即调度）",
+   _seen[0], "frds-top250-2024")
+
 print()
 if fails:
     print(f"!!! {len(fails)} 个失败")
