@@ -141,6 +141,14 @@ LOCAL_ONLY = [
     (r"^ENVIRONMENT\.md$",                        "文档·环境前提与坑手册（检索层，不是事实源）"),
     (r"^patches/",                                "在 NAS 上**手工**应用的操作说明"),
     (r"^tests/",                                  "离线自测（在 Windows 上跑，不进容器）"),
+    # ★ 2026-09-13：文档整理审计工具（标题树 / 引用对账 / 关键词倒排 / 只读探针）。
+    #   判据与下面 qb-census / linkguard 那两条**同一形状**：
+    #   **只读 + 不回显凭据 + 只打聚合**（不是「它碰没碰凭据」）。
+    #   04_probes.py 读 cross-seed.db 的 indexer 表，但**不选 url 列** ——
+    #   那条每行都带 apikey=<Prowlarr 应用级 key>，而判「哪个站、什么状态」
+    #   靠 id/name/status 就够；出口再统一过一遍 redact() 兜底（**两条都要**）。
+    #   另外三个只看三份 md，不碰网络。产物目录 out/ 已进 .gitignore。
+    (r"^tools/doc-audit/",                        "文档审计工具（在 Windows 上跑；只读 md + UNC 只读 + HTTP 只读；不选 indexer.url 列，出口统一 redact()）"),
     (r"^deploy\.sh$",                             "同步工具本身（在 Windows 上跑）"),
     (r"^scripts/check-deploy-drift\.py$",         "本哨兵（在 Windows 上跑）"),
     (r"^scripts/scan-secrets\.py$",               "推前凭据扫描（在 Windows 上跑；读本地 .env，但绝不打印命中到的值）"),
