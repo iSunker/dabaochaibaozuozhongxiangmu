@@ -2710,6 +2710,157 @@ def qb_999_band(torrents: list[dict], now: float) -> dict:
     return {"n": len(hits), "hashes": hits, "total": len(torrents or [])}
 
 
+# --------------------------------------------------------------------------- #
+# 链接守护：628 条既有硬链接的「锚」—— 文件指纹基线 + 差分
+# --------------------------------------------------------------------------- #
+# 立这个判据的现场（2026-09-13）：cross-seed 在 matchMode=partial 下把
+# 「名称+大小匹配、但 piece 不一致」的单种注入 qB；qB 校验不通过**不报错**，
+# 而是就地重下那几个 piece —— 而 linkDirs 是硬链接，这一写**直接落到源文件**
+# 上（两处实证时间分秒吻合，见 README「源文件被写穿」）。
+#
+# 修法分两步，缺一不可：
+#   ① 从此以后：matchMode 与 linkType 互锁（cross-seed/config.js），
+#      只有 reflink(COW) 才允许 partial ⇒ **新**建的都是 COW 副本，写不穿。
+#   ② 已经存在的那 628 条仍是硬链接，**故意不重建**（重建本身要动 60TB 的
+#      链接，风险大于收益）—— 但必须能发现「它正在被写穿」。
+#
+# 这一节就是 ② 的判据：给那 628 条 payload 的文件建一份 (size, mtime) 指纹，
+# 之后定期重算、比对。**文件被就地改写 ⇒ mtime 必变**。
+#
+# ★ 为什么不直接监控「是否被 recheck」：qB 不提供逐种的 recheck 计数，
+#   `checkingDL` / `checkingUP` 只是**瞬时**状态，事后查不到。而且 recheck
+#   本身无害 —— 有害的是它**失败后那一次就地重下**。所以判据落在**结果**
+#   （文件到底变了没）上：既可观测，又正是要紧的那件事。瞬时状态另记一格
+#   （见 `linkguard_inflight`），用来抓「此刻正在发生」。
+#
+# ★ 指纹只取 (size, mtime_ns)，**不取 inode、不取内容哈希**：
+#   · 内容哈希要读 60TB，直接出局；
+#   · inode 在 SMB 上不可靠（st_nlink 实测恒为 0），而本判据要能在 NAS 宿主机
+#     与 Windows 两侧得到同一个答案 —— 判据只有一份才谈得上一致；
+#   · size+mtime 两边都可靠，且**写穿必然改 mtime**（内核写文件必更新它）。
+#     漏报的唯一情形是「改了内容又精确还原 mtime」，那不是 qB 会做的事。
+LINKGUARD_TMP_SUFFIXES = (".!qb", ".parts", ".part", ".tmp")   # 下载中间产物：不计入基线
+
+
+def _lg_is_tmp(name: str) -> bool:
+    n = name.lower()
+    return any(n.endswith(s) for s in LINKGUARD_TMP_SUFFIXES)
+
+
+def linkguard_snapshot(roots: list[str]) -> dict[str, list[int]]:
+    """walk 一批根目录，返回 {NAS 绝对路径: [size, mtime_ns]}。
+
+    ★ 存**NAS 侧路径**（`/volume1/...`），不是 SMB 的 `//iSunker-DS423/...`：
+      基线由 NAS 宿主机写（drive-loop），由 Windows 侧读（诊断 CLI），
+      两边唯一都认的坐标系就是 NAS 内路径 —— 也是 qB API 的 `save_path`。
+    ★ 读不到的条目**跳过**（不是记成 0）：记 0 会在下次比对时被当成「变了」，
+      而权限问题会天天误报。跳过则只影响覆盖面，不影响正确性。
+    ★ 不抛：调用方挂在每天一次的日报里（同 `qb_999_band` 的失败语义）。
+    """
+    snap: dict[str, list[int]] = {}
+    for root in roots or []:
+        if not root or not os.path.isdir(root):
+            continue
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames
+                           if d not in ("@eaDir", "#recycle", ".recycle")]
+            for fn in filenames:
+                if _lg_is_tmp(fn):
+                    continue
+                p = os.path.join(dirpath, fn)
+                try:
+                    st = os.stat(p)
+                except OSError:
+                    continue
+                snap[p] = [st.st_size, st.st_mtime_ns]
+    return snap
+
+
+def linkguard_diff(base: dict, cur: dict) -> dict:
+    """比对两份快照 → {"changed": [...], "added": [...], "removed": [...]}（升序）。
+
+    · changed：两边都有，但 size 或 mtime 不同 ⇒ **被改写**（要抓的就是这个）
+    · added  ：只在 cur 里 ⇒ 新文件（qB 重下常留下 `.!qB` 之类；那些已在
+               snapshot 阶段按后缀滤掉，所以这里出现的基本是真新增）
+    · removed：只在 base 里 ⇒ 被删（重建链接时会出现，人工操作也会）
+    """
+    b = base if isinstance(base, dict) else {}
+    c = cur if isinstance(cur, dict) else {}
+    changed, added = [], []
+    for p, v in c.items():
+        old = b.get(p)
+        if old is None:
+            added.append(p)
+        elif list(old) != list(v):
+            changed.append(p)
+    removed = [p for p in b if p not in c]
+    return {"changed": sorted(changed), "added": sorted(added),
+            "removed": sorted(removed)}
+
+
+def linkguard_owner(path: str, torrents: list[dict]) -> str | None:
+    """这个文件属于哪条种子（按 save_path 前缀匹配）→ 返回 hash，认不出返回 None。
+
+    ★ 前缀要带结尾斜杠再比，否则 `/x/reseed_singles/甲` 会把
+      `/x/reseed_singles/甲乙/...` 也吞进去（经典的前缀 bug）。
+    ★ 取**最长**匹配：分类目录可能嵌套（`<save_path>` 之间互相是前缀）。
+    ★ 两边都先把 `\\` 归一成 `/`：生产跑在 NAS（posix，两边本来就是 `/`），
+      但这个判据也会被 Windows 侧的工具调到 —— 归一一次，省掉一整类
+      「在 NAS 上对、在 Windows 上认不出」的诡异现象。
+    """
+    best, best_len = None, -1
+    p = path.replace("\\", "/")
+    for t in torrents or []:
+        sp = (t.get("save_path") or "").replace("\\", "/").rstrip("/")
+        if not sp or not p.startswith(sp + "/"):
+            continue
+        if len(sp) > best_len:
+            best, best_len = t.get("hash"), len(sp)
+    return best
+
+
+#: qB 里「静止」的 state —— 除这些之外都算「在动」。
+#: ★ `uploading` **必须显式列出来**：它不以 `UP` 结尾，只按 `endswith("UP")` 判
+#:   会被当成「正在下载」。这个坑是 2026-09-13 由 tests/test_linkguard.py §④ 抓到的
+#:   —— 当时生产上跑着的那把看门狗（watchdog-xp.py）用的是同一个写错的判据，
+#:   只是这 628 条恰好全是 `stalledUP`、没有一条 `uploading`，才没被误暂停。
+#:   别把这条删了。
+#: ★ `checkingUP` **故意不算静止**：它是对**已做种数据**的校验，很可能正是
+#:   「校验不通过 → 就地重下」的前奏，而那恰恰是要盯的事。
+_LG_IDLE_EXACT = frozenset({"uploading", "error", "unknown"})
+
+
+def _lg_is_motion(state: str | None) -> bool:
+    st = state or ""
+    if st.startswith(("paused", "stopped")):
+        return False                        # 终态
+    if st in _LG_IDLE_EXACT:
+        return False
+    if st.endswith("UP") and not st.startswith("checking"):
+        return False                        # stalledUP / queuedUP / forcedUP …
+    return True
+
+
+def linkguard_inflight(torrents: list[dict]) -> dict:
+    """此刻有多少条 cross-seed 种子**不在**静止态（=可能正在校验/重下）。
+
+    ★ 这不是写穿的证据，只是**正在发生**的信号 —— 写穿的证据是
+      `linkguard_diff` 的 changed。两者一起看才完整：前者抓当下，后者抓结果。
+    ★ 判据故意**按否定写**（列出静止态、其余皆算动）：漏报的坏法（正在写穿却
+      看不见）比误报重，同 `qb_999_band` 里 `last_activity or 0` 那条理由。
+      所以 `state` 缺失 / 为 None 一律算「在动」。
+    """
+    hits: list[str] = []
+    for t in torrents or []:
+        if not _lg_is_motion(t.get("state")):
+            continue
+        h = t.get("hash")
+        if h:
+            hits.append(h)
+    hits.sort()
+    return {"n": len(hits), "hashes": hits, "total": len(torrents or [])}
+
+
 def parse_alias(items: list[str] | None) -> dict[str, str]:
     """`--indexer-alias 'http://prowlarr:9696/1/api=SiteB'` → {url: name}"""
     out: dict[str, str] = {}

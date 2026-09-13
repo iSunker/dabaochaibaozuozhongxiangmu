@@ -18,6 +18,72 @@
 const csv = (s) => (s || "").split(",").map((x) => x.trim()).filter(Boolean);
 const bool = (s) => String(s).toLowerCase() === "true";
 
+// =====================================================================
+// ★★★ 匹配宽松度 ⇄ 链接类型：一个**结构性互锁**，不是两段各自独立的配置 ★★★
+// ---------------------------------------------------------------------
+// 背景（2026-09-13 查实的事故，见 README「源文件被写穿」）：
+//   linkType=hardlink 时，linkDirs 里的「做种数据」与 dataDirs 里的源**同一个 inode**。
+//   于是 matchMode=partial/flexible 放进来一个「名称+大小匹配、但 piece 不一致」的单种后，
+//   qB 校验不通过**不会拒绝**，而是**就地重下**那几个 piece —— 这一写直接落到源文件上，
+//   无声改写库里的母本，且 Farm 侧仍显示 100%。两处实证时间分秒吻合（哥谭 04421b52 /
+//   教父 db7be3ac）。官方文档对 partial 的说法恰好印证：
+//     "Nearly all partial matches recheck to 99.9% rather than 100%"
+//   —— 上游当预期行为；在硬链接农场里它就是事故。
+//
+// 所以**能不能放宽匹配，不取决于你想不想，取决于链接是不是 COW 的**：
+//   hardlink / symlink → 写穿，只能 strict（本文件强制，忽略 .env）
+//   reflink (COW)      → 重下只改副本、源不受影响，才谈得上 partial/flexible
+// 这么耦合是**故意的**：把「放宽匹配」的前提写进代码里，以后谁想调 partial，
+// 必须先能让 linkType 真的是 reflink，而不是在 .env 里改个值就绕过。
+// =====================================================================
+
+function resolveLinkType() {
+  const raw = String(process.env.LINK_TYPE || "").trim().toLowerCase();
+  const t = raw || "hardlink";
+  // ★ reflinkOrCopy 在 reflink 失败时**静默整份拷贝**（上游文档自己也标了 Danger）。
+  //   本卷 2026-09-13 实测已用满 100%（仅剩 ~19 GiB）—— 一次静默拷贝就能把注入卡死，
+  //   而「静默」意味着你只会看到跨站做种莫名其妙停了。降级为 reflink：不支持就报错。
+  if (t === "reflinkorcopy" || t === "reflink_or_copy") {
+    console.warn(
+      "[config] 拒绝 LINK_TYPE=" + t + "：reflink 失败时它会**静默整份拷贝**，" +
+        "而本卷已近满，一份都放不下。改用 reflink（不支持就直接报错，绝不拷贝）。"
+    );
+    return "reflink";
+  }
+  if (t === "hardlink" || t === "symlink" || t === "reflink") return t;
+  console.warn("[config] 未知 LINK_TYPE=" + raw + "，回退 hardlink（并因此强制 strict）");
+  return "hardlink";
+}
+
+function resolveMatchMode(linkType) {
+  const m = String(process.env.MATCH_MODE || "").trim().toLowerCase() || "partial";
+  if (linkType === "hardlink" || linkType === "symlink") {
+    if (m !== "strict") {
+      console.warn(
+        "[config] 忽略 MATCH_MODE=" + m + "：linkType=" + linkType +
+          " 时 qB 校验失败会就地重下并**写穿源文件**，已强制 strict。" +
+          "要放宽请先把 LINK_TYPE 改成 reflink（需 BTRFS/XFS 支持 COW）。"
+      );
+    }
+    return "strict";
+  }
+  if (m !== "strict" && m !== "flexible" && m !== "partial") {
+    console.warn("[config] 未知 MATCH_MODE=" + m + "，回退 partial");
+    return "partial";
+  }
+  return m;
+}
+
+const LINK_TYPE = resolveLinkType();
+const MATCH_MODE = resolveMatchMode(LINK_TYPE);
+if (LINK_TYPE === "reflink" && MATCH_MODE !== "strict") {
+  console.warn(
+    "[config] matchMode=" + MATCH_MODE + " + linkType=reflink：不完整匹配会被注入，" +
+      "qB 校验不符的 piece 会重下进 **COW 副本**（源文件安全）。" +
+      "但分离出来的块占真实空间，本卷已近满 —— 跑起来后留意剩余容量。"
+  );
+}
+
 module.exports = {
   // --- 站点来源：Prowlarr 的 Torznab feeds（含各站 apikey）---
   torznab: csv(process.env.TORZNAB_URLS),
@@ -26,41 +92,17 @@ module.exports = {
   // dataDirs：其"子目录"被当作 searchee。指向大包根目录 → 每部电影=一个 searchee。
   dataDirs: csv(process.env.DATA_DIRS),
 
-  // 命中后在这里按"单种发布名/结构"建链接（做种数据），零磁盘开销。
+  // 命中后在这里按"单种发布名/结构"建链接（做种数据）。
   // v6：linkDirs 为数组；若你的镜像是 v5，改成  linkDir: csv(...)[0]
   linkDirs: csv(process.env.LINK_DIR),
-  linkType: process.env.LINK_TYPE || "hardlink", // hardlink | symlink | reflink
+  // ★ 取值 hardlink | symlink | reflink（由上面 resolveLinkType 决定，见那段注释）。
+  //   要与 hlink/config.yml 的 matcher.link_type 保持同一个值 —— 那是**另一条**
+  //   建链接的路径（orchestrator/hardlink.py::prestage），两边不一致就会一半硬链接。
+  linkType: LINK_TYPE,
 
-  // ★★★ 2026-09-13：硬链接农场下这里**只能 strict**，不跟随 .env ★★★
-  // 机理（已实证，见 README「源文件被写穿」）：
-  //   matchMode=partial/flexible 会让 cross-seed 把「名称+大小匹配、但 piece 不一致」
-  //   的单种也注入。qB 校验(recheck)发现 piece 对不上 → **就地重下那几个 piece**；
-  //   而 linkDirs 是硬链接（与 reseed_farm、download/movies|TV 同一个 inode），
-  //   于是这次重下**写穿到源文件**，无声改写库里的母本，且 Farm 侧仍显示 100%。
-  //   官方文档对 partial 的描述恰好印证这一点：
-  //     "Nearly all partial matches recheck to 99.9% rather than 100%"
-  //   —— 上游把它当作预期行为；在硬链接农场里它就是事故。
-  //   实证（2026-09-13）：
-  //     · 哥谭.全5季 ih=04421b52 决策 MATCH_PARTIAL，完成 09-13 16:35，
-  //       对应源文件 mtime 15:57/16:05/16:35 —— 分秒吻合；
-  //     · 教父1972  ih=db7be3ac 决策 MATCH_PARTIAL，完成 09-12 09:49，
-  //       对应源文件 mtime 09-12 09:49 —— 分秒吻合；
-  //     · 同一份《致命魔术》被 5 条 MATCH 注入（完成 09-12 19:22）源毫发无伤，
-  //       第 6 条 MATCH_PARTIAL 卡在 99.9996% 正在重下。
-  // 故**硬编码 strict**：只注入完全匹配，源永不被重下。.env 的 MATCH_MODE 保留
-  // 仅为兼容，非 strict 一律忽略并告警（绝不静默放行）。
-  // 要恢复宽松匹配，前提是让做种数据与源脱离同一 inode（reflink / 独立副本），
-  // 而不是把这里改回去。
-  matchMode: (() => {
-    const m = String(process.env.MATCH_MODE || "").trim().toLowerCase();
-    if (m && m !== "strict") {
-      console.warn(
-        "[config] 忽略 MATCH_MODE=" + m + "：硬链接农场下非 strict 注入会写穿源文件，" +
-          "已强制 strict。要放宽请先让做种数据与源脱离同一 inode（reflink/独立副本）。"
-      );
-    }
-    return "strict";
-  })(),
+  // ★ 由 resolveMatchMode 决定：linkType 是 hardlink/symlink 时**强制 strict**，
+  //   只有 reflink 才允许 .env 的 MATCH_MODE 生效。理由见文件顶部那段注释。
+  matchMode: MATCH_MODE,
 
   // --- 命中后的动作：注入 qBittorrent ---
   action: "inject",

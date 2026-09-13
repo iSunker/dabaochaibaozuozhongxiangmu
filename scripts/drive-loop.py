@@ -920,6 +920,158 @@ def qb_999_watch(args) -> tuple[str, dict]:
 
 
 # --------------------------------------------------------------------------- #
+# 链接守护：既有 628 条硬链接有没有被**写穿**
+# --------------------------------------------------------------------------- #
+# 判据本体在 `orchestrator/state.py`（`linkguard_snapshot` / `linkguard_diff` /
+# `linkguard_owner` / `linkguard_inflight`），理由同上面几条：**本进程跑在 NAS
+# 宿主机上**，判据只有一份才谈得上两侧一致。
+#
+# 立这一节的现场（2026-09-13，见 README「源文件被写穿」）：cross-seed 在
+# `matchMode=partial` 下把「名称+大小匹配、但 piece 不一致」的单种也注入 qB；
+# qB 校验不通过**不报错**，而是**就地重下**那几个 piece —— 而 linkDirs 是硬
+# 链接（与源同一个 inode），这一写**直接落到源文件上**，Farm 侧还显示 100%。
+#
+# 修法分两步，**这一节只负责第二步**：
+#   ① 关上闸门：`matchMode` ⇄ `linkType` 互锁（cross-seed/config.js），只有
+#      reflink(COW) 才允许 partial ⇒ **将来新建**的链接写不穿。
+#   ② 给**已经存在**的那 628 条上锚：它们是硬链接，且**故意不重建**（重建要
+#      重摆几十 TB 的链接，风险大于收益）—— 但得能发现「它正在被写穿」。
+#      判据就是这一节：文件 (size, mtime) 指纹基线 + 定期差分。
+#
+# ★ 基线**单独一个文件**（`.linkguard.state`），不塞进 `.reconcile.state`：
+#   它是几千~几万条 (路径 → [size, mtime])，而 `.reconcile.state` 被好几个
+#   watch **整文件读改写** —— 塞进去等于让每一个 watch 都搬一次这个体积。
+#   本文件**只有本函数读写**，所以不需要 `qb_999_watch` 里那套
+#   「读→改→写必须紧挨着、别夹在别人中间」的约束。
+#
+# ★ 只报**数量**，不报路径 / 不报种子名（同 `qb_999_watch` 的口径）：
+#   日报是要发出去的。要知道具体是哪些，跑 `scripts/crossseed-linkguard.py`
+#   —— 那是人主动跑，且默认也只出 hash。
+LINKGUARD_FILE = HERE / ".linkguard.state"
+LINKGUARD_TAG = "cross-seed"
+LINKGUARD_SNAP_KEY = "_linkguard_snapshot"
+LINKGUARD_DETAIL_KEY = "_linkguard_detail"
+
+
+def _linkguard_read() -> dict:
+    try:
+        d = json.loads(LINKGUARD_FILE.read_text(encoding="utf-8"))
+        return d if isinstance(d, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except Exception as e:                  # noqa: BLE001
+        # ★ 坏掉的基线**不能当空**处理 —— 那会把每个文件都算成「新增」，然后
+        #   当成一次事件报出去。假警报比漏报更消耗信任。返回 {} 会让下面走
+        #   `first=True` 分支：静默重新起锚（代价是这一轮失去检测能力，可接受）。
+        LOG.warning("链接守护基线读不出（本轮按「无基线」重新起锚）: %s", e)
+        return {}
+
+
+def _linkguard_write(d: dict) -> None:
+    # ★ 直接写、**不做「写临时文件再改名」**：临时名（`.linkguard.state.tmp`）
+    #   不匹配 check-deploy-drift 的 `^drive-loop/scripts/\.[^/]+\.state$`，
+    #   扫到就会被报成「未知文件」。而写坏的后果已经被 `_linkguard_read` 兜住
+    #   （解析失败 ⇒ 静默起锚，不误报），所以原子性的收益不值这个噪音。
+    LINKGUARD_FILE.write_text(json.dumps(d, ensure_ascii=False), encoding="utf-8")
+
+
+def linkguard_watch(args) -> tuple[str, dict]:
+    """看那 628 条既有硬链接有没有被就地改写 → (给日报正文的一段, 给 metrics 的字典)。
+
+    ★ **绝不抛**：挂在每天一次的日报里，而日报挂在每 15 分钟一批的生产循环里
+      （同 `iyuu_watch` / `qb_999_watch`）。
+    ★ 读不到时 metrics 给 `n/a` —— **必须给**，否则 TSV 里「这次没读到」和
+      「那天根本没跑」长得一模一样（同 `iyuu_watch`）。
+    """
+    na = {"lg_changed": "n/a", "lg_added": "n/a", "lg_removed": "n/a",
+          "lg_files": "n/a", "lg_inflight": "n/a", "lg_seeded": "n/a"}
+    url = getattr(args, "qbit_url", None)
+    if not url:
+        return "链接守护：跳过（没有 --qbit-url）", dict(na, lg_changed="no-url")
+    try:
+        # 服务端按 tag 过滤，再在本地用「子串」复核一次 —— 判据与当初那把
+        # 看门狗（watchdog-xp.py）保持一致，别在这里引入第二套口径。
+        torrents = [t for t in S.qbit_tagged(url, LINKGUARD_TAG)
+                    if LINKGUARD_TAG in [x.strip() for x in (t.get("tags") or "").split(",")]]
+    except Exception as e:                  # noqa: BLE001 —— 附属观测，绝不拖垮日报
+        LOG.debug("链接守护：取 qB 失败", exc_info=True)
+        return (f"链接守护：读不到 qB（{type(e).__name__}: {e}）", dict(na))
+
+    roots = sorted({(t.get("save_path") or "").rstrip("/") for t in torrents} - {""})
+    if not roots:
+        return ("链接守护：这些种子都没有 save_path，跳过", dict(na, lg_changed="no-path"))
+    try:
+        cur = S.linkguard_snapshot(roots)
+    except Exception as e:                  # noqa: BLE001
+        LOG.debug("链接守护：扫盘失败", exc_info=True)
+        return (f"链接守护：扫盘失败（{type(e).__name__}: {e}）", dict(na))
+
+    # ★ 一个文件都没扫到 ⇒ **绝不写基线**。写了就等于把「扫了个空」记成现状，
+    #   下一轮拿它比对会把所有文件报成「新增」（整条链路最容易踩的假警报）。
+    #   宁可这一轮 metric 记 n/a、基线保持不动。
+    if not cur:
+        return (f"链接守护：扫到 0 个文件（save_path 根 {len(roots)} 个）—— 基线保持不变",
+                {"lg_changed": "n/a", "lg_added": "n/a", "lg_removed": "n/a",
+                 "lg_files": 0, "lg_inflight": "n/a", "lg_seeded": "n/a"})
+
+    state = _linkguard_read()
+    first = LINKGUARD_SNAP_KEY not in state     # ★ 与「基线记过一个空集」是两回事
+    base = state.get(LINKGUARD_SNAP_KEY) or {}
+    d = S.linkguard_diff(base, cur)
+    inflight = S.linkguard_inflight(torrents)
+
+    # 受影响的文件按「属于哪条种子」归组（给 --rebuild-plan 用；不进正文）
+    detail: dict[str, dict] = {}
+    for p in d["changed"] + d["added"]:
+        h = S.linkguard_owner(p, torrents) or "?"
+        e = detail.setdefault(h, {"n": 0, "sample": []})
+        e["n"] += 1
+        if len(e["sample"]) < 5:
+            e["sample"].append(p)
+
+    state[LINKGUARD_SNAP_KEY] = cur
+    state[LINKGUARD_DETAIL_KEY] = {
+        "at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "changed": detail,
+        "removed_n": len(d["removed"]),
+        "removed_sample": d["removed"][:5],
+        "inflight": inflight["hashes"],
+        "files": len(cur),
+    }
+    try:
+        _linkguard_write(state)
+    except OSError as e:
+        LOG.warning("链接守护基线写不进去: %s", e)
+
+    n_ch, n_ad, n_rm = len(d["changed"]), len(d["added"]), len(d["removed"])
+    if first:
+        # ★ 首读**不响**（#47 立的规矩）：现存的差异是「已接受的现状」，不是今天
+        #   新冒出来的。响一次就得配冷却，而那正是要避免的噪音。
+        verdict = f"首次读数，记基线（{len(cur)} 个文件）"
+    elif n_ch or n_ad or n_rm:
+        verdict = "★ 有变化 —— 见下面一行"
+    elif inflight["n"]:
+        verdict = "与基线一致（但有种子正在动）"
+    else:
+        verdict = "与基线一致"
+
+    note = (f"链接守护（既有硬链接的锚；{len(torrents)} 条种子 / {len(cur)} 个文件）\n"
+            f"  被改写 {n_ch} · 新增 {n_ad} · 消失 {n_rm} · 正在动 {inflight['n']}"
+            f" —— {verdict}")
+    if not first and n_ch:
+        # 写穿是**必须有人动手**的那一类（要按需重建），所以单独点一句，
+        # 但仍然只说数量与去哪里看 —— 名字不进日报。
+        note += ("\n  ⚠ 被改写 = 内容被就地覆写（写穿的直接证据）。"
+                 "定位与重建清单：看 //iSunker-DS423/.../drive-loop/scripts/.linkguard.state 的"
+                 " _linkguard_detail，或跑 scripts/crossseed-linkguard.py --rebuild-plan")
+    return note, {"lg_changed": 0 if first else n_ch,
+                  "lg_added": 0 if first else n_ad,
+                  "lg_removed": 0 if first else n_rm,
+                  "lg_files": len(cur), "lg_inflight": inflight["n"],
+                  "lg_seeded": 1 if first else 0}
+
+
+# --------------------------------------------------------------------------- #
 # 观测对账：a − b / b − c / 全场无人认领
 # --------------------------------------------------------------------------- #
 # ★ 判据本体**不在这个文件里**，在 `orchestrator/state.py`
@@ -1466,11 +1618,18 @@ def report_daily(args, *, force: bool = False, farm_note: str = "") -> bool:
     qb_note, qb_metrics = qb_999_watch(args)
     parts.append(qb_note)
 
+    # 链接守护：既有那 628 条硬链接有没有被就地改写（=写穿）。
+    # ★ 用**自己的状态文件** `.linkguard.state`，与 `reconcile_watch` 那条
+    #   「读→改→写」的约束无关（那个约束只对 `.reconcile.state` 成立）。
+    lg_note, lg_metrics = linkguard_watch(args)
+    parts.append(lg_note)
+
     body = "\n\n".join(parts)
     # ★ 数字要进 `metrics` 才落得进 TSV 流水（notify 只记 ts/kind/title/metrics，
     #   **不记正文**）—— 详见 iyuu_watch 的说明。
     if emit("batch", "每日台账", body=body, key="daily",
-            metrics={"day": today, **iyuu_metrics, **rec_metrics, **qb_metrics}):
+            metrics={"day": today, **iyuu_metrics, **rec_metrics, **qb_metrics,
+                     **lg_metrics}):
         _daily_set(today)
         LOG.info("已投递每日台账（额度 + 趋势）")
         return True
@@ -2021,6 +2180,13 @@ def main() -> int:
     ap.add_argument("--packs", default=PACKS_DEFAULT,
                     help=f"包顺序，逗号分隔（轮流推进），默认 {PACKS_DEFAULT}")
     ap.add_argument("--once", action="store_true", help="只跑一轮（配合计划任务）")
+    # ★ 为什么需要它：有几个观测（链接守护、对账基线、卡 999）**只挂在日报里**
+    #   —— 它们要有个「锚」才能谈"变化"，而自然日报一天只投一次。想**当场起锚**
+    #   （比如刚刚改了 cross-seed 的匹配策略，要立刻开始盯）就得能手动催一次。
+    #   语义是 `report_daily(force=True)`：**绕开「今天已投过」这道闸**，所以
+    #   真的会再发一封日报邮件 —— 是故意的，人主动跑的命令，不该静默什么都不做。
+    ap.add_argument("--daily-now", dest="daily_now", action="store_true",
+                    help="立刻投一次日报并退出（给「挂在日报里」的观测当场起锚）")
     ap.add_argument("--max-rounds", type=int, default=0, help="最多跑几轮（0=不限）")
     ap.add_argument("--min-sleep", type=float, default=0, help="批间最小等待秒数（覆盖默认）")
     # --- 透传 drive 参数 ---
@@ -2120,6 +2286,12 @@ def main() -> int:
     # 那两个自检本身就会发告警（这恰恰是最需要有人看到的两个）。
     init_notifier(args)
     LOG.info("通知: %s", describe_notifier())
+
+    # ★ 已建好通知器 ⇒ 现在才谈得上投递。见 --daily-now 的定义处。
+    if getattr(args, "daily_now", False):
+        sent = report_daily(args, force=True)
+        LOG.info("--daily-now：日报%s", "已投递" if sent else "未投递（被闸门挡下）")
+        return 0 if sent else 4
     if _NOTIFIER is not None and _NOTIFIER.enabled and not _NOTIFIER.dry_run:
         if not _NOTIFIER.spool.parent.is_dir():
             LOG.warning("  ⚠ 通知目录的上级不存在：%s", _NOTIFIER.spool.parent)

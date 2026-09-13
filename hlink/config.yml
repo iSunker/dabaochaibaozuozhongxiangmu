@@ -35,10 +35,16 @@ matcher:
   crossseed_url: http://cross-seed:2468
   crossseed_api_key: "${CROSSSEED_API_KEY}"
 
-  # cross-seed 匹配宽松度；允许值随 cross-seed 版本变化，以官方文档为准
+  # cross-seed 匹配宽松度。★ 这个键**不是决定项** —— 真正的闸门在
+  # cross-seed/config.js：它把 matchMode 与 linkType 绑在一起（hardlink/symlink
+  # 下强制 strict）。这里同步一份只是为了配置里能看到全貌。
   match_mode: "${MATCH_MODE}"
   # 内容匹配(名称+大小)→ 建议 false：注入后做一次校验(recheck)确认数据一致再做种
+  # ★ 但别把 recheck 当安全网：不通过时 qB 只会**就地重下**，硬链接下即写穿源文件
   skip_recheck: ${SKIP_RECHECK}
+  # ★ 2026-09-13 起这是**活键**：orchestrator/hardlink.py::prestage() 会读它。
+  #   reflink 需要 BTRFS/XFS 的 COW（/volume1 已确认是 BTRFS）。
+  #   必须与 .env 的 LINK_TYPE、cross-seed/config.js 的 linkType 同一个值。
   link_type: "${LINK_TYPE}"          # hardlink | symlink | reflink
   # cross-seed 建链接(做种数据)的目录，★必须与各大包源目录在同一物理卷★
   # 需与 .env 的 LINK_DIR、cross-seed/config.js 的 linkDirs 保持一致

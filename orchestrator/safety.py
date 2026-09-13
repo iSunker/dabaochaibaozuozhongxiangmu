@@ -97,7 +97,7 @@ def preflight_job(name: str, source_dir: str, link_dir: str,
     try:
         same_vol = same_volume(source_dir if exists else nearest_existing(source_dir), link_dir)
         if exists and not same_vol:
-            problems.append(f"源目录与 linkDir 不在同一物理卷，无法硬链接：{source_dir}  <->  {link_dir}")
+            problems.append(f"源目录与 linkDir 不在同一物理卷，无法建链接：{source_dir}  <->  {link_dir}")
     except OSError as e:
         problems.append(f"同卷校验失败: {e}")
 

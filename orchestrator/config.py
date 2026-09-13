@@ -53,10 +53,19 @@ class MatcherConfig:
     engine: str = "cross-seed"
     crossseed_url: str = "http://cross-seed:2468"
     crossseed_api_key: str = ""
-    # cross-seed 匹配宽松度；允许值随 cross-seed 版本变化，部署时按官方文档核对
+    # cross-seed 匹配宽松度。★ 2026-09-13：这个键**不是决定项** —— 真正的闸门在
+    #   cross-seed/config.js，那里把 matchMode 与 linkType 绑在一起（硬链接下强制
+    #   strict）。这里读它只是为了「配置里能看到全貌」，改它不会改变 cross-seed 行为。
     match_mode: str = "partial"
     # 内容匹配（名称+大小）→ 建议 false，即注入后做一次校验(recheck)确认数据一致
     skip_recheck: bool = False
+    # ★ 2026-09-13 起这是**活键**：orchestrator/hardlink.py::prestage() 会读它
+    #   （此前只被定义和校验，无人引用）。
+    #   hardlink：同 inode ⇒ qB 就地重下会写穿源文件（事故根源，除非 matchMode=strict）
+    #   symlink ：同样会写穿源；只在明确接受风险时用
+    #   reflink ：COW，写入按块分离 ⇒ 源文件不受影响。BTRFS/XFS 可用。
+    #   必须与 cross-seed/config.js 的 linkType 保持同一个值，否则两条建链接的路径
+    #   行为不一致（一半硬链接、一半 reflink）。
     link_type: str = "hardlink"  # hardlink | symlink | reflink
     # cross-seed 建链接（做种数据）的位置，必须与各大包源目录在同一物理卷
     # ★ 2026-09-12 目录搬迁：旧根 /volume1/video/download/reseed_singles 已废弃，

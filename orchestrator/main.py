@@ -236,9 +236,17 @@ def cmd_state(pack: str | None, db: str, indexers: str | None, include_cooldown:
 def cmd_prestage(cfg: AppConfig, job_name: str | None, dry_run: bool) -> int:
     jobs = [cfg.job(job_name)] if job_name else cfg.enabled_jobs()
     rc = 0
+    link_type = cfg.matcher.link_type
+    # ★ 别让 reflink 的失败在几百个文件里静默累计：prestage 内部每个文件各自
+    #   try/except，最后只汇总 failed 计数。同卷校验已在 prestage 里做；
+    #   这里先把「这台机器/这个卷根本建不了这种链接」的硬错挡住。
+    if link_type == "reflink" and os.name != "posix":
+        print(f"[错误] link_type=reflink 需要 Linux(FICLONE ioctl)，当前平台是 {os.name}")
+        return 3
     for job in jobs:
         try:
-            hardlink.prestage(job.source_dir, cfg.matcher.link_dir, dry_run=dry_run)
+            hardlink.prestage(job.source_dir, cfg.matcher.link_dir,
+                              link_type=link_type, dry_run=dry_run)
         except OSError as e:
             rc = 3
             print(f"[错误] 任务 {job.name} 预拆失败: {e}")

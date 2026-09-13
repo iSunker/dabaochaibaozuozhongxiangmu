@@ -636,7 +636,7 @@ python scripts/reseed-state.py init --roots-from-env .env --match "DouBan_IMDB"
 | `UNMATCHED` 的「软性节流」会**突然释放** | 靠 `SKIPPED`/`PENDING` 还多撑着 | 无 —— **不可观测** |
 | 站上「后来才有人发种」的机会被漏掉 | 14 天周期是当前兜底 | 无 |
 | 「按片预测会不会命中」这条路 | **没采用，也不该采用** —— 判据只有模型自己一个来源 | 见 SUMMARY §19.2.5 |
-| **源文件被 qB 就地重下写穿**（partial 注入 × 硬链接） | 2026-09-13 起改 `strict`；**存量 551 条**已注入的仍在 | 只挡住"新增"，存量无解 —— 见下节 |
+| **源文件被 qB 就地重下写穿**（partial 注入 × 硬链接） | 2026-09-13 起 `matchMode` ⇄ `linkType` **互锁**（只有 reflink 才许 partial）+ **链接守护**每日差分 | 存量 628 条仍是硬链接（**故意不重建**）—— 靠守护发现、按需重建，见下节 |
 
 ### 源文件被写穿 —— partial 匹配 × 硬链接农场（2026-09-13 发现）
 
@@ -666,26 +666,68 @@ Farm 侧还显示 100%。
 规模：已注入的 629 条里 **551 条（88%）来自非完整匹配**（`MATCH_PARTIAL` 472 +
 `MATCH_SIZE_ONLY` 79 —— 后者只按大小匹配）。
 
-**处置**：`cross-seed/config.js` 里**硬编码** `matchMode: "strict"`，不再跟随 `.env` 的
-`MATCH_MODE`（非 strict 会忽略并打告警）。改代码层而不是 `.env`，有两个理由：
-`.env` 不在 `deploy.sh` 白名单里（改不动），且代码层强制更不容易被以后误改回去。
+**处置**：分两步走，**第一步关闸门，第二步给存量上锚**。
+
+#### 第 1 步 · 关闸门：把 `matchMode` 和 `linkType` 做成**结构性互锁**
+
+`cross-seed/config.js` 里 `resolveMatchMode()` 不再单独看 `MATCH_MODE`，而是先看链接类型：
+
+| `linkType` | `matchMode` | 为什么 |
+|---|---|---|
+| `hardlink` / `symlink` | **强制 `strict`**（`.env` 的值被忽略并告警） | 同 inode / 同文件 ⇒ 重下 = 写穿源文件 |
+| `reflink`（COW） | `.env` 的 `MATCH_MODE` 生效，可以 `partial` | 重下只改副本，源不受影响 |
+
+这么耦合是**故意的**：把"放宽匹配"的前提写进代码，以后谁想调 partial，**必须先让
+链接真的是 COW 的**，而不是在 `.env` 里改个值就绕过。`reflinkOrCopy` 会被**降级成
+`reflink`** —— 它在 reflink 失败时**静默整份拷贝**（上游文档自己标了 Danger），
+而本卷已近满，一次静默拷贝就能把注入卡死，且"静默"意味着你只看到跨站做种莫名停了。
+
+`orchestrator/hardlink.py::prestage()` 是**另一条**建链接的路径，也一并接上了
+`matcher.link_type`（此前 `config.py` 里那个键只被定义和校验、**全仓库无人引用**，
+是个死键 —— 不接上它，config.yml 里写 reflink 也只是好看）。
+
+#### 第 2 步 · 给存量上锚：链接守护（the 628 条仍是硬链接）
+
+reflink 只保护**新建**的链接。改动前已建的 **628 条仍是硬链接**，且**故意不重建**
+（重摆几十 TB 链接的风险大于收益）—— 但必须能发现"它正在被写穿"。
+
+判据：给这 628 条 payload 的文件建一份 `(size, mtime_ns)` 指纹基线，**定期差分**。
+
+- **判据本体**在 `orchestrator/state.py`（`linkguard_snapshot` / `linkguard_diff` /
+  `linkguard_owner` / `linkguard_inflight`）—— 本进程跑在 NAS 宿主机上，
+  判据只有一份才谈得上两侧一致。
+- **基线**落在 `<compose>/drive-loop/scripts/.linkguard.state`（**单独一个文件**：
+  几千~几万条快照不该让每个 watch 都搬一次 —— `.reconcile.state` 是几个 watch
+  整文件读改写的）。
+- **接线**在 `drive-loop.linkguard_watch()`，挂在**每日台账**里，只报数量：
+  `被改写 N · 新增 N · 消失 N · 正在动 N`。**首读不响**（现状不是新闻，#47 的规矩）。
+- **诊断端** `scripts/crossseed-linkguard.py`（Windows 上跑，**只读**）：告诉你
+  具体是**哪几条**（默认只出 hash 12 位，`--show-names` 才出发布名）。
+
+★ **为什么不直接监控"是否被 recheck"**：qB 不提供逐种的 recheck 计数，
+`checkingDL`/`checkingUP` 只是**瞬时**状态，事后查不到；而且 recheck 本身无害 ——
+有害的是它**失败后那一次就地重下**。所以判据落在**结果**（文件到底变了没）上。
+瞬时状态另记一格（`linkguard_inflight`），用来抓"此刻正在发生"。
+
+★ **`uploading` 那个坑**：`uploading` **不以 `UP` 结尾**，只按 `endswith("UP")`
+判会被当成"正在下载"⇒ 误暂停健康做种。这个判据写错了**不会报错**，只会把
+628 条好种子一条条 pause 掉 —— 而"暂停"看起来完全正常。是 `tests/test_linkguard.py`
+当场抓到的（生产上那把临时看门狗用的是同一个写错判据，只是那批种子恰好全是
+`stalledUP` 才没误伤）。
 
 **残留风险 / 边界**：
-- 只有 `strict` 安全；`flexible` 与 `partial` 在硬链接农场下**都不安全**。
-- 根上的解法是让做种数据与源**脱离同一 inode**（reflink 或独立副本）—— 那时才谈得上放宽匹配。
-  **★ 2026-09-13 确认：`/volume1` 就是 BTRFS**（`/dev/mapper/cachedev_1 /volume1 btrfs …`），
-  所以 **reflink（COW）是可用的** —— 而且这块卷已用满 100%（仅剩 ~19 GiB），
-  COW「不写不占空间」的特性在这里尤其划算。
-  注意 reflink 只保护**新建**的链接：改之前已建的 628 条仍是硬链接。
-  **写入面已实测（2026-09-13）**：qB 全部 931 条的 `save_path` **都**在
+- `/volume1` 确认是 **BTRFS**（`/dev/mapper/cachedev_1 /volume1 btrfs …`）⇒
+  **reflink（COW）可用**。★ 这块卷**已用满 100%**（仅剩 ~19 GiB）—— COW
+  "不写不占空间"在这里尤其划算，但重下分离出来的块**要占真实空间**，留意容量。
+- 这块卷上 **reflink 是真的在发生**：删掉旧根那 9 个文件时，`%h == 1`（不像硬链接）
+  却**一分空间都没回来** —— 因为 COW 共享 extent。⇒ **判 inode 数判不出 COW**，
+  要看 `btrfs filesystem du -s` 的 Exclusive 列。
+- **写入面已实测（2026-09-13）**：qB 全部 931 条的 `save_path` **都**在
   `reseed_singles/<站点>/`（HDFans 488 / 南洋 258 / BTSCHOOL 143 / HDtime 42），
-  **没有一条**落在 `reseed_farm` —— 所以面很窄，只有这一处要改。
-  但**造这些链接的不止 cross-seed**：`orchestrator/hardlink.py::prestage()` 也在
-  往这个目录硬链接，而它写死 `os.link`、**根本不读** `matcher.link_type`
-  （那个键在 `config.py` 里只被定义和校验，全仓库没有第二处引用）——
-  改 reflink 时两边都得改，否则一半链接仍是硬链接。
+  **没有一条**落在 `reseed_farm` —— 面很窄，只有这一处要改。
 - 已被改写的文件**无备份可恢复**：`net view` 没有任何备份共享，4 处 `#snapshot` 均不存在，
-  `download/可删` 与 `download/temp` 为空。
+  `download/可删` 与 `download/temp` 为空。诊断出"被改写"之后，恢复要**回站点重新下**
+  —— 那条数据**和源是同一份**，删种子只会少一份证据（见任务 #74）。
 - inode 基线存档在 **`D:\tmp\reseed-inode-baseline\`**（**仓库外** —— 里面有完整文件名）。
   日后谁再被改写，拿这份比即可。
 

@@ -153,6 +153,12 @@ LOCAL_ONLY = [
     #   ⇒ 判据是「**只读 + 不回显凭据 + 不打印可识别内容**」这三条同时成立，
     #     不是「它碰没碰凭据」—— 后者会把所有有用的诊断工具都挡在门外。
     (r"^scripts/qb-census-savepath\.py$",         "qB 落点普查（在 Windows 上跑；读本地 .env 的账号口令登录，只打聚合计数与路径前 N 段）"),
+    # ★ 2026-09-13：链接守护的诊断端。与上面 qb-census 那条是**同一形状**
+    #   （只读 + 不回显凭据 + 只打聚合），判据也一样。它比那条更严一点：
+    #   默**只出 hash 前 12 位**，发布名要 `--show-names` 才出（名字里有站点与
+    #   发布名，不该随随便便进日志）。它读的是 NAS 上 drive-loop 写的
+    #   `.linkguard.state`，**只读不写**。
+    (r"^scripts/crossseed-linkguard\.py$",        "链接守护诊断（在 Windows 上跑；读 NAS 的 .linkguard.state + 只读问一次 qB，默认只出 hash）"),
     # ★ 2026-09-13：#58「drive-loop 迁容器」的草案，**故意不进白名单**。
     #   它与 scripts/drive-loop-nas.sh 是同一层的东西（NAS 侧入口），差别只在
     #   后者**已经**在生产跑、前者还没有。白名单的语义是「两边必须一致」——
