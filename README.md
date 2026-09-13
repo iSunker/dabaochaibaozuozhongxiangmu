@@ -31,7 +31,8 @@
 | **搞清「包」是怎么被认出来的 / 搜索压力从哪来** | **原理技术和风险须知**（包是**声明**的不是识别的 · 压力来自**分母** · 风险清单）→ SUMMARY §19 |
 | 从零部署一台 | **部署步骤**（Phase 0→3，每步可独立验证）+ **验证清单** |
 | 跑起来 / 继续跑 | **当前状态与下一步** ← 最常用，先看这个 |
-| 我卡住了（报错 / 搜不到 / 不动了） | **常见问题** + **交接必读的坑** |
+| **新会话开局 / 不了解这台机器** | **`ENVIRONMENT.md`** ← 环境前提 + 按症状 grep 的 `ERR-*` 条目（含全部 20 项技术弯路）|
+| 我卡住了（报错 / 搜不到 / 不动了） | **常见问题** + **交接必读的坑** → `ENVIRONMENT.md` 的 `ERR-*`（按症状检索）|
 | **想从电脑上手动跑点什么** | **⛔ 电脑端已不参与** ← 电脑只剩诊断用途：`deploy.sh`（推代码）、`check-deploy-drift.py`（查漂移）、`scan-secrets.py`（推前扫凭据）、`audit-found-*.py`（对账 `Found` 行） |
 | **想知道 NAS 上有没有我不知道的文件** | **漂移哨兵** ← `python scripts/check-deploy-drift.py` |
 | **想推代码，但怕把密钥一起推上去** | **推前凭据扫描** ← `python scripts/scan-secrets.py`（绿了再 `git push`） |
@@ -42,10 +43,14 @@
 | 状态机说没做种、qB 里明明在做种 | **常见问题** → **SUMMARY §17.5.1**（已修） |
 | 接手这个项目 | **当前状态与下一步** → **SUMMARY §13**（全过程 + 坑单）→ **§13.11**（最新进度与唯一待办） |
 
-> **两份文档怎么分工**（照日志分级来）：
+> **三份文档怎么分工**（照日志分级来）：
 > **README = INFO 层**（操作手册：命令、步骤、症状→解法）；
-> **SUMMARY = DEBUG 层**（完整过程、踩坑、决策理由）。
+> **SUMMARY = DEBUG 层**（完整过程、踩坑、决策理由）；
+> **`ENVIRONMENT.md` = 检索层**（环境前提 + 每条坑一个 `ERR-*` 可检索 ID，**不承担事实源**）。
 > 同一事实**只在一处维护**，跨层用「详见 SUMMARY §N」单向指路 —— 防止两边漂移。
+> ★ `ENVIRONMENT.md` 是**索引**，不是第三个事实源：与 README / SUMMARY 冲突时，以那两份为准。
+> ★ 原 `走过的弯路.md`（20 项技术弯路）已于 2026-09-13 **全部并入 `ENVIRONMENT.md` 并删除**，
+> 文件名不再存在；要按历史编号找，用 `grep -n '弯路 #' ENVIRONMENT.md`。
 
 ---
 
@@ -72,6 +77,7 @@ prowlarr_cross-seed_autohardlink/   # NAS 部署目录（compose 就放这里，
 ├─ orchestrator/          # 编排器(Python, 仅依赖 PyYAML) 源码 + Dockerfile：预检/驱动/汇报
 │  └─ state.py            # ★单片状态机（sidecar 库，只读 cross-seed/qB，见「扩展」）
 ├─ patches/reseed-qbit.conf.md   # Phase 0：:3060 需改的配置项（参考文档）
+├─ ENVIRONMENT.md         # ★环境前提与坑手册（检索层：A 部分前提 + B 部分 `ERR-*` 条目）
 └─ README.md
 ```
 
