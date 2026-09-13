@@ -7372,6 +7372,23 @@ dc-collection,frds-top250-2024      →   dc-collection,mbf,frds-top250-2024
 `Querying HDtime … q: '…'` 的**原样 `q`**。那才是 cross-seed 真正发出去的问题；
 口径不一样（`tvsearch` + 季号 vs 裸片名），答案没法比。
 
+★ **走 Torznab，别去站点网页搜**（2026-09-13 补）。要判的是「**cross-seed 看到的
+候选里有没有季包**」，所以复现的必须是 cross-seed 那条路：
+
+| 搜法 | 发出去的 query | 回答的是哪个问题 |
+|---|---|---|
+| 抄 verbose 的 `q` 打 Torznab | 与 cross-seed **逐字节相同** | HDtime 对**这个** query 返回了什么 |
+| 站点网页 / HTML 搜索 | 大概率是裸片名、无季号 | 「站上有没有这个片」—— **另一个问题** |
+
+- 端点：`TORZNAB_URLS`（`.env`）里 path 段是 **`/1/api`** 的那条 —— `1` = HDtime，
+  证据就是 verbose 那行 `Querying HDtime at http://prowlarr:9696/1/api`（同理
+  `2` = HDFans、`3` = BTSCHOOL、`4` = NanyangPT）。**这是项目既有做法**
+  （`config.js` 读的就是 `TORZNAB_URLS`），别另造一个。
+- ★ 那个 URL 里**带 apikey** —— **不许回显**。要核对先脱敏：
+  `sed -E 's/(apikey=)[^,&]+/\1<redacted>/g'`。
+- 「去搜一下看看」这种动作最容易在**口径**上跑偏：它看着只是「手动复现一次」，
+  但**你复现的是不是同一个 query**，决定了读出来的是不是同一个答案。
+
 > **第 3 点用什么读法**：直读 UNC + `PRAGMA query_only=1`（§18.18.3）—— 这是项目
 > 既有做法，`state.py:_open_csdb` 就是这么写的，实测 0.00s，读前读后 `ls` 旁边都
 > **没有** `-wal` 冒出来。**别拷副本**：`state.db` 自己是 `journal_mode=delete`，
