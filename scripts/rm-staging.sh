@@ -35,17 +35,37 @@
 #        /volume2/docker_ssd/prowlarr_cross-seed_autohardlink/_cleanup-20260912 --apply
 #   ★ 这条**不要**勾「发送运行详情」的意义不大（一次性、手动），但勾了也无害。
 #
+#   —— 旧根残留（一次性，见闸 ③）：
+#     sh /volume2/docker_ssd/prowlarr_cross-seed_autohardlink/rm-staging.sh \
+#        /volume1/video/download/reseed_singles --apply
+#   ★ 注意这里是 **`/volume1/...`**（真实数据路径），不是 `/volume2/...`
+#     —— compose 在 volume2，数据在 volume1，两者本来就不在同一个卷上。
+#   ★ 跑完请把闸 ③ 里那条 case 撤掉再 deploy 一次：它是残余清理，不是常态。
+#
 # 安全闸（五条，缺一不可）
 # -----------------------
 #   ① 必须是**绝对路径** —— 相对路径会被解读成「相对于任务计划的工作目录」，
 #      而那个目录不是你能预先知道的。
 #   ② 必须**存在、是目录、不是软链接**。软链接要单独拒：`rm -rf` 一个指向
 #      `/volume1/video` 的链接会顺着删过去。
-#   ③ ★ **只认两类 basename**（这是本脚本存在的核心理由）：
+#   ③ ★ **只认三类路径**（这是本脚本存在的核心理由）：
 #        · `_cleanup-*`               —— 哨兵的暂存区
 #        · `#recycle/` 下的 `env-bak-*` —— 早先误删进回收站的明文 .env 副本
+#        · `/volume1/video/download/reseed_singles` —— **旧根残留（一次性）**
 #      其余一律拒绝。**生产上不许存在一个「给什么删什么」的脚本**，
 #      哪怕它只由 root 手动跑 —— 手滑一次就是不可逆的。
+#      ★ 第三类和前两类**判据不同**：它是**完整路径字面量**，不是 basename。
+#        若按 basename 放行 `reseed_singles`，任何同名目录都跟着放行了；
+#        写全路径 = 只放行这一处。**删完就该把这条撤掉**（它是残余清理，
+#        不是常态；留着等于在生产上永久留一个能删视频目录的口子）。
+#      ★ 放行它的依据 —— 2026-09-13 **全部实测，没有一条是推理**：
+#        · 9 个文件 / 48.20 GiB；其中 8 个是**独立副本**（按 SMB 传回的
+#          server inode/fid 判，可释放 44.60 GiB；剩下 1 个是硬链接，删了不释放）
+#        · qB `:3060` 927 条 → 旧根 **0** 条；qB `:3020`(opencd) 1234 条 → 旧根 **0** 条
+#          （opencd 的 API 回 403、免密不通，改读它自己的 `BT_backup`；
+#           判据仍是 save_path 前缀，与读 API 时同一个判据）
+#        · NAS `.env` 的 `LINK_DIR` 已指向**新根** ⇒ 没有任何配置再引用旧根
+#        · 旧根不在任何 qB 的 save_path 下 ⇒ 删掉的不会是「正在做种的活文件」
 #   ④ `--apply` 才动手；不加就是纯列清单。
 #   ⑤ 先单独删凭据副本并复核归零，**再**删目录。
 #      顺序是有意的：哪怕中途断电/报错，凭据也已经先走了。
@@ -136,22 +156,31 @@ if [ ! -d "$P" ]; then
   exit 1
 fi
 
-# ---- 闸 ③ 只认两类 basename ----
+# ---- 闸 ③ 只认三类路径 ----
+# ★ 第一类按 **basename** 放行（`_cleanup-*` 带日期后缀，写不成字面量）；
+#   第三类按 **完整路径字面量** 放行 —— 见头部闸 ③ 那段：
+#   拿 basename 当通行证会把「任何叫这名字的目录」一起放行。
 base=$(basename "$P")
 parent=$(basename "$(dirname "$P")")
 allowed=0
-case "$base" in
-  _cleanup-*) allowed=1 ;;
+case "$P" in
+  /volume1/video/download/reseed_singles) allowed=1 ;;   # 旧根残留（一次性，见头部闸 ③）
 esac
+if [ "$allowed" -eq 0 ]; then
+  case "$base" in
+    _cleanup-*) allowed=1 ;;
+  esac
+fi
 if [ "$allowed" -eq 0 ] && [ "$parent" = "#recycle" ]; then
   case "$base" in
     env-bak-*) allowed=1 ;;
   esac
 fi
 if [ "$allowed" -eq 0 ]; then
-  echo "[!!] 拒绝：本脚本只删两类路径，其余一律不碰 ——" >&2
+  echo "[!!] 拒绝：本脚本只删三类路径，其余一律不碰 ——" >&2
   echo "       ① basename 形如 _cleanup-YYYYMMDD" >&2
   echo "       ② #recycle/ 下的 env-bak-*" >&2
+  echo "       ③ /volume1/video/download/reseed_singles（旧根残留，一次性）" >&2
   echo "     你给的是：$P" >&2
   echo "     （basename=$base  parent=$parent）" >&2
   exit 1
