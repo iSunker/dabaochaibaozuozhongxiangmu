@@ -7334,27 +7334,43 @@ dc-collection,frds-top250-2024      →   dc-collection,mbf,frds-top250-2024
 三个观测点，**全只读**：
 
 1. `drive-loop.log` 该批的 `跑包 mbf（第 2/3 个）` 行 —— 先确认**真的轮到它**了。
-2. cross-seed `info.current.log` 在**那一批的时间窗内**：「`on HDtime by`」的行有几条。
-   ★ **顺序别写反**：站名在 `on` 后面，`by` 后面跟的是**决策类型**
-   （`MATCH` / `MATCH_PARTIAL` / `MATCH_SIZE_ONLY`）。本文件里那条解析正则
+2. cross-seed **`verbose.current.log`** 在**那一批的时间窗内**：
+   `Querying HDtime at … with { t: … q: '…' }` 有几条 ——
+   ① 证明 HDtime **真的被问了**；② **抄下原样的 `q`**，第 3 行兜底要手动搜时用它。
+   ★ **顺序别写反**：匹配事件那行是 `Found <searchee> [hash…] on HDtime by MATCH` ——
+   站名在 `on` 后面，`by` 后面跟的是**决策类型**。本文件里那条解析正则
    （`\[(?:webhook|inject)\] Found (.+?) \[([0-9a-f]{8})\.\.\.\] on (\S+) by (\w+) …`）
-   的捕获组顺序就是证据。写成 `grep "by HDtime"` 会得到 **0 条** —— 而 0 条在
-   下表里**正好**是「HDtime 对这个包没货」，**看着像结论，其实是 grep 写错了**。
-   （本节初稿就写成了 `Found … by HDtime`，2026-09-13 改。）
+   的捕获组顺序就是证据。写成 `grep "by HDtime"` 会得到 **0 条**，**看着像结论，
+   其实是 grep 写错了**。（本节初稿就写成了 `Found … by HDtime`，2026-09-13 改。）
+   ★ 别指望这条能在「有货但只有单集」时给出非 0 —— 理由见下表下面的 ★★。
 3. `state.db` 的 `movie` 表 `pack='mbf'` 那 4 行的 `stage` / `searched_indexers` /
    `indexer_seen`（后两列是 **JSON 文本**）—— **HDtime 出现在里面 = 搜过了**。
 
-三处合起来才能分开下面这四种情形 —— **单看 `matched_indexers` 是不够的**：
+三处合起来才能分开下面三种情形 —— **单看 `matched_indexers` 是不够的**：
 
-| `searched_indexers` 有 HDtime | `matched_indexers` 有 HDtime | `on HDtime by` 条数 | 结论 |
-|---|---|---|---|
-| ❌ | — | — | 前提没成立（站压根没搜）⇒ 先查 `--indexers` / 容器，**不是**退出条件 |
-| ✅ | ❌ | 0 | HDtime 对这个包就是没货 ⇒ **执行处置**（移出 `--packs`） |
-| ✅ | ❌ | > 0 | ★ HDtime **有货**，是「季包跳过单集」（§12.3.1）⇒ **不移出**，另开待办 |
-| ✅ | ✅ | — | 保留 `mbf`，什么都不用改 |
+| `searched_indexers` 有 HDtime | `matched_indexers` 有 HDtime | 结论 |
+|---|---|---|
+| ❌ | — | 前提没成立（站压根没搜）⇒ 先查 `--indexers` / 容器，**不是**退出条件 |
+| ✅ | ✅ | 保留 `mbf`，什么都不用改 |
+| ✅ | ❌ | ★ **两种可能，日志分不开** ⇒ 必须**手动搜一次 HDtime** 才能定（见下） |
 
-★ 第 2、3 行**长得一模一样**（`matched_indexers` 都是空集）而处置**相反** ——
-所以「日志里搜到几条」不是锦上添花，是**必需**的那一格。
+★★ **第 3 行是本节最容易被读错的一格（2026-09-13 补，初稿把它错拆成了两行）。**
+初稿写的是「`on HDtime by` 条数 > 0 ⇒ HDtime 有货、是季包跳过单集」，**这条推不出来**：
+
+- `Found N torrents for { path: … }` 这个块里**只有 `path` 一个字段，没有站名**
+  （09-13 全天 75/75 块都是这个形状）—— 也就是说 info 级**根本没有 per-indexer 的结果数**。
+- verbose 级有 per-indexer 的**请求**行（`[webhook] Querying HDtime at
+  http://prowlarr:9696/1/api with { t: 'tvsearch', q: '…' }`），但**没有**对应的结果数。
+- `cross-seed/config.js:58` 是 `includeSingleEpisodes: false` ⇒ 单集候选被**静默过滤**，
+  全库 grep 不到任何「某候选因单集被跳过 + 站名」的行。
+
+⇒ 「HDtime **完全没货**」和「HDtime **有货但只有单集**」在三处读数里**一模一样**
+（`searched` 有、`matched` 空、`found` 0），而处置**相反**（前者移出 `--packs`，
+后者不移出、另开待办）。**日志给不出这一格，只能手动搜。**
+
+★ 手动搜的时候**别用自己拼的季包名** —— 用 verbose 里那行
+`Querying HDtime … q: '…'` 的**原样 `q`**。那才是 cross-seed 真正发出去的问题；
+口径不一样（`tvsearch` + 季号 vs 裸片名），答案没法比。
 
 > **第 3 点用什么读法**：直读 UNC + `PRAGMA query_only=1`（§18.18.3）—— 这是项目
 > 既有做法，`state.py:_open_csdb` 就是这么写的，实测 0.00s，读前读后 `ls` 旁边都
