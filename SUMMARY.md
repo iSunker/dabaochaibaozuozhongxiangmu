@@ -5566,7 +5566,7 @@ schtasks /Query /TN "reseed-drive-loop"   →  系统找不到指定的文件
 
 - `drive-loop/run.sh` 是 **DSM 任务在宿主机上直接执行**的（不是容器里的东西），下次唤醒自动生效；
 - `orchestrator/config.py` 是 `build:` 进镜像的，要 `docker compose build reseed-orchestrator`
-  才生效 —— 但它本来就是**死代码**（§18.11.6），不必为它单独重建。
+  才生效 —— 但它本来就是**死代码**，不必为它单独重建。
   （`deploy.sh` 的那段提示对**它自己**不知道的两个文件类型一视同仁，所以在这里是**噪音**。）
 
 **关掉「换站」**：用户提问——「BTSCHOOL 现在不是能登录、能匹配到种子吗？」
