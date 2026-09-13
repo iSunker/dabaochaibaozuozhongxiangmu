@@ -113,6 +113,19 @@ FILES=(
   #     「⚠ 本地缺失，跳过」并继续 —— 不会因为少了它而中断。
   "scripts/fix-statedb-farm-root.py::fix-statedb-farm-root.py"
   "scripts/nas-update-env.sh::nas-update-env.sh"
+  # ★ 2026-09-13 补：删「暂存区」目录 —— 哨兵 `--cleanup` 攒出来的
+  #   `_cleanup-YYYYMMDD/`，以及早先误删进回收站的 `#recycle/env-bak-*`。
+  #   为什么落成文件、不往 DSM 任务框里粘：
+  #     ① 这类目录**会反复出现**（每清一次杂物就攒一个），粘一次只能用一次；
+  #     ② 它必须**绕开 File Station** —— File Station 的删除只是挪进 `#recycle`，
+  #        文件仍在盘上；而暂存区里最要紧的恰恰是 `.env.bak.*`（生产 .env 的
+  #        明文副本）。2026-09-13 实测 `docker_ssd/#recycle/env-bak-20260912/`
+  #        里就躺着 8 个，全是之前几次「File Station 删除」留下的。
+  #   放在 compose **根目录**（不是 scripts/），理由同 build-farm.sh —— 和它要
+  #   清理的目标在同一层，命令行里路径短、不容易打错。
+  #   ★ 它**不进任何计划任务**：只在 DSM 任务计划里手动运行一次，
+  #     手动跑 → 用户选 root → 脚本框一句 `sh <路径>/rm-staging.sh <目标> --apply`。
+  "scripts/rm-staging.sh::rm-staging.sh"
 )
 
 MODE="${1:---dry-run}"
