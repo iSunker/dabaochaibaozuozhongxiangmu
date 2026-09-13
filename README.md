@@ -1537,7 +1537,11 @@ schtasks /Delete /TN "reseed-drive-loop" /F
      ★★ **2026-09-13 起用脚本删，别再手敲**：`sh <compose>/rm-staging.sh <目标> --apply`
      （仓库 `scripts/rm-staging.sh`，已在 `deploy.sh` 白名单里，**不进任何计划任务**，
      手动跑一次即可）。它默认只列清单、`--apply` 才删；**先删凭据副本（口径 `.env*`）再删目录**；
-     并且**只认两类 basename**：`_cleanup-*`、`#recycle/` 下的 `env-bak-*`，其余一律拒。
+     并且**只认三类路径**：`_cleanup-*` 与 `#recycle/` 下的 `env-bak-*`（按 **basename**）、
+     以及 `/volume1/video/download/reseed_singles`（按 **完整路径字面量** —— 旧根残留，一次性），
+     其余一律拒。
+     ★ 第三类**故意不用 basename**：按 basename 放行 `reseed_singles`，任何同名目录都会
+     跟着放行；写成完整路径 = **只放行这一处**。对照实测：同名、不同完整路径 → **被拒**。
      ★★ **别走 DSM File Station** —— 它的删除只是把文件挪进 `#recycle`，**文件仍在盘上**。
      2026-09-13 实测 `docker_ssd/#recycle/env-bak-20260912/` 里已经躺着 **8 个 `.env.bak*`**
      （其中 4 个是 7.0–7.3 KB，**与生产 `.env` 的 7750 B 同档**），全是之前几次
@@ -1560,9 +1564,11 @@ schtasks /Delete /TN "reseed-drive-loop" /F
      ⚠ **别对 UNC 路径跑 `rm`** —— 只在本机看不到的 NAS 原生路径上删。
 
    * ⬜ **`#recycle` 里的「旧项目残骸」不受脚本受理，只能一次性手动删。**
-     `rm-staging.sh` 的闸 ③ 只放行 `_cleanup-*` 与 `#recycle/env-bak-*`，
-     其余条目**一概被拒** —— **这是有意为之，别放宽**：一放宽它就变成
+     `rm-staging.sh` 的闸 ③ 对 `#recycle` 只放行 `env-bak-*`，其余条目**一概被拒**
+     —— **这是有意为之，别放宽**：一放宽它就变成
      「能清空整个回收站」的东西，而回收站里还有 `iyuuplus` 等你可能想留的条目。
+     （2026-09-13 新增的那条例外是**旧根残留**，判据是**完整路径字面量**、与回收站无关，
+      所以并没有松动这里的口径。）
      处置：在 NAS 上先 `du -sh` + `ls -a` 看过，再 `rm -rf /volume2/docker_ssd/#recycle/<条目名>`。
      ★ **判它是残骸还是活项目，靠穷尽统计后缀** —— 2026-09-13 就这样定性了
      `musopia_script2/`：718 个文件里 `.db-shm` 346 / `.db-wal` 346 / `.pyc` 6 /

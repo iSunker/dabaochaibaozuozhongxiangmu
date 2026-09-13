@@ -122,6 +122,7 @@ LOCAL_ONLY = [
     (r"^scripts/scan-secrets\.py$",               "推前凭据扫描（在 Windows 上跑；读本地 .env，但绝不打印命中到的值）"),
     (r"^scripts/audit-found-lines\.py$",          "对账 a−b（在 Windows 上跑；只读 NAS 的 info.current.log，不碰库）"),
     (r"^scripts/audit-found-resolve\.py$",        "对账 b−c（在 Windows 上跑；UNC 直读 state.db，query_only 硬闸，绝不写）"),
+    (r"^scripts/torznab-probe\.py$",              "手搜探针（在 Windows 上跑；读 NAS .env 的 TORZNAB_URLS 但**绝不回显**，只发一次 Torznab 查询）"),
     (r"^prowlarr/\.gitkeep$",                     "占位符；生产的 prowlarr/ 是**不许碰**的"),
     (r"^scripts/(add-indexers|add-torznab-indexer|check-indexer-timestamps"
      r"|gen-datadirs|gen-nas-env-update|migrate-reseed-dirs|run-batch|wait-for-checks)"

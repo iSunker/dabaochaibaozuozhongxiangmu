@@ -7439,6 +7439,34 @@ dc-collection,frds-top250-2024      →   dc-collection,mbf,frds-top250-2024
 而且是**静默采纳**（不告警）—— 同 §20.2 的规矩：
 **现状不是新闻，只有"又冒出来的"才是。**
 
+### 20.9.5.1 ★ 手动搜怎么跑：**Windows 侧就能跑**（2026-09-13 修正一处误判）
+
+**此前判成「探针从 Windows 跑不了」—— 那是错的。** 错因是把两件事焊成了一件：
+
+* 「`TORZNAB_URLS` 里写的是**容器名** `prowlarr`」—— **真**（那是给 cross-seed 容器用的）
+* 「所以这条路只能从 NAS 宿主机入口走」—— **假**
+
+**9696 已发布到宿主机**，且 apikey 是 Prowlarr **应用层**的（`/N/api` 不校验来源 IP）
+⇒ 把 host 换成 **NAS 宿主机 IP** 即可。**这不是「换一条路」，是同一条 Torznab 路的宿主机入口。**
+
+★ 佐证就在我们**自己的文档**里，当时没往这里连 —— `.env.example` 白纸黑字写着
+「★ 必须是 **NAS 的宿主机 IP**，不是容器名」，README 也写着
+「三个 Web 端口都已发布到宿主机（9696 / 2468 / 3060）」。
+★ 「本地 `.env` 是**存根**」仍然成立，但它只说明**数据源取错了地方**（探针原先读仓库里的
+`.env`），**不是阻塞** —— 修的是取值来源，不是思路。
+
+⇒ 落成 **`scripts/torznab-probe.py`**（读 NAS `.env`、换 host、只打状态码/条数/标题；
+`--id`：`1=HDtime 2=HDFans 3=BTSCHOOL 4=NanyangPT`）。**别再往 `D:\tmp` 里放一次性副本。**
+
+**2026-09-13 首跑读数**：路由**通了**（拿到了 HTTP 响应，不再有「连不上」这一档），
+但 **HTTP 429** —— 因为 **HDtime 正处在站点退避**，`drive-loop.log` 12:40:45 那行写着
+「索引器 HDtime 要等到 **2026-09-14 11:32:28**（1374 分钟 > 上限 30 分钟）」。
+Prowlarr 本地就把它拒了，**换任何入口都是 429**。
+⇒ 本节的第 3 点**今天读不到**，**最早 2026-09-14 11:32 之后**。
+
+★ 教训：**「某条路只能在某台机器上走」这类判断，先查端口发布表与 `.env.example`。**
+这次两者都白纸黑字写着，而结论反了 —— 一个假阻塞会让整条路白白停摆。
+
 ### 20.9.6 钉回测试（`test_once_gate.py` ⑩，24 → 32 条）
 
 改的是**值**，没有新逻辑可测 —— 但它押在一个**此前一条断言都没有**的行为上：
@@ -7635,11 +7663,24 @@ python scripts/migrate-reseed-dirs.py --all-tags --apply    # 全量 20 条
 —— 这正是 v3 方案的设计，**不额外占空间**。所以删旧根**不会**让新根的单片失效。
 
 **删法**：只能在 NAS 上做；**别对 UNC 跑 `rm`**（SMB 上删是不走回收站的真删，且路径解析在 Windows 侧）。
-`149.V字仇杀队…` 主 qB（opencd）也不引用它（opencd 的 `/downloads` = `/volume1/video/music`）。
+两个 qB 实例**都实测过、都不引用旧根**（2026-09-13）：
 
-> ⚠ **`rm-staging.sh` 不接这条路径**：它的闸 ③ **只认两类 basename**
-> （`_cleanup-*`、`#recycle/env-bak-*`），`reseed_singles/` 会被**明确拒绝**（这是有意的，
-> 别为它放宽 —— 一放宽那个脚本就变成"给什么删什么"）。这条得在 NAS 上另走一次手工删除。
+| qB | 读数 | 判据 |
+|---|---|---|
+| `:3060` reseed | 927 条 → 旧根 **0** 条 | 读 API `torrents/info` 的 `save_path` 前缀 |
+| `:3020` opencd | 1234 条 → 旧根 **0** 条 | ★ API 回 **403**（白名单不覆盖本机 IP），**改读它自己的 `BT_backup/*.fastresume`**（bencode 里的 `save_path`），判据与读 API 时**同一个** |
+
+★ 第 2 行此前一直是**推理**（「opencd 的 `/downloads` = `/volume1/video/music`，所以不搭界」）
+—— 推理不是读数，2026-09-13 才补成实测。opencd 的 1234 条全是 `/downloads`
+（容器内路径），1212 条直接落 `/downloads`、22 条落 `/downloads/incomplete`。
+
+> ✅ **`rm-staging.sh` 现在接这条路径了（2026-09-13）**：闸 ③ 加了第三类，判据是
+> **完整路径字面量** `/volume1/video/download/reseed_singles` —— **不是 basename**
+> （按 basename 放行 `reseed_singles` 会把任何同名目录一起放行）。
+> 命令：`sh <compose>/rm-staging.sh /volume1/video/download/reseed_singles --apply`
+> ★ 注意是 **`/volume1/...`**（数据卷），不是 compose 所在的 `/volume2/...` —— 两者本来就不在同一个卷上。
+> ★ **删完请把闸 ③ 里那条 case 撤掉再 deploy 一次**：它是残余清理，不是常态，
+>   留着等于在生产上永久留一个「能删视频目录」的口子。
 
 ### 21.6 顺带查出一个潜伏雷：`qbittorrent-reseed` 的 `/downloads` **没挂载**
 
