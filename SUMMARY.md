@@ -828,7 +828,7 @@ NAS 自己的 `df -h` 实测：
   （`build-farm.sh` 的 `stat -c %d` 比设备号那道闸，比的正是这件事。）
 - ★ **`docker_ssd` 在 `cachedev_0` 上**，所以 compose/配置、以及 qB 的 `/downloads/incomplete`
   都落在有余量的那块 —— 但 `qbittorrent-reseed` 的种子数据走 `/volume1/video`，
-  仍在满盘上（见 §21.6 那颗雷）。
+  仍在满盘上（同 §21.6；那颗"`/downloads` 落进可写层"的雷 **09-13 已修**，见 §21.6.1）。
 
 > **首次实测（2026-09-11）**：`/volume1` 56 TB / 剩 ~20 GB（100%）；
 > `/volume2/docker_ssd` 448 GB / 剩 ~329 GB。
@@ -7694,4 +7694,39 @@ python scripts/migrate-reseed-dirs.py --all-tags --apply    # 全量 20 条
 
 ⇒ 现状无害（cross-seed 与 IYUU **都显式传 savepath**），但这是一颗**潜伏的**雷 ——
 它的形态正是本项目反复栽的那一类：**失败的样子是「看起来正常」**。
-要不要补挂 `/downloads`（或把 `DefaultSavePath` 改到已挂载的目录），列入待办。
+
+#### 21.6.1 ✅ 已修（2026-09-13）—— 走 qB API 改 `save_path`，**没有**动 conf、**没有**改 compose
+
+```python
+POST http://192.168.0.7:3060/api/v2/app/setPreferences
+     json={"save_path": "/volume1/video/download/temp"}
+```
+
+| 项 | 值 |
+|---|---|
+| 改前 | `save_path=/downloads` → `Session\DefaultSavePath=/downloads/` |
+| 改后 | `save_path=/volume1/video/download/temp` ✅ 已落盘 |
+| 落点选择的依据 | 只有 `/volume1/video` 是 **1:1 挂载**的媒体卷；而**硬链接不能跨卷**（§9 那条），要让"意外落进来的种子"还有机会与农场共享硬链接，落点就**只能**在这棵树下 |
+
+★ **雷的直接证据不是推理，是 qB 自己报的数**：改前 `free_space_on_disk = 302.14 GiB`
+—— 那是 **volume2（docker_ssd，容器可写层所在卷）**，不是 volume1；改后读数是 **0**
+（= volume1 的真实剩余）。⇒ **这个数本身就是验收判据**：它从 302 GiB 掉到 0，
+说明保存路径**真的**从可写层挪到了媒体卷上。比 `du` 容器可写层省事，也不用开 shell。
+
+**为什么走 API 而不是改 conf**：`qBittorrent.conf` 由 qB **自己拥有** —— 它退出/改设置时会
+**用内存里的值整份重写**（`patches/reseed-qbit.conf.md` 开头那条"必须先停容器"就是为此）。
+从外面改这个文件是**和 qB 抢方向盘**；而 API 是 qB 自己写，天然一致、且可逆（同一个调用改回去）。
+代价：**需要 qB 在跑**（它本来就在跑），**零停机**。
+
+**为什么不是"补挂 `/downloads`"**（备忘录里给的另一条路）：那要改的 compose **不在本仓库里**
+（在 `/volume2/docker_ssd/qbittorrent-reseed/`，哨兵扫不到），改完还得 `--force-recreate`
+—— 在一台**正常跑批**的生产机上做容器重建，收益却只是"让一个兜底路径可用"。
+而且会把容器内 `/downloads` 与宿主某处绑成**非同名**，正好与本项目**刻意维持的
+"宿主路径 == 容器路径"**（`/volume1/video:/volume1/video` 那条）相抵触。
+
+**残留（无害，可选清理）**：conf 里还留着 `Downloads\SavePath=/downloads/`。
+它是个**死键** —— 判据是 qB 刚才**整份重写**了 conf、却**没有**更新它（活键一定会被写）。
+真要清，得**停容器后**手工改；**不清也不影响**，运行时的取值由 `Session\DefaultSavePath` 定。
+
+**副作用（是好事）**：qB 现在按 **volume1 的真实水位**判断空间了。
+以前它以为有 302 GiB 可写，现在是 0 —— 满载时它会**拒绝/限制**添加，而不是**悄悄**写到 SSD 上。

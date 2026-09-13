@@ -76,6 +76,32 @@ Session\AddTorrentPaused=false
 若想手动建：WebUI 左侧「分类」右键新增，或在停容器后编辑
 `/config/qBittorrent/categories.json` 加入 `{"reseed-singles": {"save_path": ""}}`。
 
+### 6) ★ 默认保存路径**必须落在已挂载的媒体卷上**（2026-09-13 修）
+
+```ini
+[BitTorrent]
+Session\DefaultSavePath=/volume1/video/download/temp
+```
+
+- **为什么**：本实例只挂了 `/downloads/incomplete`（→ `/volume2/qb_temp/temp_docker_reseed`）
+  与 `/volume1/video`。默认值却是 **`/downloads/`** —— 那里**什么都没挂** ⇒
+  落进**容器可写层**（宿主机看不见、容器重建即丢、也**不可能**和农场共享硬链接）。
+- **必须落在 `/volume1/video` 下**：硬链接**不能跨卷**（`video` 与 `docker_ssd`
+  是两个物理卷）。让"意外落进来的种子"还有机会共享硬链接，落点就**只能**在这棵树下。
+- **改法（推荐走 API，不用停容器）**：
+  ```bash
+  curl -s "http://<NAS_IP>:3060/api/v2/app/setPreferences" \
+       --data-urlencode 'json={"save_path":"/volume1/video/download/temp"}'
+  ```
+  ★ 走 API 而不是手改 conf 的原因见 SUMMARY §21.6.1：**qB 自己拥有那个文件**，
+  退出时会整份覆盖；API 是 qB 自己写，天然一致且可逆。
+- **验收判据（很干净，不用开 shell）**：`GET /api/v2/sync/maindata` 里的
+  `server_state.free_space_on_disk` —— 它报的是**默认保存路径所在卷**的剩余。
+  改前是 **~302 GiB**（= volume2，可写层），改后应变成 **volume1 的真实剩余**。
+  **数字没变 ⇒ 没生效。**
+- **`Downloads\SavePath=`** 那个同名旧键是**死键**（qB 整份重写 conf 时不会更新它），
+  留着无害。
+
 ---
 
 ## 验证
