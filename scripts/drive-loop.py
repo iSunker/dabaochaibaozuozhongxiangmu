@@ -1021,13 +1021,21 @@ def linkguard_watch(args) -> tuple[str, dict]:
     inflight = S.linkguard_inflight(torrents)
 
     # 受影响的文件按「属于哪条种子」归组（给 --rebuild-plan 用；不进正文）
+    # ★★ 首读时**这份清单必须留空**。那一轮 base 是空的，`linkguard_diff` 会把
+    #   **整库**算进 `added`，而这里把 `changed + added` 合并写进同一个键 ⇒
+    #   `detail.changed` 里躺着 2816 个文件，于是谁去跑 `crossseed-linkguard.py`
+    #   都会看到「★ 被改写 / 新增（共 2816 个文件）」，**而那天什么写穿都没发生**。
+    #   2026-09-13 当场实测（18:00 那次起锚就是这个输出），记在这里当证据。
+    #   正文与 metrics 本来就是对的（`first` ⇒ 三个数全 0），错只错在这份**给诊断端
+    #   读的**清单上 —— 与「扫了个空绝不落盘」是同一族假警报：**逐字看着像真的**。
     detail: dict[str, dict] = {}
-    for p in d["changed"] + d["added"]:
-        h = S.linkguard_owner(p, torrents) or "?"
-        e = detail.setdefault(h, {"n": 0, "sample": []})
-        e["n"] += 1
-        if len(e["sample"]) < 5:
-            e["sample"].append(p)
+    if not first:
+        for p in d["changed"] + d["added"]:
+            h = S.linkguard_owner(p, torrents) or "?"
+            e = detail.setdefault(h, {"n": 0, "sample": []})
+            e["n"] += 1
+            if len(e["sample"]) < 5:
+                e["sample"].append(p)
 
     state[LINKGUARD_SNAP_KEY] = cur
     state[LINKGUARD_DETAIL_KEY] = {

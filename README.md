@@ -703,6 +703,12 @@ reflink 只保护**新建**的链接。改动前已建的 **628 条仍是硬链�
   `被改写 N · 新增 N · 消失 N · 正在动 N`。**首读不响**（现状不是新闻，#47 的规矩）。
 - **诊断端** `scripts/crossseed-linkguard.py`（Windows 上跑，**只读**）：告诉你
   具体是**哪几条**（默认只出 hash 12 位，`--show-names` 才出发布名）。
+- ★★ **`_linkguard_detail.changed` 在首读那一轮必须是空的**。首读 `base={}` ⇒
+  `linkguard_diff` 把**整库**算进 `added`，而 `linkguard_watch` 把 `changed + added`
+  合并写进同一个键 ⇒ 诊断端吐出「★ 被改写 / 新增（4 条种子受影响，共 **2816** 个
+  文件）」—— **而那天什么写穿都没发生**（2026-09-13 18:00 起锚时真的这样，已修、
+  已钉回归）。注意**只看日报是发现不了的**：正文与 metrics 本来就对（`first` ⇒
+  三个数全 0），错的恰恰是"出事后去查证时读的那份清单"。
 
 ★ **为什么不直接监控"是否被 recheck"**：qB 不提供逐种的 recheck 计数，
 `checkingDL`/`checkingUP` 只是**瞬时**状态，事后查不到；而且 recheck 本身无害 ——

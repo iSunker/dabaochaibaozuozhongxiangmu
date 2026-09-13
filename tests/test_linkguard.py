@@ -222,6 +222,11 @@ ck("  lg_seeded=1（这一轮是起锚）", m["lg_seeded"] == 1, repr(m))
 ck("★ 基线落盘了", len(_state_on_disk()[D.LINKGUARD_SNAP_KEY]) == 2,
    repr(sorted(_state_on_disk())))
 ck("  详情里写了 files 数", _state_on_disk()[D.LINKGUARD_DETAIL_KEY]["files"] == 2)
+ck("★★ 首读时 detail.changed 必须是**空的**（否则诊断端把整库报成「被改写」）",
+   _state_on_disk()[D.LINKGUARD_DETAIL_KEY]["changed"] == {},
+   repr(_state_on_disk()[D.LINKGUARD_DETAIL_KEY]["changed"]))
+ck("  同理 removed 也空（首读没有「消失」可言）",
+   _state_on_disk()[D.LINKGUARD_DETAIL_KEY]["removed_n"] == 0)
 
 note, m = _watch()
 ck("同一份数据再读 → 「与基线一致」", "与基线一致" in note, note)
