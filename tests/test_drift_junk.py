@@ -58,6 +58,11 @@ def kind_of(rel: str) -> str:
     return "unknown"
 
 
+def rule_of(rel: str):
+    """命中那条规则本身 —— 用来判严重度标记。"""
+    return M.classify(rel, set(), M.KNOWN_NAS)[1]
+
+
 fails = []
 
 
@@ -94,8 +99,42 @@ check(6, "backup 变体", ".env.backup", "clutter")
 check(7, "无关文件不误伤", "hlink/.reseed_farm.manifest.tsv", "known")
 
 print()
+print("== 严重度：`.env*` 备份是「形似凭据泄漏」，`__pycache__` 不是 ==")
+
+
+def check_alert(n, label, rel, want):
+    got = M.is_alert(rule_of(rel))
+    ok = got is want
+    print("[%d] %-28s %-40s: %s" % (n, label, rel, "PASS" if ok else "FAIL"))
+    if not ok:
+        print("      want is_alert=%s  got=%s" % (want, got))
+        fails.append(n)
+
+
+# 8) 备份必须带 ALERT —— 否则哨兵只把它混进「杂物 N 个」，真信号被噪音吞掉
+check_alert(8, "备份带告警标记", ".env.bak", True)
+check_alert(9, "时间戳备份也带", ".env.bak.20260911-204109", True)
+check_alert(10, "下划线变体也带", ".env_bak", True)
+
+# 11) `__pycache__` **不许**带 —— 它是字节码，不是凭据。带上了就等于天天喊狼来了
+check_alert(11, "字节码不带告警", "drive-loop/scripts/__pycache__/x.cpython-312.pyc", False)
+
+# 12) ★ 反向结构检查：ALERT 只能打在「杂物」上。
+#     打在某条非杂物规则上，那段 if alert_items 永远不会触发 ——
+#     一条"看着像装好了告警、其实从不响"的路，正是本文件 2–3 行那段要防的形状。
+ALERT_NOT_CLUTTER = [(r[0], r[1]) for r in M.KNOWN_NAS
+                     if M.is_alert(r) and not M.CLUTTER.match(r[1])]
+ok = len(ALERT_NOT_CLUTTER) == 0
+print("[%d] %-28s %-40s: %s" % (12, "ALERT 只打在杂物上", "KNOWN_NAS 全表",
+                                "PASS" if ok else "FAIL"))
+if not ok:
+    for rx, why in ALERT_NOT_CLUTTER:
+        print("      ★ ALERT 打在非杂物规则上，永不触发: %s  %s" % (rx, why))
+    fails.append(12)
+
+print()
 if fails:
     print("FAIL：第 %s 项不过（测试自己也可能错，先看 want/got）" % fails)
     sys.exit(1)
-print("ok：7/7 通过")
+print("ok：12/12 通过")
 sys.exit(0)

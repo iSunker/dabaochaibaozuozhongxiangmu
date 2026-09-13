@@ -36,6 +36,12 @@
 ★ `--cleanup` 只**打印**计划，自己不写任何东西：本脚本的契约是只读。
   计划里只有 `mv`、没有 `rm` —— 对 NAS 的 UNC 路径跑 `rm` 是禁止的（见禁止清单）。
 
+★ 杂物里有**一类要单看**：`.env` 的备份/变体。它不是噪音，是**形似凭据泄漏** ——
+  备份里装的是真凭据。所以它既单独列一行计数、又置 `fail=1`，不混进「杂物 N 个」
+  那个数里（那个数本身也不可读：它是"活着的模块数"的代理量，涨了不代表出杂物——
+  `drive-loop` 每 import 一个模块就多一个 `.pyc`）。严重度写在 `KNOWN_NAS` 规则的
+  第三项（`ALERT`），**不另立正则表**。
+
 退出码
 ------
     0 = 干净   1 = 有未登记的（需要人看一眼）   2 = 环境问题（NAS 不可达 / 解析失败）
@@ -64,6 +70,24 @@ for _s in (sys.stdout, sys.stderr):
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 DEPLOY = REPO / "deploy.sh"
+
+# ★ 严重度：杂物里有一类**不是噪音**，是「形似凭据泄漏」—— NAS 上躺着一份 `.env`
+#   的备份/变体。把它和 `__pycache__` 混在同一个计数里是错的：前者该有人立刻看一眼，
+#   后者是字节码。（2026-09-13：起因是「杂物 3 个」这个数**本身不可读** ——
+#   它是"当前活着的模块数"的代理量，下界随 import 而变化，涨了不代表出杂物。）
+#   ★ 严重度用**同一份清单的第三项**表达，绝不另立一份正则表 —— 那会造出第二个
+#     声明点，两份迟早漂开（本仓库反复吃过这个形状的亏，见 deploy.sh 的教训）。
+#     `classify()` 只读 `rule[0]`、调用方只读 `rule[1]`，所以加这一项对既有代码
+#     是**纯增量** —— 没有 alert 的规则仍是 2 元组，照旧工作。
+#   ★ 定义必须**在 KNOWN_NAS 之前**：清单里那条 `.env` 规则在构造时就要用到 ALERT，
+#     放后面会 NameError（本文件刚踩过，测试是当场抓到的 —— 这就是它有回归测试的价值）。
+ALERT = "alert"
+
+
+def is_alert(rule):
+    """这条规则是不是「形似凭据泄漏」。规则是本清单里的 (正则, 说明[, 严重度])。"""
+    return len(rule) > 2 and rule[2] == ALERT
+
 
 # NAS 上**已知合理**的、不在白名单里的东西。每一条都要写清"为什么它该在 NAS 上"。
 # 判据用正则匹配 **POSIX 相对路径**（不含开头的 ./），比 fnmatch 的 `**` 语义更可控。
@@ -98,7 +122,7 @@ KNOWN_NAS = [
     #   这里按 `.env.` / `.env_` 两种前缀全兜，只排掉 `.env.example`
     #   （它是模板、**压根不部署**，见下面 LOCAL_ONLY；排掉只为分类语义干净）。
     #   `.env` 本体不受影响 —— 它在上面那条 `^\.env$` 就命中了，**先匹配先赢**。
-    (r"^\.env[._](?!example$)",                 "杂物·.env 备份/变体"),
+    (r"^\.env[._](?!example$)",                 "杂物·.env 备份/变体", ALERT),
     (r"^build-farm\.sh\.bak\..*",                 "杂物·旧脚本备份"),
     (r"^notify/probe-artifacts-[^/]*/",           "杂物·一次性探测产物"),
     (r"(^|/)__pycache__/",                        "杂物·python 字节码"),
@@ -326,6 +350,7 @@ def main():
         groups = {"managed": [], "unknown": [], "known": []}
         known_why = {}
         clutter_items = []           # [(相对路径, 命中的规则)]，只收"杂物"那几条
+        alert_items = []             # 上面那批里**形似凭据泄漏**的（规则带 ALERT）
         for rel in sorted(nas):
             kind, rule = classify(rel, managed, KNOWN_NAS)
             groups[kind].append(rel)
@@ -334,16 +359,35 @@ def main():
                 known_why.setdefault(why, []).append(rel)
                 if CLUTTER.match(why):
                     clutter_items.append((rel, rule))
+                    if is_alert(rule):
+                        alert_items.append((rel, rule))
 
         clutter = {w: v for w, v in known_why.items() if CLUTTER.match(w)}
         n_clutter = sum(len(v) for v in clutter.values())
+        n_alert = len(alert_items)
         n_known = len(groups["known"])
 
         print(f"       NAS 上共 {len(nas)} 个文件：")
         print(f"         ✓ 受管（在白名单里）        {len(groups['managed']):>6}")
         print(f"         ✓ 已知生产独有              {n_known - n_clutter:>6}")
-        print(f"         ✓ 杂物（已知，但该清）      {n_clutter:>6}")
+        print(f"         ✓ 杂物（已知，但该清）      {n_clutter - n_alert:>6}")
+        print(f"         ★ 形似凭据泄漏              {n_alert:>6}")
         print(f"         ★ 未知                      {len(groups['unknown']):>6}")
+
+        # ★ 单列的理由：这些**不是杂物**，是凭据。和 `__pycache__` 共用一行计数
+        #   就等于让「3 个杂物」这个数把真信号和噪音一起吞掉 —— 而 `.env` 的备份里
+        #   装的是**真凭据**（见上面「已知生产独有」的 `.env` 那条）。
+        #   于是这里既单列、又置 fail=1：它该让人**看一眼**，不该沉默地混在计数里。
+        if alert_items:
+            print(f"\n       ★★ 形似凭据泄漏 {n_alert} 个 —— NAS 上躺着 `.env` 的备份/变体：")
+            for rel in sorted(r for r, _ in alert_items)[:20]:
+                print(f"           {rel}")
+            if n_alert > 20:
+                print(f"           …（还有 {n_alert - 20} 个）")
+            print("         → 里面是真实凭据。处理：在 **NAS 上**删掉，或先 `mv` 进暂存区"
+                  "（`--cleanup` 会给计划）。")
+            print("         ★ 本脚本的契约是只读：**绝不对 NAS 的 UNC 路径跑 rm**。")
+            fail = 1
 
         missing = sorted(managed - nas)
         if missing:
