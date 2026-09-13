@@ -1210,6 +1210,19 @@ def reconcile_watch(args) -> tuple[str, dict]:
                     new = [x for x in cur[dim] if x not in prev_b[dim]]
                     if new:
                         grew.append(f"{label}：新增 {'、'.join(new)}")
+                # ★ 缩了也是好消息 —— 但**要写出来**（2026-09-13 补，与「无人认领」那条对齐）：
+                #   否则「基线少了」在日报里和「什么都没发生」长得一样，
+                #   就分不清「`mbf` 被排进 `--packs` 了（预期）」和「判据今天没读到（故障）」。
+                #   ★ 这一支是**补**出来的：两条基线判据（无人认领 / `--packs`）当时只给
+                #   无人认领写了缩回文案，`--packs` 缩回时会掉进 `else` 打印
+                #   「与基线一致」—— 一句**不真的话**（它明明少了 `mbf`）。
+                #   触发点正是 #40：把 `mbf` 排进 `PACKS_DEFAULT` 就是一次缩回。
+                gone = []
+                for dim, label in (("undriven", "登记了却没被驱动"),
+                                   ("unreg", "在名单里但库里没登记")):
+                    lost = [x for x in prev_b[dim] if x not in cur[dim]]
+                    if lost:
+                        gone.append(f"{label}：少了 {'、'.join(lost)}")
                 if grew:
                     note = "   ★ 与基线相比**有变化** —— 已告警。"
                     emit(
@@ -1233,6 +1246,10 @@ def reconcile_watch(args) -> tuple[str, dict]:
                         key="packs-mismatch",
                         metrics={"packs_undriven": len(undriven),
                                  "packs_unreg": len(unreg)})
+                elif gone:
+                    note = ("   ★ 比基线**少** —— 不告警（修好了不必喊；"
+                            "新基线已采纳，**再长回来会报**）：\n"
+                            + "\n".join("     − " + g for g in gone))
                 else:
                     note = "   ★ 与基线一致 —— 不告警（只报变化，不再每天喊）。"
             lines.append(
