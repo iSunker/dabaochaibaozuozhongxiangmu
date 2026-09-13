@@ -11,9 +11,11 @@
 #      —— SMB 上删是不走回收站的真删，且路径解析在 Windows 侧，容易打偏。
 #   ② **不能走 DSM File Station**。File Station 的删除只是把文件挪进
 #      `#recycle`，**文件仍在盘上**。而暂存区里最要紧的东西恰恰是
-#      `.env.bak.*` —— 生产 `.env` 的**明文副本，带全部凭据**。
+#      `.env*` —— 生产 `.env` 的**明文副本，带全部凭据**。
 #      2026-09-13 实测：`//iSunker-DS423/docker_ssd/#recycle/env-bak-20260912/`
-#      里就躺着 8 个 `.env.bak*`，全是之前几次「File Station 删除」留下的。
+#      里就躺着 **8 个**凭据副本，全是之前几次「File Station 删除」留下的。
+#      ★ 这 8 个里只有 **7 个**是 `.env.bak.<时间戳>` 形态，第 8 个是**不带后缀**
+#        的 `.env.bak` —— 闸 ⑤ 的删除口径就是被它撑宽的，详见下面闸 ⑤ 那段。
 #      ⇒ 走 File Station 删 = **凭据原地不动，还多 6 个**。
 #
 # 所以本脚本干的就是「在 NAS 上、绕开回收站、先把凭据删掉再删目录」这一件事，
@@ -45,8 +47,13 @@
 #      其余一律拒绝。**生产上不许存在一个「给什么删什么」的脚本**，
 #      哪怕它只由 root 手动跑 —— 手滑一次就是不可逆的。
 #   ④ `--apply` 才动手；不加就是纯列清单。
-#   ⑤ 先单独删 `.env.bak.*` 并复核归零，**再**删目录。
+#   ⑤ 先单独删凭据副本并复核归零，**再**删目录。
 #      顺序是有意的：哪怕中途断电/报错，凭据也已经先走了。
+#      ★ 删除口径是 **`.env*`（任何 `.env` 副本）**，不是 `.env.bak.*`
+#        —— 2026-09-13 实测（README「漂移哨兵 / 已知窄口」）那个暂存区里
+#        8 个凭据副本**只有 7 个**匹配 `.env.bak.*`，第 8 个是不带时间戳的
+#        `.env.bak`。**口径宽松，闸 ⑤ 这句承诺才真的成立**；窄口径下它对
+#        那个命名变体是假的 —— 而它恰恰是这条闸唯一的卖点。
 #
 # 本脚本**不做**的事
 # ------------------
@@ -58,7 +65,10 @@
 set -eu
 
 usage() {
-  sed -n '2,60p' "$0" | sed 's/^# \{0,1\}//'
+  # ★ 锚点式，不写死行号：以前是 `sed -n '2,60p'`，而头部注释只加几行
+  #   就会把最后几行截掉（**静默**——用法说明少几行没人会发现）。
+  #   跟 build-farm.sh 用同一个写法：从第 2 行打到 `set -eu` 之前。
+  awk 'NR>1 && /^set -eu/{exit} NR>1{print}' "$0" | sed 's/^# \{0,1\}//'
 }
 
 APPLY=0
@@ -148,14 +158,36 @@ if [ "$allowed" -eq 0 ]; then
 fi
 
 # ---- 清单 ----
+# ★★ 凭据口径（2026-09-13 修）—— 这里有两个模式，**别混用**：
+#     ENV_PAT  = `.env.bak*`  —— 只是「我们**预期**的备份命名」，用来**报数**；
+#     ENV_SEAL = `.env*`      —— **真正拿来删**的口径（闸 ⑤ 用的就是它）。
+#   为什么不一件事两个名字：上面那个窄口（`.env.bak.*` 只匹配 7/8）的教训
+#   不是「再猜一次命名」，而是**别让「凭据删没删净」取决于我们猜得对不对**。
+#   所以：删除口径放宽到「任何 `.env` 副本」，同时把**超出 ENV_PAT 的那些名字
+#   点名打出来** —— 下一次命名再变，它是「报了一条你没见过的名字」，
+#   而不是「计数悄悄少了一个」。（少一个数是**静默**的，静默的少算比报错坏得多。）
+ENV_PAT='.env.bak*'
+ENV_SEAL='.env*'
 n_all=$(find "$P" -type f | wc -l)
-n_env=$(find "$P" -type f -name '.env.bak.*' | wc -l)
+n_env=$(find "$P" -type f -name "$ENV_PAT" | wc -l)
+n_seal=$(find "$P" -type f -name "$ENV_SEAL" | wc -l)
+n_odd=$((n_seal - n_env))
 n_pyc=$(find "$P" -type f -name '*.pyc' | wc -l)
 
 echo "目标          : $P"
 echo "文件总数      : $n_all"
-echo "  .env.bak.*  : $n_env   ← ★ 生产 .env 的**明文副本**（带全部凭据）"
+echo "  $ENV_PAT : $n_env   ← ★ 生产 .env 的**明文副本**（带全部凭据）"
 echo "  *.pyc       : $n_pyc"
+if [ "$n_odd" -gt 0 ]; then
+  echo
+  # ★ 字符串里**别用反引号**：双引号里的 `` 会被 shell 当命令替换（实测报
+  #   `line NNN: .env*: command not found`，且**只是把那截文本吃掉**，
+  #   不报错、不中断 —— 跟 Python 串里嵌 ASCII 引号是同一类坑）。中文引号「」安全。
+  echo "★ 另外 $n_odd 个「.env*」**不在上面那个口径里** —— 名字没见过，"
+  echo "  但同样是 .env 的副本、同样带凭据。**它们照样会先被删**（删除口径是 $ENV_SEAL）："
+  find "$P" -type f -name "$ENV_SEAL" ! -name "$ENV_PAT" | sed 's/^/     /'
+  echo "  ⇒ 这里出现陌生名字就是在提醒：备份命名又变了，回头把 ENV_PAT 跟上。"
+fi
 
 if [ "$APPLY" -eq 0 ]; then
   echo
@@ -171,10 +203,12 @@ echo
 echo "===== --apply ====="
 
 echo "[1/2] 先删明文凭据"
-find "$P" -type f -name '.env.bak.*' -exec rm -f {} \;
-n_env_left=$(find "$P" -type f -name '.env.bak.*' | wc -l)
-echo "      剩余 .env.bak.* = $n_env_left"
-if [ "$n_env_left" -ne 0 ]; then
+# ★ 删的是 $ENV_SEAL（`.env*`，任何 .env 副本），不是 $ENV_PAT ——
+#   理由见上面「两个模式」那段：**保证必须不依赖我们猜对命名**。
+find "$P" -type f -name "$ENV_SEAL" -exec rm -f {} \;
+n_seal_left=$(find "$P" -type f -name "$ENV_SEAL" | wc -l)
+echo "      剩余 $ENV_SEAL = $n_seal_left"
+if [ "$n_seal_left" -ne 0 ]; then
   echo "[!!] 有删不掉的（权限？文件被占用？）—— 目录就不动了，先查这个" >&2
   exit 1
 fi
