@@ -7751,6 +7751,25 @@ POST http://192.168.0.7:3060/api/v2/app/setPreferences
 而且会把容器内 `/downloads` 与宿主某处绑成**非同名**，正好与本项目**刻意维持的
 "宿主路径 == 容器路径"**（`/volume1/video:/volume1/video` 那条）相抵触。
 
+**★ 2026-09-13 晚实测 —— 把上面那段从「推理」补成「读数」**：
+
+| 读数 | 值 |
+|---|---|
+| `:3060` 种子总数 / `save_path` 前缀分布 | **932 / 932 条全在 `/volume1/video` 下**；`/downloads` 下 **0 条** |
+| 活着的默认值 | `save_path=/volume1/video/download/temp`（§21.6.1 的修复仍在） |
+| `free_space_on_disk` | **0.00 GiB**（= volume1，仍是那个验收判据） |
+| `temp_path` | `/downloads/incomplete`（compose 把它挂在 **volume2**，见 §21.4） |
+| 那份 compose 回读 | `/volume2/docker_ssd/qbittorrent-reseed/docker-compose.yml` —— 它**已经 1:1 挂着** `/volume1/video:/volume1/video` |
+
+⇒ 于是「补挂 `/downloads`」的性质更清楚了：它**不是补一条缺失的路，而是给一棵
+已经可达的树再起一个名字**（别名）。而且这次实测还排掉了一个**反向风险**：
+补挂**不会**把谁的下载藏起来 —— 因为 `/downloads` 下**一条种子都没有**
+（若有，那一挂就是"文件全丢"：宿主机目录会遮住容器可写层里的数据）。
+
+若哪天**真**要挂，唯一自洽的一格是 `/volume1/video/download/temp:/downloads`
+—— 就是现在的默认保存路径本身：不新增落点、不引入新布局、爆炸半径最小。
+**但那是化妆，不是修东西。**
+
 **残留（无害，可选清理）**：conf 里还留着 `Downloads\SavePath=/downloads/`。
 它是个**死键** —— 判据是 qB 刚才**整份重写**了 conf、却**没有**更新它（活键一定会被写）。
 真要清，得**停容器后**手工改；**不清也不影响**，运行时的取值由 `Session\DefaultSavePath` 定。
