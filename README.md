@@ -1574,11 +1574,15 @@ schtasks /Delete /TN "reseed-drive-loop" /F
      ★★ **2026-09-13 起用脚本删，别再手敲**：`sh <compose>/rm-staging.sh <目标> --apply`
      （仓库 `scripts/rm-staging.sh`，已在 `deploy.sh` 白名单里，**不进任何计划任务**，
      手动跑一次即可）。它默认只列清单、`--apply` 才删；**先删凭据副本（口径 `.env*`）再删目录**；
-     并且**只认三类路径**：`_cleanup-*` 与 `#recycle/` 下的 `env-bak-*`（按 **basename**）、
-     以及 `/volume1/video/download/reseed_singles`（按 **完整路径字面量** —— 旧根残留，一次性），
+     并且**只认两类路径**：`_cleanup-*` 与 `#recycle/` 下的 `env-bak-*`（**都按 basename**），
      其余一律拒。
-     ★ 第三类**故意不用 basename**：按 basename 放行 `reseed_singles`，任何同名目录都会
-     跟着放行；写成完整路径 = **只放行这一处**。对照实测：同名、不同完整路径 → **被拒**。
+     ★★ **第三类已撤（2026-09-13，本条原先写的是「三类」）** —— 旧根残留
+     `/volume1/video/download/reseed_singles` 曾经是第三类（按**完整路径字面量**放行），
+     删完即撤。★ 撤掉的理由值得留着：它和前两类的**判据不同**（完整路径 vs basename），
+     而**一次性口子不该常驻** —— 留着等于在生产上永久留一个「能删视频目录」的口子。
+     那条留下的教训照旧成立：**拿 basename 当通行证，会把「任何叫这名字的目录」一起放行**；
+     写成完整路径 = 只放行那一处（对照实测：同名、不同完整路径 → 被拒）。
+     ⇒ 下次再有一次性的清理，照这个办：**加一条 case，删完立刻撤**。
      ★★ **别走 DSM File Station** —— 它的删除只是把文件挪进 `#recycle`，**文件仍在盘上**。
      2026-09-13 实测 `docker_ssd/#recycle/env-bak-20260912/` 里已经躺着 **8 个 `.env.bak*`**
      （其中 4 个是 7.0–7.3 KB，**与生产 `.env` 的 7750 B 同档**），全是之前几次
@@ -1629,6 +1633,52 @@ schtasks /Delete /TN "reseed-drive-loop" /F
      组成、每段都是纯字母的长密钥抓不到。要收口就得换成"熵 / 字符集"判据，而那会**同时**
      把文档里的英文短语重新变成假阳性 —— 换来的是一个"次次都红"的闸门。
      理由与取舍见 §18.15。
+
+15. ⬜ **2026-09-13：#58「drive-loop 迁容器」的静态对账 —— 含一条代码缺陷**
+
+   **a. ★ 缺陷（这条是新的，且是"不报错、只是不动"的形状）：常驻分支不写心跳、也不落盘状态。**
+   `drive-loop.py` 的 `write_state()` **全文件只有两处调用，都在 `once_round()` 里**
+   （批前写 `running_pid` + `heartbeat_ts`；收尾写 `{"running_pid": None, ...}`）。
+   常驻分支（`if args.once and not args.dry_run` 为假时走的那条）调 `run_round()` 时
+   **没有 `with Heartbeat()` 包着** ⇒ 常驻模式下：
+     * `.drive-loop.state` 的 `heartbeat_ts` **这键根本不存在**；
+     * 包轮换下标 `cur_pack_idx` 与连续失败计数 `consec` **都是局部变量**，进程/容器一重启就从头
+       （`--once` 那边是靠 `consec_abort` 落盘跨进程累计的，见 §17.5.4）。
+   ⇒ **后果**：若照「给常驻容器加 healthcheck，判据用心跳新鲜度」这条路做，
+     那套判据在常驻模式下**永远不成立**（键都没有）。要这么走得**先改代码**。
+   ⇒ ★ 这同时否掉了一份外部分析里「常驻模式代码已存在、不用改代码，只需改怎么跑」的结论 ——
+     **跑起来**确实不用改；**要"卡死能接管"** 就得改。
+   ⇒ 另记一条同源的：`restart: unless-stopped` 只对容器**退出**生效，
+     **healthcheck 不健康并不会触发重启** —— 所以常驻路线的接管机制得再加一个
+     `autoheal` 侧车（或 DSM 轮询 `docker inspect`），不是配一个 healthcheck 就完事。
+
+   **b. 迁容器（方案 B）的草案已落盘：`scripts/drive-loop-docker.sh`**
+   （`docker run` 包装 + 挂载清单 + 三处容器方言差异）。
+   **未部署、未进 `deploy.sh` 白名单 —— 有意为之**：白名单的语义是「两边必须一致」，
+   而这份还没在 NAS 上验过；现在就收进去，下次谁跑一次 `--apply` 就会造成假一致
+   （生产上有了这个文件、看着像在用的那套，而 DSM 任务调的还是 `run.sh`）。
+   ★ 若最终采用，**首选**其实不是这个包装，而是做成 `compose.yaml` 的一个服务
+     （网络与卷由 compose 统一声明，不用 `create → network connect → start` 绕），
+     届时本包装退化成一句 `docker compose run --rm drive-loop`。
+     现在不直接改 `compose.yaml` 的理由只有一条：**它在白名单里，改它 = 改生产**。
+
+   ★★ 一条值得单独记的结论 —— **「挂载 1:1」不是「挑几个子目录挂」，而是整个 compose
+   目录按同名同路径挂。** 因为代码里的路径**全是绝对路径**：`CROSSSEED_DIRS[0]`（硬编码）、
+   `build-farm.sh` 的 `COMPOSE_DIR`、`--env "$COMPOSE_DIR/.env"`、告警出栈口
+   `notify/spool/`、以及 `ROOT = HERE.parent` 那条推导。挑着挂**不会报错**，
+   只会**静默退化**（`first_existing()` 返回 `None`，然后只打一行 warning）。
+   ★ 最容易漏的是 `drive-loop/scripts/` 下那五个 `.state` 文件 —— 它们**不在** `hlink/` 里，
+   而漏了的后果是**静默**的：对账 / 无人认领的基线会被当成「首次读数」重新记一遍。
+   ★ 代价也要写明：挂整个 compose 目录 = 把 `.env`、`prowlarr/`、`cross-seed/`、
+   `notify/notify.conf` 一并交给这个容器 —— 这是**新扩大的爆炸半径**，躲不掉。
+
+   ★ **边界（别把这份对账读成"已经跑通过了"）**：容器里**真跑一遍没做过**，
+   闸门跨容器**连跑两轮没验过**，属主/权限**没验过** —— 以上全是静态对账
+   （读 NAS 上的 `run.sh` / `compose.yaml` + 本地代码）。本机不能在 NAS 上执行命令
+   （SSH 关着）。这三条也写在草案文件头部了。
+
+   **c. 顺带修掉一条"自己造的陈旧描述"**：本节上面那段原写 `rm-staging.sh`「只认三类路径」，
+   而它 2026-09-13 已撤成**两类**（旧根删完即撤）—— 已按现状更正。
 
 #### 收尾命令（一次重建同时办完两件事）—— ✅ **已执行过，此节仅存流程**
 

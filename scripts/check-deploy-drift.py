@@ -123,6 +123,16 @@ LOCAL_ONLY = [
     (r"^scripts/audit-found-lines\.py$",          "对账 a−b（在 Windows 上跑；只读 NAS 的 info.current.log，不碰库）"),
     (r"^scripts/audit-found-resolve\.py$",        "对账 b−c（在 Windows 上跑；UNC 直读 state.db，query_only 硬闸，绝不写）"),
     (r"^scripts/torznab-probe\.py$",              "手搜探针（在 Windows 上跑；读 NAS .env 的 TORZNAB_URLS 但**绝不回显**，只发一次 Torznab 查询）"),
+    # ★ 2026-09-13：#58「drive-loop 迁容器」的草案，**故意不进白名单**。
+    #   它与 scripts/drive-loop-nas.sh 是同一层的东西（NAS 侧入口），差别只在
+    #   后者**已经**在生产跑、前者还没有。白名单的语义是「两边必须一致」——
+    #   现在收进去，下次谁跑一次 `deploy.sh --apply` 就会把它推到生产，
+    #   而它没有任何东西调用它 ⇒ 制造一个**假一致**（生产上有个看着像"在用的那套"
+    #   的文件，而 DSM 任务调的其实还是 `drive-loop/run.sh`）。
+    #   **先验，后进白名单**。验通过后的正确做法不是删掉这一行、而是：
+    #   把它加进 deploy.sh 的 FILES，**并从本清单里移除**（两处必须同时改，
+    #   只改一处就会被 B 方向当场报出来 —— 这正是这份清单存在的意义）。
+    (r"^scripts/drive-loop-docker\.sh$",          "**草案**，未部署（#58 迁容器方案 B）；验通过后应进白名单并删掉本行"),
     (r"^prowlarr/\.gitkeep$",                     "占位符；生产的 prowlarr/ 是**不许碰**的"),
     (r"^scripts/(add-indexers|add-torznab-indexer|check-indexer-timestamps"
      r"|gen-datadirs|gen-nas-env-update|migrate-reseed-dirs|run-batch|wait-for-checks)"
