@@ -36,6 +36,18 @@
 #      （pid + 心跳）确实能挡住并发，但 attempts.log 会交错成看不懂的样子，
 #      而排查时间线时它是唯一的证据文件。
 #
+# ★★ 什么时候能跑它 —— **测的时候不必等批次间隙**（2026-09-13 读代码确认）：
+#    `drive-loop.py` 里那个闸门只有一条进入路径
+#        if args.once and not args.dry_run: return once_round(...)
+#    ⇒ 带上 `--dry-run` 时**根本不进这里**：`batch_alive()`（pid + 心跳）与
+#      批次间隔闸门**一个都不走**，直接落到常驻分支里的那一轮。
+#      也就是说 `--dry-run` 是「随时可跑、且不落状态」的那条路。
+#    ★ 反过来说：`--dry-run` **只挡写状态，不挡真动作** —— 判断依据是
+#      `dry_run` 在 `drive-loop.py` 里只出现两次（2047 的闸门、2058 的透传），
+#      别把它当成"什么都不做"的开关到处用。
+#    ★ 这一条与「① 部署/② 冒烟要不要等批次间隙」是同一个问题的答案：
+#      **冒烟随时可做**；要占批次的是**真正 run 一轮**（不带 --dry-run）。
+#
 # 挂载清单（★ 这就是「1:1 对上」的全部内容）
 # -----------------------------------------
 #   两条，缺一不可。**都不是"挑几个子目录"**，因为代码里的路径**全是绝对路径**：
@@ -109,6 +121,16 @@
 #   ★ 这条 `--entrypoint sh` 成立的前提是镜像里有 `/bin/sh`：`python:3.12-slim`
 #     （Debian 底）有；**换任何 alpine/distroless 系镜像都要重新确认**，
 #     而没有 sh 的表现是 create 阶段直接失败，倒还好 —— 不会静默。
+#
+# ★★ PyYAML 那条**不用再查了**（2026-09-13 查过并结案）：
+#   镜像里**有** PyYAML（Dockerfile 的 `pip install -r requirements.txt` 是 build 期
+#   保证），但**这个结论其实用不上** —— 更硬的理由是
+#   **`drive-loop.py` 的整个 import 闭包是纯标准库**（`orchestrator/__init__.py`
+#   无 import；`orchestrator/state.py` 与 `scripts/notify.py` 也只 import 标准库）。
+#   于是它**换任何自带 python3 的镜像都成立**，不绑定 `reseed-orchestrator`。
+#   PyYAML 只被 `orchestrator/config.py` 用，那条路径本包装不走。
+#   ⇒ 下次别再问「镜像里有没有 PyYAML」；问「import 闭包里非标准库的有没有」，
+#     而这个答案是**空集**，且不随镜像变。
 #
 # ★ 为什么不用 `docker run --network A --network B` 一次写完
 #   `docker run` 的 `--network` 在旧版 Engine 上**只认最后一个**，而且**不报错**
