@@ -1174,6 +1174,39 @@ def _age_h(sec: float) -> str:
     return f"{sec / 86400:.1f} 天前"
 
 
+def _prev_day_found_count(log_path: str) -> tuple[str | None, "S.FoundLineCount | None"]:
+    """回退读**最近一个已轮转的完整日**日志 —— 只给「控制没过」那条当**证据**用。
+
+    为什么这么找：cross-seed 的 info 日志**按天轮转**，轮转出来的名字是
+    `info.<YYYY-MM-DD>.log`（口径见 `reconcile_watch` 那段）。文件名带 ISO 日期
+    ⇒ **字典序即时间序**，取最后一个就是最近的那个完整日；`info.current.log`
+    是当日的那个，排除掉。
+
+    ★ 它**不参与判据** —— 判据永远还是 `S.count_found_lines` 那一个。
+      这里只是把「昨天数得到吗」这个**便宜且可验证**的对照摆到告警正文里，
+      好让读告警的人不必自己去猜该往哪儿查。
+    ★ 读不动就回 None。这条告警**绝不抛**（它挂在每天一次的日报里，
+      而日报挂在每 15 分钟一批的生产循环里）。
+    ★ 不用 `Path.resolve()`：这条路径在 NAS 上是 SMB/网络路径，
+      resolve 会真的去问文件系统，慢且可能失败；比名字就够了。
+    """
+    try:
+        d = Path(log_path).parent
+        cur = Path(log_path).name
+        cands = sorted(p for p in d.glob("info.*.log")
+                       if p.name != "info.current.log" and p.name != cur)
+    except OSError:
+        return None, None
+    if not cands:
+        return None, None
+    p = cands[-1]
+    try:
+        return str(p), S.count_found_lines(p.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, UnicodeError):
+        LOG.debug("回退读完整日日志失败：%s", p, exc_info=True)
+        return str(p), None
+
+
 def reconcile_watch(args) -> tuple[str, dict]:
     """四类对账的读数 → (给日报正文的一段, 给 metrics 的字典)。
 
@@ -1257,10 +1290,49 @@ def reconcile_watch(args) -> tuple[str, dict]:
             f"（期望差 0；合取比 L1 单字面量收窄了 "
             f"{c.lit_counts.get(S.L1_LABEL, 0) - c.a} 行）")
         if not c.controls_ok:
-            # 控制没过 = 判据没走到，下面的 0 什么都不说明。
-            emit("alert", "观测对账：判据没走通",
-                 body=("日志读了，但基线一个字面量都没数到 —— 说明**匹配逻辑坏了**，"
-                       "不是「没有 Found 行」。\n"
+            # ★★★ 2026-09-14 改。原话是「说明**匹配逻辑坏了**」——
+            #   **那是下结论，而且下反了。**
+            #   `controls_ok` 的定义只有一条实质条件：`lit_counts[L1] > 0`，
+            #   也就是**当日日志里至少出现一次 `] Found `**。于是它必然在
+            #   「本日还没搜出去」时失败 —— 而那**不是**判据坏了。实测就是它：
+            #       当日日志 40 行 / L1 命中 0 / a = b = 0 → 报警「匹配逻辑坏了」
+            #     而用**同一个函数、同一张字面量表**跑前三个完整日：
+            #       09-11 a=399 b=399 a−b=0 ｜ 09-12 a=1011 b=1011 a−b=0
+            #       09-13 a=179 b=179 a−b=0  （三个完整日**全是 0 差**）
+            #   09-14 之所以是 0，只因**那天一条 Found 行都没产生**（HDtime 退避）。
+            #   ★ 再叠上「日报在当天第一批（00:0x–01:3x）采样」这个已知口径
+            #     （见本函数头部那段）—— 任何安静的夜都必然踩空 =
+            #     **每天一封假告警**。而本文件 754-758 那段自己写着：
+            #     假告警会把人喊到不再看它，那正好毁掉告警通道。
+            #   ⇒ 所以这里**不下结论**，改成给**可验证的对照**：
+            #     回退读最近一个**完整日**。昨天数得到、今天数不到 ⇒ 是口径；
+            #     两天都数不到 ⇒ 这才该往 `_RE_FOUND` 和那六个字面量上想。
+            #   ★ metrics 仍报真数（0）—— 它确实是「从 00:00 到现在」的计数；
+            #     要修的是**它被念成了什么**，不是这个数（§18.17.3 那条：错的
+            #     不是数，是它指向的排查动作）。
+            prev_name, prev = _prev_day_found_count(log_path)
+            if prev is None:
+                ev = ("对照：同一目录下没有别的已轮转日志 —— **这次判不了**"
+                      "是不是判据坏了，别急着改正则。\n")
+            else:
+                ev = (f"对照〔最近一个完整日〕{Path(prev_name).name}："
+                      f"总行 {prev.total_lines} / 形状 {prev.a} / 正则 {prev.b}"
+                      f" / L1 命中 {prev.lit_counts.get(S.L1_LABEL, 0)}\n")
+                if prev.controls_ok:
+                    ev += ("   ⇒ 那个**数得到** ⇒ 判据没坏。本日的 0 只是"
+                           "「当日口径」的 0（今天还没搜出去）。\n"
+                           "     手工复核用 scripts/audit-found-lines.py"
+                           "（读的是同一个函数）。\n")
+                else:
+                    ev += ("   ★ 那个**也数不到** ⇒ 这才可能是**匹配逻辑真的坏了**"
+                           "—— 去核 `_RE_FOUND` 与那六个字面量。\n")
+            emit("alert", "观测对账：本日尚无 Found 行（判据不可判）",
+                 body=("当日日志（从 00:00 到现在）里**一条 `] Found ` 都没有** ⇒ "
+                       "判据**没走到**，下面的 0 **什么都不说明**。\n"
+                       "★ 两种可能，**别默认是后者**：\n"
+                       "   ① 今天还没搜出去（站点退避时会这样）—— 当日口径的正常表现；\n"
+                       "   ② 匹配逻辑真的坏了。\n"
+                       + ev +
                        f"日志: {log_path}\n总行数: {c.total_lines}\n"),
                  key="reconcile-controls", metrics={"fa": c.a, "fb": c.b})
         elif c.delta:

@@ -279,10 +279,53 @@ note, m = D.reconcile_watch(argparse.Namespace(log=[LOG_C], db=None, db_path=Non
 ck("控制没过：a / b 都是 0", (m["fa"], m["fb"]), (0, 0))
 ck("控制没过：发了一条 alert", [e[0] for e in events], ["alert"])
 ck("key 是 reconcile-controls", events[0][3], "reconcile-controls")
-# ★ 正文必须说「匹配逻辑坏了」，而不是「没有 Found 行」——
-#   这两句对应完全不同的排查动作（改正则 vs 去查为什么没搜）。
-ck("正文点明「匹配逻辑」（不是「没有 Found 行」）",
-   "匹配逻辑" in events[0][2], True)
+# ★★ 2026-09-14 改。原来这里钉的是「正文必须说『匹配逻辑坏了』」——
+#   **那个断言把一次误判钉成了契约。** `controls_ok` 只有一条实质条件：
+#   `lit_counts[L1] > 0`，也就是**当日日志里出现过一次 `] Found `**。
+#   而日报是在**当天第一批（00:0x–01:3x）**采样的，于是任何安静的夜它都会失败 —
+#   那时正文说「匹配逻辑坏了」就是**指错方向**（改正则 vs 去查为什么没搜）。
+#   实测（2026-09-14）：当日日志 40 行 / L1 命中 0 / a = b = 0，报了「匹配逻辑坏了」；
+#   而**同一个函数、同一张字面量表**跑前三个完整日：
+#     09-11 a=399 b=399 a−b=0 ｜ 09-12 a=1011 b=1011 a−b=0 ｜ 09-13 a=179 b=179 a−b=0
+#   ⇒ 判据是好的，0 只是「当日口径」的 0。所以现在钉的是**并列两种可能**，
+#     并钉死「不许再下那个结论」。
+ck("正文并列两种可能（①没搜出去 / ②匹配逻辑坏了）",
+   ("①" in events[0][2] and "匹配逻辑" in events[0][2]), True)
+ck("★ 不再断言「匹配逻辑坏了」", "说明**匹配逻辑坏了**" in events[0][2], False)
+ck("同目录没有别的已轮转日志 → 明说判不了（不猜）",
+   "判不了" in events[0][2], True)
+
+print("== ④ 出口 2b：有完整日对照时，必须给**证据**而不是猜（09-14 就是这一格）==")
+# ★ 复刻 2026-09-14：当日日志刚轮转、一条 Found 都没有，而**昨天那个完整日**
+#   数得到。判据没坏，坏的只是「当日口径」这个窗口 —— 所以正文必须把对照摆出来，
+#   让读告警的人不必自己去猜该往哪儿查。
+DIR_2B = tempfile.mkdtemp()
+LOG_CUR = os.path.join(DIR_2B, "info.current.log")
+LOG_PREV = os.path.join(DIR_2B, "info.2026-09-13.log")
+pathlib.Path(LOG_CUR).write_text(
+    '2026-09-14 00:00:01.000 info: [webhook] Received search request',
+    encoding="utf-8")
+pathlib.Path(LOG_PREV).write_text(LOG2, encoding="utf-8")   # 完整日：有靶心形状
+events.clear()
+note, m = D.reconcile_watch(argparse.Namespace(log=[LOG_CUR], db=None, db_path=None))
+ck("当日 0 → 仍然发 alert", [e[0] for e in events], ["alert"])
+ck("正文点名那个完整日", "info.2026-09-13.log" in events[0][2], True)
+ck("★ 给出「数得到 ⇒ 判据没坏」", "判据没坏" in events[0][2], True)
+ck("★ 并说清本日的 0 是当日口径的 0", "当日口径" in events[0][2], True)
+
+print("== ④ 出口 2c：完整日**也**数不到 → 这才该怀疑判据 ==")
+DIR_2C = tempfile.mkdtemp()
+LOG_CUR2 = os.path.join(DIR_2C, "info.current.log")
+LOG_PREV2 = os.path.join(DIR_2C, "info.2026-09-13.log")
+pathlib.Path(LOG_CUR2).write_text(
+    '2026-09-14 00:00:01.000 info: [webhook] Received search request',
+    encoding="utf-8")
+pathlib.Path(LOG_PREV2).write_text(
+    '2026-09-13 01:00:00.000 info: [webhook] Received search request',
+    encoding="utf-8")
+events.clear()
+note, m = D.reconcile_watch(argparse.Namespace(log=[LOG_CUR2], db=None, db_path=None))
+ck("★ 两天都数不到 → 才指向正则", "匹配逻辑真的坏了" in events[0][2], True)
 
 print("== ④ 出口 3：空转（b == 0 但**控制通过**）—— 必须与上一格分得开 ==")
 # ★ 两格的 metrics 都是 fb = 0，**但含义相反**：一个是"判据坏了"，
