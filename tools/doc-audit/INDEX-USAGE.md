@@ -529,6 +529,6 @@ git rev-parse HEAD origin/main   # 两个 hash 必须相等
 
 | 触发 | 动作 | 判据 |
 |---|---|---|
-| **HDtime 退避结束**（读 `04_probes.py` 第 4 列〔`retry_after`〕确认，**不是按钟点**）| ① `python tools/doc-audit/04_probes.py` ② `python scripts/torznab-probe.py "<原样 q>" --id 1`（`q` 必须**逐字节**抄 verbose 里 `Querying HDtime at … with { t: 'tvsearch', q: '…' }` 那行的 `q`，见脚本头部用法）| ①「**退避中，剩 N 分钟**」⇒ **顺延，别硬跑**（撞 429，且拿不到有效读数）；「**限流窗口已过**」⇒ ② 能通 |
+| **HDtime 退避结束**（读 `04_probes.py` 第 4 列〔`retry_after`〕确认，**不是按钟点**）| ① `python tools/doc-audit/04_probes.py` ② `curl -s -H "X-Api-Key: <PROWLARR_API_KEY>" http://192.168.0.7:9696/api/v1/indexerstatus`（**分辨是哪一种机制**，见 `ERR-SVC-17`）③ `python scripts/torznab-probe.py "<原样 q>" --id 1`（`q` 必须**逐字节**抄 verbose 里 `Querying HDtime at … with { t: 'tvsearch', q: '…' }` 那行的 `q`，见脚本头部用法）| ① **只看第 4 列的时长朝哪个方向变**：变短 / 清零 ⇒ 在消气；★ **变长 ≠ 站点在加罚** —— 那多半是 **cross-seed 自己的退避阶梯**（见 `ERR-SVC-17`），变长只说明**还没到点** ② 数组里**有** HDtime ⇒ 是 **Prowlarr 本地禁用**，与站点无关 ③ **两个时钟不一致时以更长的为准**（`disabledTill` 管 Prowlarr 何时肯转发，`retry_after` 管 cross-seed 何时肯再问）|
 | **每日首批跑完后** | 读当天 `notify/log/<日期>.tsv` 的 reconcile 八格 | 真数 ⇒ 判据跑到了；`n/a` ⇒ **没跑到**（不是「没事」）；缩回基线是**静默采纳**，不发告警 |
 
