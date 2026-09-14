@@ -1296,8 +1296,13 @@ NAS 上还跑着**别人的**容器（IYUU Plus、另一套 qB、opencd），它
   ```
   · 数组里**有**该站、带 `disabledTill` ⇒ **②**（Prowlarr 本地禁用，与站点无关）
   · 数组为空 / 没有该站 ⇒ **①**（站点真发，Prowlarr 只是转发）
-  ★ 两个时钟**不一致时以更长的为准**：`disabledTill` 管 Prowlarr 何时肯转发，
-  `retry_after` 管 cross-seed 何时肯再问 —— **后者更长就由后者决定恢复时刻**。
+  ★ **两个时钟不一致时以更长的为准**（★★ **这是推断，不是实测** —— 依据只有
+  `run.sh` 那句「真判据是 `retry_after`」，本项目**没有实测过**"Prowlarr 放行而
+  cross-seed 不动"这个场景）：`disabledTill` 管 Prowlarr 何时肯转发，`retry_after`
+  管 cross-seed 何时肯再问 —— **后者更长就由后者决定恢复时刻**。
+  ★ **验法**（到 Prowlarr 放行那一刻，本例 **2026-09-14 17:38**）：
+  Prowlarr 放行而 cross-seed **仍不动** ⇒ 推断坐实；
+  cross-seed **动了** ⇒ **推断错**，回来改本条这一句 —— 别把它当中性事实传下去。
 - **怎么发现的**：2026-09-14，HDtime 的 `retry_after` 从「剩 34 分钟」跳成「剩 1439 分钟」
   之后，`04_probes.py` 只报出这个数、报不出是哪种机制 ⇒ 换 `indexerstatus` 才定下来。
   **两个数据点**（09-13 那次空转 + 09-14 这次跳变）。
