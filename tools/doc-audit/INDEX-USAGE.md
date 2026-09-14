@@ -539,6 +539,6 @@ git rev-parse HEAD origin/main   # 两个 hash 必须相等
 
 | 触发 | 动作 | 判据 |
 |---|---|---|
-| **HDtime 恢复**（两个时钟：Prowlarr `disabledTill` / cross-seed `retry_after` —— **以更长的为准**；**不是按钟点**，读 `04_probes.py` 第 4 列确认）| ① `python tools/doc-audit/04_probes.py` ② `curl -s -H "X-Api-Key: <PROWLARR_API_KEY>" http://192.168.0.7:9696/api/v1/indexerstatus`（**分辨是哪一种机制**，见 `ERR-SVC-17`）③ `python scripts/torznab-probe.py "<原样 q>" --id 1`（`q` 必须**逐字节**抄 verbose 里 `Querying HDtime at … with { t: 'tvsearch', q: '…' }` 那行的 `q`，见脚本头部用法）| ① `04_probes.py` 第 4 列变「**限流窗口已过**」**且** ② `indexerstatus` 里**没有** HDtime ⇒ **真恢复**；**任一未过 ⇒ 顺延** |
+| **HDtime 恢复**（两个时钟：Prowlarr `disabledTill` / cross-seed `retry_after` —— **以更长的为准**；**不是按钟点**，读 `04_probes.py` 第 4 列确认）| ① `python tools/doc-audit/04_probes.py` ② **Prowlarr 侧**：`python scripts/prowlarr-indexerstatus.py`（**分辨是哪一种机制**，见 `ERR-SVC-17`）+ **cross-seed 侧**：`python scripts/check-indexer-timestamps.py` ③ `python scripts/torznab-probe.py "<原样 q>" --id 1`（`q` 必须**逐字节**抄 verbose 里 `Querying HDtime at … with { t: 'tvsearch', q: '…' }` 那行的 `q`，见脚本头部用法）| ① `04_probes.py` 第 4 列变「**限流窗口已过**」**且** ② `indexerstatus` 里**没有** HDtime ⇒ **真恢复**；**任一未过 ⇒ 顺延**。★ ② 原来写的是一条**把 key 打在命令行上**的裸 `curl` —— 2026-09-14 换成脚本（key 从生产 `.env` 读、**绝不打印**）；`.env` 读的是 NAS 那份生产 `.env`。★ **时刻到 ≠ 条件成立**：窗口本身变过（同一天记过 24 h 也记过 6 h），**先读再判** |
 | **每日首批跑完后** | 读当天 `notify/log/<日期>.tsv` 的 reconcile 八格 | 真数 ⇒ 判据跑到了；`n/a` ⇒ **没跑到**（不是「没事」）；缩回基线是**静默采纳**，不发告警 |
 

@@ -153,20 +153,30 @@ prowlarr_cross-seed_autohardlink/   # NAS 部署目录（compose 就放这里，
 > 或摘索引器（`--remove`，换站用〔apikey 从同文件现有条目**原样抄**，不经过人眼〕）、
 > `check-indexer-timestamps.py` **只读**查「哪个站真的搜出去过 + 到底有没有在被限流」
 > 〔加站流程第 ③ 步的闸门，见 SUMMARY §18.11〕、
+> `prowlarr-indexerstatus.py` **只读**查「Prowlarr 是不是**在本地禁用**某个站」
+> 〔`ERR-SVC-17` 里三种限流机制的分辨器，与上一条是**一对**：一条看 Prowlarr 侧、
+> 一条看 cross-seed 侧；key 从生产 `.env` 读、**绝不打印**，站名只取
+> `cross-seed.db` 的 `id`/`name` 两列〕、
 > `check-deploy-drift.py` **只读**的**漂移哨兵**（NAS 上有没有没登记的文件 / 仓库里有没有
 > 该部署却没进白名单的文件，见「漂移哨兵」一节，SUMMARY §18.14）、
 > `scan-secrets.py` **只读**的**推前凭据扫描**（按值的形状找漏进仓库的 cookie / apikey /
 > passkey，见「推前凭据扫描」一节，SUMMARY §18.15）、
 > `audit-found-lines.py` / `audit-found-resolve.py` **只读**的两道**对账**
 > （`Found` 行：a−b 验「抓到的形状 = 正则认的形状」，b−c 验「抓到的行真的落到了某个单片」；
-> 直读 NAS 的 `info.current.log` 与 `state.db`〔后者 `query_only` 硬闸〕，见 SUMMARY §18.18）。
+> 直读 NAS 的 `info.current.log` 与 `state.db`〔后者 `query_only` 硬闸〕，见 SUMMARY §18.18）、
+> `sa-volume-usage.py` **只读**群晖 Storage Analyzer 的报告
+> 〔内存里解 zip、不落盘、无凭据；它留着的是**一句否定结论的证据** ——
+> 报告里**没有可用空间**，见 SUMMARY §22 与「🔴 下一步」第 14 条〕。
 > 其余工具要么跑在 NAS 上，要么是**手动**用的（不必进容器）。
 > ★ 2026-09-12 起电脑端只留 **`deploy.sh`**（推代码）、**`check-deploy-drift.py`**（查漂移）、
-> **`scan-secrets.py`**（推前扫凭据）、**`audit-found-*.py`**（对账）几个用途，
+> **`scan-secrets.py`**（推前扫凭据）、**`audit-found-*.py`**（对账）、
+> **`prowlarr-indexerstatus.py`** / **`check-indexer-timestamps.py`**（查限流是哪一种）几个用途，
 > 见「⛔ 电脑端已不参与」。
-> `tests/` 是**离线自测**（13 个脚本 / 431 条断言）—— 原先散在 `D:/tmp` 里**没有版本管理**，
-> 2026-09-12 搬进仓库。不联网、不碰生产、不碰真库，`python tests/<名字>.py`
-> **任一 cwd** 都能跑（路径按 `__file__` 解析），全过退出码 0。见 `tests/README.md`。
+> `tests/` 是**离线自测** —— ★ **脚本数与断言数只维护在 `tests/README.md`，别在这里抄第二份**
+> （抄过一次就漂了：这里曾写「13 个脚本 / 431 条断言」，而 2026-09-14 实测已是 **21 / 757**）。
+> 原先散在 `D:/tmp` 里**没有版本管理**，2026-09-12 搬进仓库。不联网、不碰生产、不碰真库，
+> `python tests/<名字>.py` **任一 cwd** 都能跑（路径按 `__file__` 解析），全过退出码 0。
+> 见 `tests/README.md`。
 > 由状态机导出的 `unmatched.tsv` /
 > `todo-paths.txt` 属运行时产物，已 gitignore。
 
@@ -1294,6 +1304,9 @@ python scripts/drive-loop.py --once --notify-spool "D:/tmp/x"    # 换个 spool
 
 | **12** | **qB（:3060）校验队列疑似卡死，卡住 145 条** —— 偏好里 `max_active_checking_torrents = 1`，而 **145 条 IYUU 种子**挤在 `checkingDL` 排队、**8 小时一步没挪**（另有 `error` 24 / `stalledDL` 1，全部 added 09-13 02:35–03:17，`pieces_have=0`、共 170 条 0 字节）。已排除三种：497 个文件逐个 `stat` **全部大小相符**、`save_path` **无映射失败** ⇒ **不是「保存路径错 / 根目录差一层 / 缺文件」**。★ **待坐实的一步（写操作，1 条，可逆）：对任意一条卡住的种子手动「强制重新校验」** —— 几秒内跳 100% ⇒ 坐实是**校验队列/校验器**卡住，不是内容问题；**未坐实前这只是「最符合证据的解释」** | 卡住的不是 1 条而是 **145** 条；校验不完就不做种，而**做种数正是这条链的产出** | — |
 
+| **13** | **`movie.matched_indexers` 全库恒空：查清 + 修（#73 / #75）** —— ✅ **代码已改、测试已过（2026-09-14），★ 未部署**。查下来**不是**「判据没被调用」：拿 09-12 的日志跑**现在**的解析函数**有值**（1011 行命中，归片后带站名 —— 南洋 285 / HDFans 448 / HDtime 44）。真根因是两段：**① 输入源易失** —— `facts.found` 的**唯一**输入是**当天**的 `info.current.log`（`searched` / `hashes` 都有 cross-seed.db 这第二条腿，**`found` 没有**）；**② 写入端不合并** —— `sync_movie` 对 `matched_indexers` 是**整行覆盖**，而同一个函数里 `indexer_seen` 是**合并**的、`searched_indexers` 是 union 的（**两列语义相同、写法相反 = 遗漏，不是设计**）。⇒ 日志跨天一滚动（`info.current.log` → `info.YYYY-MM-DD.log`），下一次 sync 就把整列抹成 `[]`；而 SEEDING 的行**不会再被搜** ⇒ **永不恢复**。生产见证：同一张 605 行的表 **09-12 非空 215 部 → 09-14 变 0 部**。修法：**与旧值取并集**（**不采用**「喂全部 `info.*.log`」—— 成本随保留天数涨，且仍不覆盖被轮换掉的），并在源头**不再造 `"A\|B"` 合体标签**（读侧 `_sites()` 按 JSON 数组**逐项**取，不认里面的 `\|`；老库残留的合体标签在写入端**拆开**再并）。回归 `tests/test_matched_indexers_union.py`（15 条，**红过再绿**：回退那两个 hunk ⇒ 红 4 条）| ★ 这一列是 `report` 的**站点归属**与 `trend` 的**按周 × 按站**换站决策表的输入 —— 它恒空等于**那些判据都在沙上建塔** | §22 |
+| **14** | **两件等拍的** —— ① **17:40 观测**（Prowlarr 放行 HDtime 之后 cross-seed 动不动）：两个读数 `python scripts/prowlarr-indexerstatus.py`（② 机制）与 `python scripts/check-indexer-timestamps.py`（③ 机制）。★ **时刻到 ≠ 条件成立** —— 窗口本身已经变过一次（`disabledTill` 记的是 24 h，而 6 h 那个只是 14:27 的读数），**先读再判** ② **存储分析器互校**：三步探针已跑完，结论是**报告里没有可用空间**（`Used` 只有百分数，0.1% on 61.4 TB = 61 GB）⇒ **等拍**：换对照量还是换报告 | ① 这是唯一能把 `ERR-SVC-17` 里那处**剩余推断**（cross-seed 是原样转抄 `Retry-After`，还是按自己起算点重算）验掉的机会，**顺手答** `#60`（放行后动不动 ⇒ snooze 该怎么处置）；判据见那两条 | §22 · `INDEX-USAGE` §八 |
+
 #### ★ 09-13 首读实测：`unclaimed=1` 那条告警**不是修复失效**（2026-09-13 复核）
 
 00:38:28 的 TSV 里有两条 alert：`unclaimed=1`（`农场里有 1 条 searchee 谁都不归`）和
@@ -1755,8 +1768,14 @@ schtasks /Delete /TN "reseed-drive-loop" /F
   | `info.2026-09-12.log` | 770 | 492 | **278，全部是南洋** |
 
   **后果链**：`parse_log` 丢掉这些行 → `facts.found` 里没有南洋 →
-  `state.py:1947` 的 `matched = [(h, "|".join(found_idx)) for h in hashes]` 拿不到南洋标签 →
-  `movie.matched_indexers` **永远只有 HDFans**。
+  `sync_pack` 组装 `matched` 的那一行拿不到南洋标签 → `movie.matched_indexers`
+  **永远只有 HDFans**。
+  > ★ **那一行后来被重写了**（2026-09-14，为另一件事：`matched_indexers` 跨天日志滚动后
+  > 被抹空 —— 见上面「🔴 下一步」里 **#73/#75** 那一行，与 **SUMMARY §22**）。原文是
+  > `matched = [(h, "|".join(found_idx)) for h in hashes]`，**现在仓库里已经没有这一行** ——
+  > 别再拿它（或它的行号）当锚点。两者是**两个不同的毛病**：这条是**正则吃不下带空格的站名**，
+  > 那条是**输入源易失 + 写入端不合并**，别把它们并成一件事。
+
   据库实测：605 部里 **215 部标着 HDFans，标着南洋的 0 部** —— 而
   `indexer_seen`（452）和 `attempt.indexers` 里南洋**都在**，因为那两处走的是
   cross-seed.db 和搜索记录，**不经过这个正则**。所以是"一个字段瞎了"，不是"南洋不行"。
@@ -1984,5 +2003,6 @@ searchee 数与切换前**一致（1888）**。
 > 若你在 NAS 上另存备份，别把任何一份拷进仓库。
 
 详细的过程记录、踩坑与决策都在 **SUMMARY.md**
-（老会话见 §11.12 / §11.13 / §11.14 / §12；本轮见 **§20**（观测层「沉默 / 响铃」语义收敛），
+（老会话见 §11.12 / §11.13 / §11.14 / §12；本轮见 **§20**（观测层「沉默 / 响铃」语义收敛）
+与 **§22**（`matched_indexers` 恒空 · HDtime 的 429 到底是哪种限流 · `ERR-SVC-17` 改「有据」），
 观测对账的判据本体见 §18.18 / §18.19）。

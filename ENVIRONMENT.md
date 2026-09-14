@@ -1088,6 +1088,13 @@ NAS 上还跑着**别人的**容器（IYUU Plus、另一套 qB、opencd），它
   curl -s -H "X-Api-Key: <Prowlarr API key>" http://<NAS_IP>:9696/api/v1/indexer \
     | python -c "import sys,json;[print(i['id'], i['name']) for i in json.load(sys.stdin)]"
   ```
+  ★ **管道是必须的，不是顺手**：`/api/v1/indexer` 的响应**每一行都带 `fields`**
+  —— 那里面有 cookie / passkey（见本节开头「绝不打印 `indexer.fields`」）。
+  裸跑那个 `curl`（哪怕只为"看一眼结构"）就等于把全部站点的凭据打到终端上，
+  **而终端输出会进聊天、进日志、进截图**。要么保留管道，要么别调这个端点。
+  ★ 同族：**key 不进命令行**（会留在 shell 历史与进程列表里）。这条 curl 用
+  `-H "X-Api-Key: …"` 是历史写法；新写的查站工具应从 `.env` 读 key
+  （如 `scripts/prowlarr-indexerstatus.py`、`scripts/check-indexer-timestamps.py`）。
 - **怎么发现的**：SUMMARY §6.6。
 - **边界**：★ 还要区分：**「只在 Prowlarr 里禁用索引器」≠「cross-seed 不搜它」** ——
   cross-seed 只认自己的 `TORZNAB_URLS`，会继续请求已禁用的站，每搜一次吃一个 `HTTP 410` 并 snooze。
@@ -1316,10 +1323,16 @@ NAS 上还跑着**别人的**容器（IYUU Plus、另一套 qB、opencd），它
   FlareSolverr 字样）。
 - **规避做法 / 判据**：★ **别继续看 `retry_after`** —— 它分不开这三种。**换读数**：
   ```bash
-  curl -s -H "X-Api-Key: <PROWLARR_API_KEY>" http://192.168.0.7:9696/api/v1/indexerstatus
+  python scripts/prowlarr-indexerstatus.py          # ② Prowlarr 本地禁用（本条的判据）
+  python scripts/check-indexer-timestamps.py        # ③ cross-seed 侧：status + retry_after + 还剩多久
   ```
   · 数组里**有**该站、带 `disabledTill` ⇒ **②**（Prowlarr 本地禁用，与站点无关）
   · 数组为空 / 没有该站 ⇒ **①**（站点真发，Prowlarr 只是转发）
+  ★ **这两个脚本替换掉了早先的一条裸 `curl`**（`-H "X-Api-Key: …"`）—— 那条有两个毛病：
+  key 摆在**命令行**上（进程表 / shell 历史 / 聊天粘贴都漏），而返回的裸 JSON 里只有
+  `indexerId`、**要靠人肉对到站名**。脚本从生产 `.env` 读 key（**绝不打印**）、
+  只打白名单字段、站名只从 `cross-seed.db` 取 `id`/`name` 两列。
+  两个脚本都在 `deploy.sh` 的白名单**之外**（Windows 侧手动诊断用）。
   ★ **两个时钟不一致时以更长的为准**：`disabledTill` 管 Prowlarr 何时肯转发，
   `retry_after` 管 cross-seed 何时肯再问 —— **后者更长就由后者决定恢复时刻**。
   ★★ **2026-09-14 实测：上一句原来写的是「这是推断，不是实测」，现在它有据了** ——

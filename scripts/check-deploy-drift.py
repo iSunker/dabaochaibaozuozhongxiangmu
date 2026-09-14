@@ -169,6 +169,17 @@ LOCAL_ONLY = [
     #   发布名，不该随随便便进日志）。它读的是 NAS 上 drive-loop 写的
     #   `.linkguard.state`，**只读不写**。
     (r"^scripts/crossseed-linkguard\.py$",        "链接守护诊断（在 Windows 上跑；读 NAS 的 .linkguard.state + 只读问一次 qB，默认只出 hash）"),
+    # ★ 2026-09-14：`ERR-SVC-17` 的 ② 机制探针。与上面两条是**同一形状**
+    #   （只读 + 不回显凭据 + 只打白名单字段），判据也一样。它替换掉的是
+    #   `ENVIRONMENT.md` 早先那条**把 key 摆在命令行上**的裸 curl ——
+    #   那条除了漏凭据，返回的裸 JSON 还得人肉把 indexerId 对到站名。
+    #   key 从生产 .env 读；**不调 `/api/v1/indexer`**（那个响应带 fields：cookie/passkey）；
+    #   站名只从 cross-seed.db 取 id/name 两列（url/apikey 那两列带凭据）。
+    (r"^scripts/prowlarr-indexerstatus\.py$",     "Prowlarr 本地禁用探针（在 Windows 上跑；读 NAS .env 的 key 但绝不打印、只打白名单字段）"),
+    # ★ 2026-09-14：群晖 Storage Analyzer 报告的只读读者。只读、无凭据（走 SMB 读报告目录），
+    #   而且 zip 是**内存里**解、不落盘。它存在的理由是**留一句否定结论的证据**：
+    #   「报告里没有可用空间」这个结论决定了一条待办（见 README 的 #77）。
+    (r"^scripts/sa-volume-usage\.py$",            "只读群晖 Storage Analyzer 报告（在 Windows 上跑；内存解 zip、不落盘、无凭据）"),
     # ★ 2026-09-13：#58「drive-loop 迁容器」的草案，**故意不进白名单**。
     #   它与 scripts/drive-loop-nas.sh 是同一层的东西（NAS 侧入口），差别只在
     #   后者**已经**在生产跑、前者还没有。白名单的语义是「两边必须一致」——
