@@ -14,7 +14,8 @@ python tests/test_backoff.py        # 任一 cwd 都行
 
 2026-09-13 实测：**18 个脚本、690 条断言、0 失败**（本轮新增 `test_linkguard.py` 66 条 + `test_hardlink_link_type.py` 17 条）。
 
-2026-09-14 实测：**20 个脚本、742 条断言、0 失败**（本轮新增 `test_qb_census_props.py` 23 条 + `test_notify_digest.py` 22 条）。
+2026-09-14 实测：**21 个脚本、757 条断言、0 失败**（本轮新增 `test_qb_census_props.py` 23 条 +
+`test_notify_digest.py` 22 条 + `test_matched_indexers_union.py` 15 条）。
 ★ 同日顺手校正下面表里一处旧数：`test_reconcile.py` **120 → 127** —— 09-13 之后又加了 7 条
 断言，表没跟着改。（数按上面那条命令重数，不手算。）
 
@@ -57,6 +58,7 @@ tot=0; for f in tests/test_*.py; do out=$(python "$f" 2>&1); rc=$?; \
 | `test_roots_from_env.py` | 25 | `init --roots-from-env` 的**取值来源**：首选 `FARM_SOURCES`、缺席时退回 `DATA_DIRS`（★ 与 `build-farm.sh:132-155` 同一种优先顺序）。核心那格是**同一个 `.env`、同一句 `--match`**：`FARM_SOURCES` 在 → 挑得到，只有 `DATA_DIRS` → 挑 0 —— 差异只可能来自取值来源，所以它量的就是"键换对了"本身。另钉：退回时**必须说出来**（不静默）、两个键都没有时报错要点名两个键、`--match` 挑不中时文案点名**实际用的那个键** |
 | `test_remove_indexer.py` | 8 | `add-torznab-indexer.py --remove` 的**字节保真**与安全闸（合成样本 + 假 key，绝不碰生产 `.env`） |
 | `test_scan_secrets.py` | 25 | 推前凭据扫描器 `scripts/scan-secrets.py`：阳性拦得住（值指纹 + 形状两条路）、阴性不误报；**形状层必须参与退出码**、**只拦「本次新引入」**、三类假阳性（读变量 / 英文短语 / 同字符重复）必须被规则认出来 |
+| `test_matched_indexers_union.py` | 15 | `matched_indexers` 是**单调事实**（#73）—— 与 `indexer_seen` **语义相同、写法却相反**（一个合并、一个整行覆盖）是**遗漏**，不是设计：`facts.found` 的**唯一**输入是**当天**的 `info.current.log`，日志跨天一滚动（`info.current.log` → `info.YYYY-MM-DD.log`），下一次 sync 就拿不到那批 Found 行 ⇒ 整列被抹成 `[]`；而 **SEEDING 的行不会再被搜** ⇒ **永不恢复**。生产见证：同一张 605 行的表 **09-12 非空 215 部 → 09-14 变 0 部**（215 那个数见 `SUMMARY` 的「`on (\S+) by` → `on (.+?) by`」一节）。钉四格：★★ **跨天滚动后旧值不许丢**、新站来了要**并集**（不是替换）、源头不再造 `"A|B"` **合体标签**、老库残留的合体标签要**拆开**再并（读侧 `_sites()` 按 JSON 数组**逐项**取，不认里面的 `\|`）。★ 另两组对照：**单调的只有这一列**（`matched_hashes` 仍被整行覆盖、`stage` 照旧会塌、searchee 落到别的包时三者表现完全不同），以及 per-站展开**没有**污染计数（`matched` 从 `\|hashes\|` 个元组变成 `\|hashes\|×\|站\|` 个，`matched_hashes` / `seeding_count` 仍须原样）。★★ **红过再绿**：回退 `state.py` 那两个 hunk ⇒ **红 4 条**，恰好就是「跨天不丢 / 并集 / 拆合体 / 别的包仍保留」那一族 |
 | `test_sync_empty_sets.py` | 31 | `sync_movie` 整行覆盖写 + 四个空集的后果：**SEEDING 塌成 PENDING 是降级不是删行**（连 `searched_indexers` 都被抹掉），而 `indexer_seen` 是**合并**保留的 → `next_retry_at` 被推到未来一整个周期 = **额度悄悄烧掉一轮**；端到端钉「一条计数器 / 两条静默通道」——searchee 落到**别的包**（`other_pack`）与**认不出的名字**（`unresolved`）后果一模一样，**只有后者会喊** |
 | `test_iyuu_watch.py` | 30 | IYUU 辅种条数（§18.8 的唯一生产级证伪点）：**重构没改行为**（`qbit_torrents` 的 URL 仍是老那个字面量 —— 它在每 15 分钟的热路径上）、中文 tag 必须被百分号编码（URL 要纯 ASCII）、`iyuu_watch` **三种情形都不许抛**、以及 **数字真的进了 `metrics`**（TSV 只记 metrics 不记正文，"看着发了其实没留痕"肉眼看不出来） |
 

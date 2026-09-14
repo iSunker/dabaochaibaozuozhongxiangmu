@@ -1480,7 +1480,23 @@ class StateStore:
         old_seen: dict[str, str] = _d(row["indexer_seen"])
 
         matched_hashes = {h for h, _ in matched if h}
-        matched_indexers = {i for _, i in matched if i}
+        # ★ `matched_indexers` 是**单调事实** —— 这部片在这个站匹配过，就是匹配过。
+        #   与 `indexer_seen` **同语义**，所以同样**与旧值取并集**；不像其它列那样
+        #   整行覆盖写。（两列语义相同、写法相反，是**遗漏**不是设计。）
+        #
+        #   ★★ 不并的后果（2026-09-14 实测 #73）：`found` 的唯一输入是**当天**的
+        #   `info.current.log`（见 `sync_pack` 里那段），而这一列每次 sync 都**重算**。
+        #   日志跨天一滚动，下一次 sync 就拿不到那批 Found 行 ⇒ 整列被抹成 `[]`；
+        #   而 SEEDING 的行**不会再被搜** ⇒ **永不恢复**。
+        #   实测见证：同一张 605 行的表，09-12 非空 **215 部** → 09-14 **0 部**
+        #   （215 那个数见 SUMMARY「`on (\S+) by` → `on (.+?) by`」一节）。
+        #
+        #   ★ 旧值要**逐个站名拆开**再并：老库里可能躺着 `"A|B"` 这种**合体标签**
+        #   （旧 `sync_pack` 用 `"|".join` 造的）。读侧（`_sites()`）是按 JSON 数组
+        #   **逐项**取的，不认里面的 `|` —— 直接并会把它当成一个假站名原样留着。
+        old_matched_idx = {p for s in _u(row["matched_indexers"])
+                           for p in str(s).split("|") if p}
+        matched_indexers = old_matched_idx | {i for _, i in matched if i}
         seeding_count = len(matched_hashes & seeding_hashes)
 
         stage = compute_stage(
@@ -2251,9 +2267,16 @@ def sync_pack(
         skipped = skipped - searched
         hashes = set(db_matched.get(d, set()))
         found_idx = {i for _, i in facts.found.get(d, [])}
-        matched = [(h, "") for h in hashes]
-        if found_idx:
-            matched = [(h, "|".join(sorted(found_idx))) for h in hashes]
+        # ★ 每 (hash, 站) 一个二元组 —— **不再把多个站用 `"|"` 合成一个标签**。
+        #   合体标签有两处坏处：
+        #     ① `matched_indexers` 里会躺着一个叫 `"A|B"` 的**假站名**，而读侧
+        #        （`_sites()`）按 JSON 数组逐项取，不认里面的 `|`；
+        #     ② 一旦要「与旧值取并集」（见 `sync_movie`），并集在合体元素上
+        #        **根本没有定义** —— `{"A|B"} ∪ {"A"}` 该是几个？
+        #   所以**在源头**就按站拆开，让下游拿到的就是集合意义上的并集。
+        #   `found_idx` 为空时退回一个空标签，`sync_movie` 那侧会把它滤掉
+        #   （`if i`）—— 那正是"这次没解析到 Found 行"的正常情形。
+        matched = [(h, ix) for h in hashes for ix in (sorted(found_idx) or [""])]
 
         new_stage = store.sync_movie(
             row["id"],
