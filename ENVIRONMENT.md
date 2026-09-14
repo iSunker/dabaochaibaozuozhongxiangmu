@@ -212,8 +212,19 @@ NAS 上还跑着**别人的**容器（IYUU Plus、另一套 qB、opencd），它
 `/volume2/docker_ssd`（SSD，compose + 配置 + 库）。★ 归属表见上面「关键取值速查」，别靠路径猜。
 
 **硬链接约束**：源与 `LINK_DIR` **必须同一物理卷** ⇒ 这决定了几乎所有路径决策
-（`build-farm.sh` 用 `stat -c %d` 比设备号，比的正是这件事）。
-`/volume1/video` 与 `/volume1/docker_ssd` 是**两个卷**，所以 `LINK_DIR` 不能挪到 SSD。
+（`build-farm.sh` 用 `stat -c %d` 比设备号，比的正是这件事 —— ★ 该判据**只在 NAS 侧成立**，见本节末 ★）。
+`/volume1/video` 与 `/volume2/docker_ssd` 是**两个卷**，所以 `LINK_DIR` 不能挪到 SSD。
+（★ 2026-09-14 更正：这里原写 `/volume1/docker_ssd` —— 那**正是本段上一行那条错法**的实例。）
+
+**卷归属怎么核**（★ 2026-09-14 复核：下面两条**独立来源逐格吻合**）：
+- **从 Windows** 跑 `df -h //iSunker-DS423/<共享>` —— 它按**底层文件系统**分组，实测 8 个共享
+  **8/8 正确**（`video`/`Download`/`homes`/`drive`/`web`/`docker` → 56 T / 100%；
+  `docker_ssd`/`qb_temp` → 448 G / 33%）。
+- **群晖自己的报告**：Storage Analyzer 的 `share_list.csv` **带 `Volume` 列**
+  （`…/home/存储空间分析器/synoreport/StorageAnalysisReport/<时刻>/csv/`，**每周三 04:07** 自动生成、
+  无凭据；`scripts/sa-volume-usage.py` 已在读它）。
+- 原来的 `ContainerManager/all_shares` **只在 NAS 上**读得到 —— 上面两条是
+  **Windows 侧第一次能独立复核卷归属**的通路（本机没有 SSH，见 `A.2` 的 ★）。
 
 **水位与行为**：`/volume1` 接近满 ⇒ **ENOSPC 会级联** —— 波及 cross-seed 注入、IYUU 辅种、
 甚至**日志**（实测：卷剩 0 字节时 `say` 的 stdout 坏掉，`set -e` 带走整趟，见 `ERR-SH-06`）。
@@ -226,6 +237,16 @@ NAS 上还跑着**别人的**容器（IYUU Plus、另一套 qB、opencd），它
 
 > ★ **AI 最常忘的一条**：**「同一物理卷」不等于「同一路径前缀」。**
 > 判断硬链接可行性要看**设备号**，不是看字符串开头像不像。
+>
+> ★★ **但那枚探针只在 NAS 侧成立 —— 搬到 Windows/SMB 侧，它对「任何一对」都说「不同」。**
+> 2026-09-14 实测 `stat -c %d //iSunker-DS423/<共享>`：**十个共享十个互不相同的号**，
+> 含**同属一个卷**的 `video`(403405124) / `Download`(864492843) / `homes`(2727544675) /
+> `drive`(12209342) / `web`(2153088345) / `docker`(4258917541) ⇒ **分辨力为零**
+> （它对 `docker_ssd` ≠ `video` 恰好说对，**是巧合**）。
+> **Windows 侧的对照量是 `df`**（见上面「卷归属怎么核」）。
+> `build-farm.sh` 的 `stat -c %d` 闸**跑在 NAS 上，是对的**；但该脚本的注释自承
+> **也可以从 Windows/SMB 跑** —— 真那么跑，它会把**每一个源目录**都判成
+> 「与农场不在同一物理卷，跳过」。
 
 ## A.4 服务清单与资源共享
 
@@ -520,8 +541,12 @@ NAS 上还跑着**别人的**容器（IYUU Plus、另一套 qB、opencd），它
 - **环境前提**：DSM 上 `video` 与 `docker_ssd` 这类共享文件夹**分属两个不同的卷**，路径前缀却都是 `/volumeN/...`。
 - **根因**：共享文件夹 → 卷的映射是 DSM 的元数据，**不体现在路径字符串里**。
 - **触发条件**：任何"按路径前缀判断是不是同一块盘"的推理。
-- **规避做法**：读 `ContainerManager/all_shares`；硬链接判据一律用 `stat -c %d` 比设备号。
+- **规避做法**：读 `ContainerManager/all_shares`（★ 2026-09-14 补：**它只在 NAS 上读得到** ——
+  从 Windows 侧有两条替代通路，见 `A.3` 的「卷归属怎么核」）；硬链接判据一律用 `stat -c %d`
+  比设备号（**仅 NAS 侧**成立，Windows/SMB 侧零分辨力，见 `A.3` 末 ★）。
 - **怎么发现的**：2026-09-13 复测补上"卷归属表"那一格（SUMMARY §9 原话：当时没记，只写了两个挂载点）。
+  ★ 2026-09-14 复核：`df`（Windows 侧）与群晖 Storage Analyzer 的 `share_list.csv`
+  **两条独立来源逐格吻合**（`docker_ssd`/`qb_temp` 在 `cachedev_0`；`video` 等 6 个在 `cachedev_1`）。
 - **边界**：DSM 专有。★ 与 `A.3` 的 ★ 是同一条知识的两种表述（一个在前提层、一个在错误层），**都留**。
 
 ### ERR-DSM-04 `/etc/ssmtp/ssmtp.conf` 是 **0 字节空壳**，真路径是 `/usr/syno/etc/synosmtp.conf`
@@ -748,6 +773,8 @@ NAS 上还跑着**别人的**容器（IYUU Plus、另一套 qB、opencd），它
 - **触发条件**：把 `LINK_DIR` 指到 SSD 上"图省事"。
 - **规避做法**：`LINK_DIR` 必须在 `/volume1/video` 下。
   `build-farm.sh` 用 **`stat -c %d` 比设备号**做闸；compose 里对相关服务都是 `/volume1/video:/volume1/video` **1:1 挂载**。
+  ★ 该 `%d` 闸的**适用范围**：只在 NAS 侧成立（本脚本就跑在 NAS 上）——
+  Windows/SMB 侧零分辨力，见 `A.3` 末 ★。
 - **怎么发现的**：设计期就确认（SUMMARY §2、§10.5.4）。
 - **边界**：通用文件系统规律。★ 但**判可行性要看设备号**，不是看路径前缀像不像（`A.3` 的 ★）。
 
@@ -756,7 +783,8 @@ NAS 上还跑着**别人的**容器（IYUU Plus、另一套 qB、opencd），它
 - **环境前提**：DSM 上多个共享文件夹映射到同一个卷；容器里又是 1:1 挂载。
 - **根因**：路径是**视图**，设备号才是**本体**。
 - **触发条件**：用路径字符串做同卷判断。
-- **规避做法**：`stat -c %d`。
+- **规避做法**：`stat -c %d`（**仅 NAS 侧**；Windows/SMB 侧它对任何一对都返回「不同」——
+  实测设备号见 `A.3` 末 ★）。
 - **怎么发现的**：与 `ERR-DSM-03` 同源。
 - **边界**：★ 与 `A.3` 的 ★ 是同一条知识的两种表述，**都留**（一个在前提层、一个在错误层）。
 
