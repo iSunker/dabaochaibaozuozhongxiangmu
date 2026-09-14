@@ -76,7 +76,13 @@ def call(path, data=None):
 
 
 def depth(p, n):
-    """路径前 n 段。空路径给「(空)」—— ★ 空**本身就是信号**（qB 没建立起内容路径）。"""
+    """路径前 n 段。**真空串**给「(空)」。
+
+    ★ 2026-09-14 改（#63）：旧注释写「空**本身就是信号**（qB 没建立起内容路径）」
+    —— 错。空有两个来源，`depth()` 这一层**区分不了**：接口真返回了空串，还是
+    那个键**压根不存在**（`dict.get` 给 None）。后者不是信号，是**取错了接口**。
+    区分放在调用处：**缺键有它自己的字面**（见 main() 里那份 dump）。
+    """
     seg = [s for s in (p or "").replace("\\", "/").split("/") if s]
     return "/" + "/".join(seg[:n]) if seg else "(空)"
 
@@ -142,18 +148,30 @@ def main():
         # ★ 挑一条看数值属性。**按 hash 排序取第一条**，不取 sel[0] ——
         #   torrents/info 的顺序不保证，取 sel[0] 会让同一现场每次挑到不同种子，
         #   于是"上次读到的那个数"对不上，"排查"变成"追一个会动的靶子"。
-        #   路径字段一律过 depth() 再打 —— content_path 为空是**信号**
-        #   （qB 没能建立起内容路径），不是缺数据。
+        #
+        # ★★ 2026-09-14 修（#63）：「**键不存在**」与「**值是空**」必须印成两种字面。
+        #   旧版一律 `v = pr.get(k)` 再 `depth(v, 4)` ⇒ 缺键给 None ⇒ 印成「(空)」，
+        #   注释又把它解释成"qB 没能建立起内容路径"。实测 qB v4.6.5 的
+        #   `/api/v2/torrents/properties` **压根不返回 content_path** —— 那不是信号，
+        #   是**取错了接口**（它长在 torrents/info 上）。假读数比不读数更坏：
+        #   它让人去查「qB 为什么不知道」，而真相是「我们问错了接口」。
+        #   判据：**两种形态在输出里分得开** ——「(字段不存在)」只对应缺键。
         h = sorted(t["hash"] for t in sel)[0]
         try:
             pr = json.loads(call("/api/v2/torrents/properties?hash=" + h))
             print("\n=== 挑 1 条（%s…，路径照脱敏）的属性 ===" % h[:8])
             for k in ("save_path", "download_path", "content_path", "total_size",
                       "total_downloaded", "seeds", "peers", "dl_speed"):
+                if k not in pr:              # ★ 缺键 ≠ 空值
+                    print("  %-18s (字段不存在)" % k)
+                    continue
                 v = pr.get(k)
                 if k in ("save_path", "download_path", "content_path"):
-                    v = depth(v, 4)          # ★ 空 → "(空)"
+                    v = depth(v, 4)          # 只有真空串才给 "(空)"
                 print("  %-18s %s" % (k, v))
+            if "content_path" not in pr:
+                print("  ★ content_path **不在这个接口的返回里** —— 要读它得走 "
+                      "/api/v2/torrents/info 的同名键（本脚本上面已经取过 info）。")
             print("  ★ total_downloaded / total_size 才是「下了多少」的真相：")
             print("    progress 是四舍五入到 4 位的，0.0000 不等于零字节。")
         except Exception as e:
