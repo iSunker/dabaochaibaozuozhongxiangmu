@@ -699,9 +699,40 @@ do_digest() {
 
     _batches=$(printf '%s\n' "$_lines" | grep -c '	batch	' || true)
     _alerts=$(printf '%s\n' "$_lines" | grep -c '	alert	' || true)
+
+    # ★★ 「批次」不能按 kind 数 —— **每日台账与「全部包已无待搜项」也是 kind=batch**
+    #   （走 batch 是为了「记账但不发信」，见 drive-loop.py 里那两处 emit）。
+    #   照 kind 数会把它们算成批次：09-13+09-14 那两窗数出 17，而真批次只有 12。
+    #   判据取「metrics 里有没有 `pack=`」—— 本批完成带它，台账（`day=`）与
+    #   无待搜（`packs=`）都不带。★ 注意是**整个键**相同，不是前缀：
+    #   `packs=` 的键是 `packs`，不等于 `pack`。
+    # ★ 求和一档的判据是「**键在不在**」，不是「值等不等于 0」—— 与 #63/#64 同一
+    #   形状：`ok=0` 是真读数，「这行没有 ok 键」是另一回事，当成 0 就是假读数。
     printf '最近两次运行窗口\n'
-    printf '  批次 : %s\n' "${_batches:-0}"
-    printf '  告警 : %s\n\n' "${_alerts:-0}"
+    printf '%s\n' "$_lines" | grep '	batch	' | awk -F'\t' -v n_alert="${_alerts:-0}" '
+      function kvget(s, k,   n, i, p, a) {
+        n = split(s, a, " ")
+        for (i = 1; i <= n; i++) {
+          p = index(a[i], "=")
+          if (p > 1 && substr(a[i], 1, p - 1) == k) return substr(a[i], p + 1)
+        }
+        return ""
+      }
+      {
+        if (kvget($4, "pack") == "") { other++; next }   # 台账 / 无待搜：不是一批
+        n++
+        if (kvget($4, "ok") == "0") zero++
+        v = kvget($4, "newly_seeding"); if (v != "") ns += v
+        v = kvget($4, "backoff_hits");  if (v != "") bh += v
+      }
+      END {
+        printf "  本批运行 : %d 批（ok=0 的 %d 批 / 新增做种 %d / 退避 %d 次）\n",
+               n, zero, ns, bh
+        if (other > 0)
+          printf "  非本批   : %d 条（kind=batch 但无 pack= 键：台账 / 无待搜，未计入上面的批次）\n",
+                 other
+        printf "  告警     : %s\n\n", n_alert
+      }'
 
     printf '批次明细（时间 / 包 / 指标）\n'
     printf '%s\n' "$_lines" | grep '	batch	' | awk -F'\t' '{printf "  %s  %s\n      %s\n", $1,$3,$4}' || true
