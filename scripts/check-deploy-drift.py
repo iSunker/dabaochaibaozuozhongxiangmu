@@ -176,6 +176,12 @@ LOCAL_ONLY = [
     #   key 从生产 .env 读；**不调 `/api/v1/indexer`**（那个响应带 fields：cookie/passkey）；
     #   站名只从 cross-seed.db 取 id/name 两列（url/apikey 那两列带凭据）。
     (r"^scripts/prowlarr-indexerstatus\.py$",     "Prowlarr 本地禁用探针（在 Windows 上跑；读 NAS .env 的 key 但绝不打印、只打白名单字段）"),
+    # ★ 2026-09-15：#109（Prowlarr key 轮换）的前置探针。与上面那条是**同一形状**
+    #   （只读 + 不回显凭据 + 只打白名单字段）。
+    #   它多守一条**阴性对照**：验 key 时同时发「假 key」与「不带 key」两组，
+    #   否则端点要是压根不校验，那个 200 什么也证明不了。
+    #   只用 `t=caps`（Prowlarr 本地定义回答，**不打 PT 站**）—— 所以站点退避时也能跑。
+    (r"^scripts/torznab-keycheck\.py$",           "Torznab key 有效性探针（在 Windows 上跑；读 NAS .env 的 key 但绝不打印，带阴性对照，只发 t=caps）"),
     # ★ 2026-09-14：群晖 Storage Analyzer 报告的只读读者。只读、无凭据（走 SMB 读报告目录），
     #   而且 zip 是**内存里**解、不落盘。它存在的理由是**留一句否定结论的证据**：
     #   「报告里没有可用空间」这个结论决定了一条待办（见 README 的 #77）。
