@@ -23,7 +23,7 @@ DOCS = Path(sys.argv[1] if len(sys.argv) > 1 else REPO).resolve()
 OUT = TOOLS / "out"
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from mdwalk import iter_lines as walk, scan_defects  # noqa: E402
+from mdwalk import doc_files, iter_lines as walk, scan_defects  # noqa: E402
 
 HEAD = re.compile(r"^(#{1,6})\s+(.*?)\s*#*\s*$")
 
@@ -47,7 +47,9 @@ def extract(path):
 def main():
     OUT.mkdir(parents=True, exist_ok=True)
     all_rows = []
-    files = sorted(DOCS.glob("*.md"))
+    # ★ doc_files 而非 DOCS.glob("*.md")：SUMMARY 的正文已拆到 summary/（2026-09-16），
+    #   只扫顶层会让 24 章的标题**静默**从标题树里消失。
+    files = doc_files(DOCS)
     if not files:
         print("[!!] %s 下没有 .md —— 文档目录传对了吗？" % DOCS)
         return

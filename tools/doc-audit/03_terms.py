@@ -19,7 +19,7 @@ DOCS = Path(sys.argv[1] if len(sys.argv) > 1 else REPO).resolve()
 OUT = TOOLS / "out"
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from mdwalk import iter_lines as walk, scan_defects  # noqa: E402
+from mdwalk import doc_files, iter_lines as walk, scan_defects  # noqa: E402
 
 
 def main():
@@ -31,7 +31,11 @@ def main():
              if t.strip() and not t.startswith("#")]
     OUT.mkdir(parents=True, exist_ok=True)
     rows = []
-    files = sorted(DOCS.glob("*.md"))
+    # ★ doc_files 而非 DOCS.glob("*.md")：SUMMARY 正文已拆到 summary/（2026-09-16）。
+    #   ★ 注意口径变了：文件数由 3 变 27，于是下面「跨 >=2 个文件」的判据更宽了 ——
+    #     一条关键词若在 §13 和 §20 各出现一次，以前算「1 个文件」（同属 SUMMARY.md），
+    #     现在算「2 个文件」。**那是分章带来的，不是新出现的重复**，逐条过时要知道。
+    files = doc_files(DOCS)
     for f in files:
         for lineno, line in walk(f):
             for t in terms:

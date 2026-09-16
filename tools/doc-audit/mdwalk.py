@@ -78,6 +78,21 @@ def defects(path):
     return out
 
 
+def doc_files(root):
+    r"""三份文档的**全部** .md —— 顶层的三份 + `summary/` 下的分章。
+
+    ★ 2026-09-16：SUMMARY.md 的正文拆到了 `summary/`（入口留导航 + §N→文件 表）。
+      这里**必须**一起收进来，否则两件事会**静默**发生：
+        · 01_headings 的标题树少掉 24 章的全部标题；
+        · 02_refs 的「目标集合」建不起来 ⇒ **476 条 §N 引用全被判成悬空**。
+      「静默」正是本仓最防的失效形状，所以口径只在这一处定义，三个脚本共用。
+
+    ★ 用**显式两条 glob**，不用 `rglob`：rglob 会把 `tests/`、`patches/`、
+      `tools/` 下的 .md 一并收进来 —— 那是**另一种**悄悄改口径。
+    """
+    return sorted(list(root.glob("*.md")) + list(root.glob("summary/*.md")))
+
+
 def scan_defects(paths):
     total = 0
     for p in paths:

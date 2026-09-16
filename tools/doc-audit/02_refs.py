@@ -30,7 +30,7 @@ DOCS = Path(sys.argv[1] if len(sys.argv) > 1 else REPO).resolve()
 OUT = TOOLS / "out"
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from mdwalk import iter_lines as walk, scan_defects  # noqa: E402
+from mdwalk import doc_files, iter_lines as walk, scan_defects  # noqa: E402
 
 REF_SEC = re.compile(r"§\s?(\d+(?:\.\d+){0,3})")
 REF_ERR = re.compile(r"\bERR-([A-Z]+)-(\d{2})\b")
@@ -47,7 +47,10 @@ HEAD_ANY = re.compile(r"^#{1,6}\s+(.*?)\s*$")
 
 def collect(root):
     secs, errs, abs_, heads = set(), set(), set(), {}
-    for f in sorted(root.glob("*.md")):
+    # ★★ 目标集合必须从**全部**文档建（含 summary/）。SUMMARY 的正文 2026-09-16 拆走了，
+    #    只扫顶层的话 secs 里就没有 `## 14.` 这些编号 ⇒ **476 条 §N 引用全被判成悬空**。
+    #    而那是**静默**的：工具照样跑完、照样输出一张看起来很正常的表。
+    for f in doc_files(root):
         title_set = set()
         for _, line in walk(f):
             for rx, bag in ((HEAD_SEC, secs), (HEAD_ERR, errs), (HEAD_AB, abs_)):
@@ -85,13 +88,13 @@ def main():
     if not heads:
         print("[!!] %s 下没有 .md —— 文档目录传对了吗？" % DOCS)
         return
-    scan_defects(sorted(DOCS.glob("*.md")))
+    scan_defects(doc_files(DOCS))
     print("目标集合：编号标题 %d · ERR 条目 %d · A/B 条 %d · README 标题 %d · ENV 标题 %d\n"
           % (len(secs), len(errs), len(abs_),
              len(heads.get("README.md", ())), len(heads.get("ENVIRONMENT.md", ()))))
 
     rows = []
-    for f in sorted(DOCS.glob("*.md")):
+    for f in doc_files(DOCS):
         for lineno, line in walk(f):
             hint = line.strip()[:80]
             for m in REF_SEC.finditer(line):
