@@ -509,8 +509,13 @@ sudo docker logs --tail=400 reseed-cross-seed 2>&1 | grep -iE '429|retry-after|r
 | 12:24:28.2 | Prowlarr 把 SiteA 标为不可用 → 回给 cross-seed **429**，`snoozing until 12:25:28` |
 | 12:24:28 → 12:24:29 | 剩余 **295 条**全部 `Skipped searching on indexers`，**1.5 秒**推到 `(384/384)` |
 
-> cross-seed 的行为是：索引器被退避时，**待搜索项直接跳过，不排队、不重试**。
-> 所以进度条走完 ≠ 搜索做完。**这是本项目最容易误判的一个坑。**
+> cross-seed 的行为是：**可用的索引器被退避到「一个都不剩」时**，待搜索项**直接跳过，
+> 不排队、不重试**。所以进度条走完 ≠ 搜索做完。**这是本项目最容易误判的一个坑。**
+>
+> ⚠️ **前提不能省**（2026-09-16 补）：跳过只在**过滤后一个站都不剩**时发生。只禁掉
+> 1 个站、其余还健康时，cross-seed 会**用剩下的站照常搜**，一条都不跳。本次之所以
+> 295 条全跳，是因为当时**只有 HDFans 一个站在扛**（当天 12:24 之前的日志里没出现过
+> 别的站）。反例与实测见 §11.13 末尾的「前提更正」。
 
 #### 真实命中率（把 87 条真搜过的与 `unmatched.tsv` 求交集）
 
@@ -1946,6 +1951,8 @@ cross-seed 的 `webhook` 是**单线程顺序处理**的：
 2. 逐个搜索 → 第 89 个（勇敢的心）时 HDFans 返回 429
 3. **标记 HDFans 为"临时禁用"**（snooze 1 分钟）
 4. 后续所有 searchee **直接跳过**，不再尝试搜索
+   ★ 注意此时**一个可用站都不剩**（当天 12:24 之前的日志里只有 HDFans）。
+   若还剩别的健康站，cross-seed 会**用那些站继续搜，不跳** —— 见本节末尾的「前提更正」。
 5. 1 分钟后（12:25:28）HDFans 恢复，但**webhook 已经处理完了**
 
 **所以**：
@@ -1980,6 +1987,42 @@ sqlite3 cross-seed.db "select count(*) from timestamp"
 python scripts/reseed-state.py todo --pack frds-top250-2024 --indexers SiteA,SiteB
 # → SKIPPED 会排在最前面，且被计入待办
 ```
+
+**★ 前提更正（2026-09-16 补）**：
+
+上面那条机制的**前提是「过滤后一个站都不剩」**，不是「有站在退避」。
+只禁掉一部分站、其余还健康时，cross-seed 会**用剩下的站照常搜**，一条都不跳。
+
+| 日期 | 被退避的站 | 退避时长 | 当天真被处理的 searchee | `Skipped searching` |
+|---|---|---|---|---|
+| 09-11 | HDFans（当天 12:24 前日志里**只有它**） | 1 分钟 | —（本批 384 条走到第 89 条触发） | **296** ← 阳性对照 |
+| 09-13 | HDtime | 00:00:56 → **次日 11:32:28**（撞 24h 上限） | **95**（用 BTSCHOOL/HDFans/NanyangPT 搜的） | **0** |
+| 09-14 | HDtime | 同上 | 9（drive-loop 只发出这么多） | 0 |
+| 09-15 | HDtime | 同上 | 18 | 0 |
+| 09-16 | HDtime（13:32 解禁） | — | 327 | 0 |
+
+**为什么 09-13 是这条的关键一格**：那天 HDtime 从 00:00 被 snooze 到**次日** 11:32，
+但 cross-seed 仍然处理了 **95 个 searchee**、**0 条被跳** —— 用的是剩下三个站。
+09-14/09-15 只有 9/18 条出去，样本太小，单看它们说明不了问题（没东西可跳）。
+
+**可复现**：
+
+```bash
+L=//iSunker-DS423/docker_ssd/prowlarr_cross-seed_autohardlink/cross-seed/logs
+grep -c "Skipped searching" $L/info.2026-09-13.log    # → 0
+grep -c "Skipped searching" $L/info.2026-09-11.log    # → 296（阳性对照）
+grep -n "HDtime"            $L/info.2026-09-13.log    # → 10 行，全是 429/snooze，没有一次搜成
+```
+
+**★ 这条前提改写了一个运维判据**：`drive-loop` 原来只要**有一个站**要等到超过
+`--max-wait`（默认 30 分钟）就中止整批 —— 于是 09-13~09-15 那三天，
+健康的三个站在干等 HDtime，49 批里 17 批「发出 0 条」，发出率
+94.8% → 27.7% → 3.7% → 7.1%。判据已改为**「名单里的站是不是全都落在退避里」**，
+还剩健康站就照发；不知道配了哪些站时（没给 `--indexers`）**退回旧行为**（照旧中止）。
+实现在 `orchestrator/state.py` 的 `DriveSession.wait_out_backoff`（判据本体，
+不用另找文档）；`--indexers` 与库里站名的归一化只有一份实现，见同模块的
+`norm_indexer_name`（它同时被 `scripts/drive-loop.py` 的 `check_indexers` 用，
+两处必须同一把尺）。回归测试在 `tests/test_backoff.py` 的 ⑨⑩⑪⑫。
 
 ---
 

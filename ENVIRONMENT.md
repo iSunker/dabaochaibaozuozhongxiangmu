@@ -199,8 +199,11 @@ NAS 上还跑着**别人的**容器（IYUU Plus、另一套 qB、opencd），它
 - ❌ 别 `cp` 生产 SQLite 库来做诊断（丢 WAL，`ERR-SQL-01`）
 
 **要在"批次间隙"才能做的事**：`deploy.sh --apply`（覆盖正被 `sh` 读的脚本）、`--force-recreate`。
+（★ 判「批次在不在跑」看 `.drive-loop.state` 的 `running_pid`；**逐个动作的允许条件表 + 改动前自检清单在 README「开工前的两道门」**。）
 
-**一次只能一条的动作**：qB 的 `setLocation`（触发重校验，而 `max_active_checking_torrents=1`）。
+**一站一批的动作**：qB 的 `setLocation` —— 按 `save_path` 分组、一批一次调用（实测 500 条只有 3 个
+`save_path` ⇒ **3 次调用，不是 500 次**）；它触发重校验，而 `max_active_checking_torrents=1`。
+**唯一要避开的是种子的在途状态**：`checkingDL` / `checkingUP` / `moving` / `allocating`。
 
 > ★ **AI 的边界**：**只读随便做；写操作一律走「给命令、人执行」。**
 > 这不是保守 —— 是环境**没有 SSH**，本机根本不能在 NAS 上执行命令。
@@ -1058,10 +1061,10 @@ NAS 上还跑着**别人的**容器（IYUU Plus、另一套 qB、opencd），它
   直接抛 `TypeError` —— **不是等到调用**。而且它崩在 `logging` 配置**之前**。
 - **触发条件**：文件里通篇用了 3.10+ 的注解语法，且**没有** `from __future__ import annotations`。
 - **规避做法**：文件顶部**必须有** `from __future__ import annotations` —— **不能删**。
-- **怎么发现的**：`attempts.log` 记到 `start py=/usr/bin/python3` + `exit=0`、
-  旁边生出 `__pycache__/*.cpython-38.pyc` ⇒ 版本坐实；README「NAS 侧一次性配置」的「同一个 `python3` 也是 drive-loop 的解释器」那段。
+- **怎么发现的**：版本坐实见 `ERR-DSM-08`（`attempts.log` + `__pycache__/*.cpython-38.pyc`）；
+  README「NAS 侧一次性配置」的「同一个 `python3` 也是 drive-loop 的解释器」那段。
 - **边界**：★ 只在 **< 3.10** 成立。但**症状（静默）在任何版本不匹配时都一样** ——
-  所以 `run.sh` 在 shell 层另记一份 `attempts.log`，用来区分"python 没起来"与"python 崩了"。
+  兜底（`run.sh` 另记 `attempts.log`）见 `ERR-DSM-08`。
 
 ### ERR-PY-02 `locale` / `encoding` 默认值：`isatty()` 对 NUL 返回 True
 - **症状**：脚本以为自己在跟终端说话，其实输出被重定向 / 接到了 NUL。
@@ -1100,7 +1103,9 @@ NAS 上还跑着**别人的**容器（IYUU Plus、另一套 qB、opencd），它
 - **环境前提**：qB v4.6.5 / WebAPI 2.9.3。
 - **根因**：`setLocation` 会触发**重新校验**，而校验队列**一次只跑一条**。
 - **触发条件**：批量 `setLocation`（本项目一次 509 条）。
-- **规避做法**：**一次只能一条**地规划；搬完等它校完（`wait-for-checks.py`）。
+- **规避做法**：**不是"一条一条地调"** —— 调用按 `save_path` 分组、一批一次（500 条只有 3 个
+  `save_path`），规则本体在 `A.2`。**能避开的只有"在途时别碰"**；避不开的是排队 —— 队列单槽，
+  一大批下发后照样会出现一波 `checkingUP` ⇒ 搬完等它校完（`wait-for-checks.py`）。
 - **怎么发现的**：搬迁后 145 条卡住；README「🔴 下一步」第 12 条（校验队列疑似卡死，卡住 145 条）。
 - **边界**：★ **"卡住"的判据要小心**：已排除三种（497 个文件逐个 `stat` 全部大小相符、`save_path` 无映射失败、
   不是缺文件）⇒ 剩下的"**校验队列/校验器卡住**"**仍是"最符合证据的解释"，不是已坐实**。
