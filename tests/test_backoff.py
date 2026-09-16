@@ -333,6 +333,42 @@ st11, _, _ = run_session(db11, n=12, max_wait=1800.0)
 ck("说不知道就照旧中止", bool(st11.aborted), True)
 ck("一条都没发", st11.sent, 0)
 
+print("\n== ⑬ 退避时刻**必须带日期**（#114：跨午夜分不清今天/明天）==")
+#   ★ 现场（2026-09-15 13:39 的 drive-loop.log）：
+#     `!  索引器 HDtime 被限流（RATE_LIMITED），解禁 01:31:11`
+#   看着像"当天凌晨"，实际是**次日** 01:31 —— cross-seed 侧窗口跳到了明天。
+#   同一时间轴上 4 行之外还有 Prowlarr 侧的 `disabledTill 09-16 13:32`，
+#   两个读数差 12 小时，**审阅时被当成"其中一个抄错了"**。
+#   ⇒ 判据：那条 warn 正文里必须能看见**日期**。
+#
+#   ★★ 要走到那条 warn，条件很具体（第一版测试就栽在这）：
+#     `:2533` 的 warn **只在 snoozed 里发** —— 即「状态是限流类 **且** 解禁时间已过」。
+#     它不是 abort 那条路（`:2589` 本来就带完整日期），也不是 `:2592` 的 wait 那条。
+#     ⇒ 造一个**刚刚过期**的退避（`now - 1s`，复刻实测 HDFans 55 秒那种）。
+#   ★★ 而且**必须在批次中途**才触发：批前那一眼 `baseline` 为真、且
+#     `b.active()` 已为假 ⇒ 不算「新发生」。所以用 on_item 在第 2 条之后写库。
+db12 = make_db([(2, "HDFans", "OK", None, 1)])
+
+
+def expire_now(call_no, clock):
+    if call_no == 2:      # 解禁时刻 = 此刻 − 1 秒 ⇒ snoozed 且 active 为假
+        set_row(db12, 2, "RATE_LIMITED", ms(clock.t - datetime.timedelta(seconds=1)))
+
+
+_ev.clear()
+st12, sess12, clock12 = run_session(db12, n=8, on_item=expire_now,
+                                    on_event=lambda *a: _ev.append(a))
+_warn = " ".join(a[1] for a in _ev if a and a[0] == "warn")
+import re as _re
+ck("★ 真的走到了那条 warn（不是空集上做断言 —— 空集上任何正则都'成立'）",
+   bool(_re.search(r"被限流", _warn)), True)
+ck("退避正文里带**日期**（MM-DD HH:MM）",
+   bool(_re.search(r"\d{2}-\d{2} \d{2}:\d{2}", _warn)), True)
+#   ★ 阴性对照：**旧写法**（只有 HH:MM:SS）必须判不出来 ——
+#     否则上面那条判据是恒真的，等于没测。
+ck("阴性对照：只有 HH:MM:SS 的旧写法**判不出来**",
+   bool(_re.search(r"\d{2}-\d{2} \d{2}:\d{2}", "索引器 HDtime 被限流（RATE_LIMITED），解禁 01:31:11")), False)
+
 print()
 if fails:
     print(f"!!! {len(fails)} 个失败")

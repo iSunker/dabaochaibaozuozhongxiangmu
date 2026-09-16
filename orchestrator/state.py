@@ -2522,8 +2522,16 @@ class DriveSession:
                 #   若把"没见过"当成"新发生"，每一批开头都会白记一笔 → 永远 2 小时一跑。
                 if (fresh and not baseline) or (baseline and b.active(self._now())):
                     self.stats.backoff_hits += 1
+                    # ★★ 时刻**必须带日期**（2026-09-16，#114）：原来这里写 `%H:%M:%S`，
+                    #    于是 09-15 13:39 那行打出「解禁 01:31:11」—— **看着像当天凌晨**，
+                    #    而实际是**次日** 01:31（cross-seed 侧窗口跳到"明天"了）。
+                    #    同一个时间轴上 4 行之外还有 Prowlarr 侧的 `disabledTill 09-16 13:32`，
+                    #    两个读数差 12 小时，**审阅时被当成"其中一个抄错了"**——
+                    #    真相是**两把锁各有一个时刻**（见 ENVIRONMENT `ERR-SVC-17`）。
+                    #    ⇒ 跨午夜的时刻一律带日期，与 `:1028` / `:2574` / `:2581` 统一为
+                    #      `%m-%d %H:%M`；**判据**：`tests/test_backoff.py` 断言跨午夜输出里带日期。
                     self._on_event("warn", f"索引器 {b.name} 被限流（{b.status}）"
-                                   + (f"，解禁 {b.until:%H:%M:%S}" if b.until
+                                   + (f"，解禁 {b.until:%m-%d %H:%M}" if b.until
                                       else "，未给解禁时间"))
                 self._snooze_seen[b.name] = key
             if not blocking:
@@ -2582,7 +2590,10 @@ class DriveSession:
                     f"（{delta / 60:.0f} 分钟 > 上限 {self.max_wait / 60:.0f} 分钟）")
                 return False
             self._on_event("wait",
-                           f"索引器 {names} 退避中，等到 {soonest:%H:%M:%S}"
+                           # ★ 带日期（#114 同族）：这一路是"短等"（delta 秒级），
+                           #   跨午夜概率低，但**同一个函数里三种格式是不该的** ——
+                           #   见 `:2589`（带完整日期）、`:2526`（本次一并改成带日期）。
+                           f"索引器 {names} 退避中，等到 {soonest:%m-%d %H:%M:%S}"
                            f"（{delta:.0f}s）")
             self._sleep(min(delta + 2, self.max_wait))
             self.stats.waited_sec += min(delta + 2, self.max_wait)
