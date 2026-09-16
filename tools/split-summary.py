@@ -80,6 +80,7 @@ NAMES = {
     22: "matched_indexers恒空与HDtime的429",
     23: "卷归属复核与SMB探针分辨力",
     24: "SUMMARY分章与本轮收口",
+    25: "三轮收口与等触发",
 }
 
 
