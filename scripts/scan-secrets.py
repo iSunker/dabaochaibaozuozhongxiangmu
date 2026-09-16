@@ -51,9 +51,20 @@ ENV = REPO / ".env"
 FILES = sys.argv[2:]
 
 if not FILES:
-    out = subprocess.run(["git", "-C", str(REPO), "ls-files"],
-                         capture_output=True, text=True).stdout
-    FILES = [f for f in out.split("\n") if f.strip()]
+    # ★★ 必须 `-c core.quotepath=false` + `-z`（2026-09-17，`#119`/`ERR-GIT-04`）。
+    #    默认 `quotepath=true` 会把**非 ASCII 路径**输出成带引号 + 八进制转义：
+    #        "summary/00-\345\215\240\344\275\215\347\254\246..."
+    #    而本仓**大量文件名是中文**（`summary/*.md` 等 25 个）。旧写法下：
+    #      · `out.split("\n")` 拿到的是**带引号的字符串**，它不是真路径；
+    #      · 下游 `if not p.is_file(): continue` ⇒ **25 个文件全部静默跳过**；
+    #      · 屏幕上照旧打印「工作区零命中」—— **一个字的错都不报**。
+    #    ⇒ 实测：默认 111 个文件里有 25 个中文件名，全部没被扫过。
+    #    ★ 这也正是本脚本存在的理由（防凭据入库）被**它自己**绕过的那一格。
+    #    ★ 判据在下面那段「扫了几个文件」的自证里（数量对不上就报出来）。
+    out = subprocess.run(["git", "-C", str(REPO), "-c", "core.quotepath=false",
+                          "ls-files", "-z"],
+                         capture_output=True).stdout.decode("utf-8", "replace")
+    FILES = [f for f in out.split("\0") if f.strip()]
 
 
 def secret_shape(v):
@@ -144,6 +155,30 @@ print(f"从 .env 提取到 {len(needles)} 个**去重后**的凭据指纹"
       f"（{shapes_seen}；值本身不打印）")
 for k, s, why in skipped_needles:
     print(f"   · .env 的 {k} 按「{why}」跳过（不当成真实凭据；只报键名不报值）")
+
+# ---------- 1b) ★★ 自证：到底扫了几个文件（2026-09-17，`#119`）----------
+#   ★ 为什么这一步是**必须**的：这个脚本的**全部价值**在于"扫过整个仓库"。
+#     而它的失败方式恰恰是**静默** —— 见 `#119`/`ERR-GIT-04` 的实测：
+#     `core.quotepath` 默认 true ⇒ 非 ASCII 路径被转义 ⇒ `is_file()` 为假
+#     ⇒ **25 个 `summary/*.md` 全部跳过**，而屏幕上照旧打「零命中」。
+#   ⇒ 判据：**先说出扫了几个，再对期望数量立断言**。
+#     `_missing` 非空 = 有路径没读到文件 —— 那是**观测故障**，不是"干净"。
+_checked = 0
+_missing = []
+for rel in FILES:
+    if (REPO / rel).is_file():
+        _checked += 1
+    else:
+        _missing.append(rel)
+print(f"扫描范围：**{_checked}/{len(FILES)} 个文件**（git ls-files 给出 {len(FILES)} 个）")
+if _missing:
+    print(f"   ★★ 有 {len(_missing)} 个路径**读不到文件** ⇒ 本次扫描**不完整**，"
+          f"别把下面的「零命中」当结论：")
+    for rel in _missing[:5]:
+        print(f"      {rel[:90]}")
+    if len(_missing) > 5:
+        print(f"      …另有 {len(_missing) - 5} 个")
+    print("   ★ 常见成因：`core.quotepath` 把非 ASCII 路径转义了（见 ERR-GIT-04）。")
 
 # ---------- 2) 形状正则：不依赖 .env，兜住"换个站/换个 key"的情况 ----------
 # ★ 2026-09-12 阳性对照抓出的第三个 bug：`\b` 锚点在 `PROWLARR_API_KEY=` 上**不成立**
