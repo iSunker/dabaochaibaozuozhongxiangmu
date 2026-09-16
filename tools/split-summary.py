@@ -79,6 +79,7 @@ NAMES = {
     21: "IYUU保存目录与旧根漏网",
     22: "matched_indexers恒空与HDtime的429",
     23: "卷归属复核与SMB探针分辨力",
+    24: "SUMMARY分章与本轮收口",
 }
 
 
