@@ -389,7 +389,16 @@ log_event() {
     printf '%s\t' "$(field_of "$_f" ts)"
     printf '%s\t' "$(field_of "$_f" kind)"
     printf '%s\t' "$(field_of "$_f" title)"
-    printf '%s\n' "$(field_of "$_f" metrics)"
+    printf '%s\t' "$(field_of "$_f" metrics)"
+    # ★★ 第 5 列 `msg` = 正文**首个非空行**（2026-09-17，`#68`）。
+    #   为什么需要它：摘要的「告警明细」原来只打 `$1 $3`（时间 + 标题），
+    #   metrics 与正文**全丢** ⇒ 「观测对账：判据没走通」这种**标题里没有数**的告警，
+    #   读者**一个字都判不了**（fa=0 fb=0 就在 metrics 里，被丢了）。
+    #   ★ 为什么不改成打 `$4`（metrics）：metrics 是 `k=v k=v` 长串，
+    #     塞进明细行会把版面撑爆；而正文首行是**人写给人看的**那一句。
+    #   ★ 顺带收益：正文首行恰好**不含路径**（路径都在后面的「共 N 条：」里），
+    #     自动满足「正文只报数量」的老口径。
+    printf '%s\n' "$(body_of "$_f" | awk 'NF{print; exit}')"
   } >> "$LOGDIR/$_d.tsv"
 }
 
@@ -740,7 +749,14 @@ do_digest() {
 
     if [ "${_alerts:-0}" != "0" ]; then
       printf '\n告警明细\n'
-      printf '%s\n' "$_lines" | grep '	alert	' | awk -F'\t' '{printf "  %s  %s\n", $1,$3}' || true
+      # ★ 打 `$5`（正文首行，`#68`）—— 2026-09-17 起 `log_event` 才有这一列。
+      #   ★ **向后兼容**：旧行只有 4 列，`$5` 为空 ⇒ 用 `NF>=5 && $5!=""` 挡住，
+      #     那时行为与以前**一模一样**（只打时间 + 标题），不会打出空行或多一个空格。
+      #   ★ `$1`/`$3` 的位置**没动** —— 这是本条改动能安全落地的全部前提。
+      printf '%s\n' "$_lines" | grep '	alert	' | awk -F'\t' '{
+        printf "  %s  %s\n", $1, $3
+        if (NF >= 5 && $5 != "") printf "      %s\n", $5
+      }' || true
     fi
 
     printf '\n── 心跳 ──\n'

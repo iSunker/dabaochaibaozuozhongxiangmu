@@ -845,9 +845,43 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _guard_qbit_url(args) -> None:
+    """★ `--qbit-url` 指向 cross-seed 自己 ⇒ **当场说出来**（2026-09-17，`#66`）。
+
+    为什么值得一条断言：这两个 URL 在 README 里**挨着写**（`:1610-1611`）：
+        URL=http://192.168.0.7:2468     # cross-seed
+        Q="http://192.168.0.7:3060"     # ★必须带 --qbit-url
+    ⇒ 抄错一格（或把 `URL` 的值复制到 `--qbit-url`）**不会有任何提示**：
+      `orchestrator/qbit_client.py:83` 会拿它去请求 `/api/v2/app/version`，
+      而那个路径是 **qB 的**，cross-seed 只会回一句
+      `[server] Unknown endpoint: /api/v2/app/version` ——
+      **错在调用方，看起来却像 cross-seed 的问题**。
+    ★ 真实现场（`#66`）：2026-09-14 11:01:02 / 11:01:31 各一条，那天只有这两条，
+      其余每天 0 条 ⇒ 就是一次抄错端口。
+    ★ **为什么不"容忍"**：`--qbit-url` 给 cross-seed 的地址**永远是错的用途**
+      （cross-seed 不提供 qB 那种接口），没有任何场景需要它成立 ⇒ 直接挡下，
+      代价为 0。
+    """
+    u = getattr(args, "qbit_url", None)
+    if not u:
+        return
+    # 只比"主机:端口"里那个端口 —— scheme/host 写法在两种场合本来就不同
+    # （容器内 `cross-seed:2468` vs 宿主机 `192.168.0.7:2468`），拿全串比会漏。
+    import re as _re
+    m = _re.search(r":(\d+)(?:/|$)", u.strip())
+    if m and m.group(1) == "2468":
+        _say(f"[!!] `--qbit-url {u}` 看着是 **cross-seed 自己**（端口 2468），"
+             f"不是 qB。\n"
+             f"     qB 在 **:3060**；拿 2468 当 qB 会让 cross-seed 的日志里出现\n"
+             f"     `[server] Unknown endpoint: /api/v2/app/version`——\n"
+             f"     **错在调用方，但看起来像 cross-seed 出问题**（见 #66）。\n"
+             f"     本次仍继续（只是少一个数据源，见下面那行 `[!!]`）。")
+
+
 def main(argv: list[str] | None = None) -> int:
     _safe_stdout()
     args = build_parser().parse_args(argv)
+    _guard_qbit_url(args)
     try:
         return args.func(args)
     except FileNotFoundError as e:

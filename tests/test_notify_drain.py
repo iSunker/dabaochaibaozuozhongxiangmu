@@ -249,6 +249,40 @@ try:
 finally:
     lab.cleanup()
 
+print("\n── ⑥ ★★ TSV 第 5 列 `msg` = 正文首行，且旧行向后兼容（#68）──")
+#   ★ 为什么要有这一列：摘要的「告警明细」原来只打 `$1 $3`（时间 + 标题），
+#     metrics 与正文**全丢** ⇒ 「观测对账：判据没走通」这种**标题里没有数**的告警，
+#     读者一个字都判不了（fa=0 fb=0 就在 metrics 里）。
+#   ★ 判据**成对**：新行要有第 5 列，**旧行（4 列）不许被打出多余内容** ——
+#     否则摘要会凭空多一行空白，或者多打一个空格把版面弄乱。
+lab = Lab()
+try:
+    lab.event("1789274444219-14909-HDtime.txt", ALERT)
+    r = lab.run()
+    check("退出码 0", r.returncode == 0, "实际 %s" % r.returncode)
+    rows = [ln for ln in lab.logtext().splitlines() if "\talert\t" in ln]
+    check("记了一行 alert", len(rows) == 1, str(rows))
+    cols = rows[0].split("\t") if rows else []
+    check("★ 有第 5 列（不像以前那样只有 4 列）", len(cols) >= 5, "实际 %d 列" % len(cols))
+    check("★★ 第 5 列 = 正文首个非空行",
+          cols[4] if len(cols) > 4 else None,
+          "HDtime 此刻在退避（RATE_LIMITED）。")
+    check("★ 第 1/3/4 列位置**没动**（改动能安全落地的全部前提）",
+          (cols[0] if cols else None, cols[2] if len(cols) > 2 else None),
+          ("2026-09-13 12:40:44", "站点退避中：HDtime"))
+    #   ★★ 摘要渲染的阴性对照：**旧行（4 列）**走同一条 awk，不许多打任何东西。
+    #     直接调那段 awk 的等价逻辑（不启动整个 digest，避免发信）。
+    _lines = "2026-09-13 12:40:44\talert\t旧行没有第5列\tindexer=HDtime"
+    _out = subprocess.run(
+        ["awk", "-F\t", '{printf "  %s  %s\\n", $1, $3; '
+                        'if (NF >= 5 && $5 != "") printf "      %s\\n", $5}'],
+        input=_lines, capture_output=True, text=True, encoding="utf-8").stdout
+    check("★★ 旧行（4 列）摘要里**不出现**第 5 行（向后兼容）",
+          _out.count("\n") == 1,
+          "实际打出 %d 行：%r" % (_out.count("\n"), _out))
+finally:
+    lab.cleanup()
+
 print("\n" + ("✓ %d 条断言全过 —— 告警不会漏记，也不会被无限重发" % _n
               if _ok == _n else
               "✗ 有对照没过（%d/%d）—— 别拿它当推前闸门" % (_ok, _n)))

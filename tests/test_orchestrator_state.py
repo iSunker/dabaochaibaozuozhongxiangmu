@@ -183,6 +183,45 @@ with S.StateStore(DB, create=True) as st:
     names = [r["name"] for r in st.packs()]
 ck("  按名字升序", names, ["aaa-pack", "bbb-pack"])
 
+print("\n== ⑨ ★★ `--qbit-url` 指向 cross-seed（:2468）必须出声（#66）==")
+#   现场：2026-09-14 11:01:02 / 11:01:31，cross-seed 的 error 日志各一条
+#     `[server] Unknown endpoint: /api/v2/app/version`
+#   ⇒ 那两天里**只有那两条**，其余每天 0 条 ⇒ 一次抄错的端口。
+#   ★ 为什么这值得一条断言：`orchestrator/qbit_client.py:83` 请求的正是
+#     `/api/v2/app/version`（**qB 的**路径）⇒ 把 cross-seed 的地址给它，
+#     报错会出现在 **cross-seed 的日志里**，**看起来像 cross-seed 出问题**，
+#     而真正错的是调用方。这才是要挡的那一格。
+#   ★ 判据：两个方向都要钉 —— 该出声的出声、**不该出声的绝不出声**
+#     （尤其 `:12468` 不能被 `2468` 子串误伤）。
+import importlib.util as _ilu
+import argparse as _ap
+_rs_spec = _ilu.spec_from_file_location(
+    "reseed_state", os.path.join(REPO, "scripts", "reseed-state.py"))
+_rs = _ilu.module_from_spec(_rs_spec)
+sys.modules["reseed_state"] = _rs
+_rs_spec.loader.exec_module(_rs)
+
+
+def _guard_says(url):
+    """跑 _guard_qbit_url，返回它有没有出声。"""
+    import io as _io
+    buf, old = _io.StringIO(), _rs._say
+    _rs._say = lambda s: buf.write(str(s) + "\n")
+    try:
+        _rs._guard_qbit_url(_ap.Namespace(qbit_url=url))
+    finally:
+        _rs._say = old
+    return bool(buf.getvalue().strip())
+
+
+for _u, _want in (("http://192.168.0.7:2468", True),
+                  ("http://cross-seed:2468", True),
+                  ("http://192.168.0.7:2468/", True)):
+    ck(f"  指向 cross-seed 的 {_u} → 出声", _guard_says(_u), _want)
+for _u in ("http://192.168.0.7:3060", "http://qbittorrent-reseed:3060", None):
+    ck(f"  正确的 {_u} → **不出声**", _guard_says(_u), False)
+ck("  ★ 阴性对照：`:12468` 不被 `2468` 子串误伤", _guard_says("http://192.168.0.7:12468"), False)
+
 print()
 if fails:
     print(f"!!! {len(fails)} 个失败")
