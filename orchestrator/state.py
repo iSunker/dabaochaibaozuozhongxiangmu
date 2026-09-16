@@ -2103,6 +2103,21 @@ def normalize_indexer(token: str, alias: dict[str, str] | None = None) -> str:
     return t
 
 
+def norm_indexer_name(n: str) -> str:
+    """取站名主干：`'NanyangPT (南洋)'` → `'nanyangpt'`。
+
+    cross-seed 里的名字来自站点 caps，常带括号后缀；`--indexers` 是人手写的短名。
+    直接比集合会每次都误报，所以去掉括号后缀与大小写再比。
+
+    ★ 实现**只有这一份**（原先在 `scripts/drive-loop.py`，2026-09-16 挪过来）：
+      `check_indexers()` 的「`--indexers` 与库里站名对账」和 `DriveSession` 的
+      「是不是**所有**站都在退避」必须用同一把尺，否则两处会各判各的。
+    """
+    # ★ maxsplit 必须写成关键字：Python 3.13 起按位置传会发 DeprecationWarning
+    #   （re.split(pattern, string, maxsplit) 里 maxsplit 是 keyword-only 的语义）。
+    return re.split(r"[(（]", n.strip(), maxsplit=1)[0].strip().lower()
+
+
 def _norm_set(tokens, alias: dict[str, str]) -> set[str]:
     return {normalize_indexer(t, alias) for t in tokens if (t or "").strip()}
 
@@ -2424,6 +2439,7 @@ class DriveSession:
                  interval: float = 30.0, check_every: int = 10, max_wait: float = 1800.0,
                  check_secs: float = 60.0,
                  timeout: float = 30.0, pause_on_backoff: bool = True,
+                 indexers: list[str] | None = None,
                  sleep=time.sleep, now=datetime.now, monotonic=time.monotonic,
                  on_event=None):
         self.url = url
@@ -2438,6 +2454,12 @@ class DriveSession:
         self.max_wait = float(max_wait)
         self.timeout = timeout
         self.pause_on_backoff = pause_on_backoff
+        #: `--indexers` 归一化后的集合。**唯一的用途**是判断「是不是**所有**配置的站
+        #: 都在退避」—— 只有那一种情形下，"等"和"中止"才有意义（见 wait_out_backoff）。
+        #: ★ 空集 = 调用方没给 ⇒ 判据退化回旧行为（照旧等/中止），宁可吵。
+        self.indexers = {norm_indexer_name(i) for i in (indexers or []) if i.strip()}
+        #: 已经就"只禁了一部分站、我们照发"打过警告的组合，避免每个检查点刷屏。
+        self._subset_warned: set[str] = set()
         self._sleep = sleep
         self._now = now
         self._mono = monotonic
@@ -2521,6 +2543,39 @@ class DriveSession:
             if delta <= 0:
                 return True
             if delta > self.max_wait:
+                # ★★ 判据是「**所有**配置的索引器都在退避吗」，**不是**「有没有站在退避」。
+                #
+                #   2026-09-16 实测（读 cross-seed 自己的 info 日志，做了阳性对照）：
+                #   cross-seed 只在**过滤后一个站都不剩**时才跳过条目 ——
+                #     · 09-11 那次 `Skipped searching` **296 条**（当时可用的站所剩无几）
+                #     · 09-13~09-15 全程只禁 HDtime 一个（另 3 站健康）⇒ 计数是 **0**
+                #   所以还有健康站时，等在 / 中止都不解决任何问题，只是白停：
+                #   那 3 天 49 批里 17 批"发出 0 条"，发出率 27.7% → 3.7% → 7.1%。
+                #
+                #   兜底方向：**不知道配置了哪些站时一律不改行为**（照旧中止）——
+                #   把真故障误判成良性会静默，反之只是多停一轮。
+                #
+                #   ★ 已知取舍（2026-09-16 记）：这里的"配置了哪些站"取自 `--indexers`
+                #     这把**人手维护的尺**，而 `blocking` 取自 cross-seed.db。两者名字
+                #     对不上时判据会偏，但两个方向都有告警兜着（见 drive-loop 的
+                #     `check_indexers`：多了站报 `indexer-extra`、漏了站报 `indexer-missing`）：
+                #       · 多列了站（cross-seed 根本不搜它）⇒ 误判"还有健康站" ⇒ 照发；
+                #         代价是白跑一批，条目落到 SKIPPED、下一轮重搜 —— 可回收。
+                #       · 漏列了站（其实健康）⇒ 误判"全在退避" ⇒ 中止，即**旧行为**。
+                #     另一种写法是**完全不看 `--indexers`**：`read_indexer_backoff`
+                #     返回的是整张表，`enabled` 的站减去 `blocking` 就是健康站，
+                #     天生抗名字漂移。将来若名字漂移成为真问题，改走那条。
+                blocked_norm = {norm_indexer_name(b.name) for b in blocking}
+                if self.indexers and not self.indexers <= blocked_norm:
+                    if names not in self._subset_warned:
+                        self._subset_warned.add(names)
+                        self._on_event(
+                            "warn",
+                            f"索引器 {names} 要等到 {soonest:%m-%d %H:%M}"
+                            f"（超过上限 {self.max_wait / 60:.0f} 分钟），但还剩 "
+                            f"{len(self.indexers - blocked_norm)} 个健康站"
+                            f" —— **不等，照发**（cross-seed 会跳过被禁的站、用其余的搜）")
+                    return True
                 self.stats.aborted_kind = "indexer-backoff"
                 self.stats.aborted = (
                     f"索引器 {names} 要等到 {soonest:%Y-%m-%d %H:%M:%S}"

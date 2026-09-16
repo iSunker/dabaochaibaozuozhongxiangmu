@@ -274,6 +274,65 @@ for _ in range(3):
     n = dl.update_abort_streak(n, _backoff())
 ck("★ 单一成因时不啰嗦（标题里没有「共 … 批」）", "共 " in _ev[0][1], False)
 
+print("\n== ⑨ ★ 只禁了一部分站（还有健康站）→ 超上限也**不许中止**，照发 ==")
+#   复刻 2026-09-13~09-15：HDtime 被 Prowlarr 禁满 24 小时，另 3 站健康。
+#   旧行为 = 一批都不发 —— 那 3 天 49 批里 17 批「发出 0 条」，
+#   发出率从 94.8% 掉到 27.7% → 3.7% → 7.1%。
+#   ★ 实测依据：那三天 cross-seed 自己的 info 日志里 `Skipped searching` 计数是 **0**
+#     （阳性对照：09-11 那天是 296）⇒ 它只在**过滤后一个站都不剩**时才跳过条目。
+db8 = make_db([(1, "HDtime", "RATE_LIMITED",
+                ms(datetime.datetime.now() + datetime.timedelta(hours=24)), 1),
+               (2, "HDFans", "OK", None, 1),
+               (3, "NanyangPT (南洋)", "OK", None, 1),
+               (4, "BTSCHOOL", "OK", None, 1)])
+ev8 = []
+st8, _, c8 = run_session(db8, n=12, max_wait=1800.0,
+                         indexers=["HDtime", "HDFans", "NanyangPT", "BTSCHOOL"],
+                         on_event=lambda kind, *rest: ev8.append((kind, rest)))
+ck("不中止", st8.aborted, None)
+ck("★ 12 条全发完", st8.ok, 12)
+ck("★ 一分钟也没白等", st8.waited_sec, 0.0)
+ck("退避仍记一笔（下批据此放缓）", st8.backoff_hits, 1)
+# ★ 检查点有 12/10 + 秒数两条腿 ⇒ 会被问很多次。警告必须只出一次，
+#   否则日志里每 10 条刷一行同样的话 —— 那正好是"喊到人不再看它"。
+skips = [r[0] for k, r in ev8
+         if k == "warn" and "不等，照发" in str(r[0])]
+ck("★ 「照发」只喊一次，不逐条刷屏", len(skips), 1)
+
+print("\n== ⑩ ★ 全部站都在退避 → 仍然中止（⑨ 不许把这一支带松）==")
+db9 = make_db([(1, "HDtime", "RATE_LIMITED",
+                ms(datetime.datetime.now() + datetime.timedelta(hours=24)), 1),
+               (2, "HDFans", "RATE_LIMITED",
+                ms(datetime.datetime.now() + datetime.timedelta(hours=24)), 1)])
+st9, _, _ = run_session(db9, n=12, max_wait=1800.0, indexers=["HDtime", "HDFans"])
+ck("中止", bool(st9.aborted), True)
+ck("一条都没发", st9.sent, 0)
+ck("分类仍是 indexer-backoff", st9.aborted_kind, "indexer-backoff")
+
+print("\n== ⑪ 库里的名字带括号后缀（'NanyangPT (南洋)'）仍算同一站 ==")
+#   ★ 这一格让**归一化本身承重**：两站**都在退避**，而 `--indexers` 里写的是短名。
+#     归一化对了 → 认出 'nanyangpt' 就是名单里的那一站 → 「全在退避」→ 中止；
+#     归一化错了（拿 'nanyangpt (南洋)' 去比 'nanyangpt'）→ 以为还剩 1 个健康站 → 照发。
+#   ★ 两种写法的断言**正好相反**，所以这一格钉的是实现、不是在钉常量。
+#     （反例：写成「另 3 站健康、只禁 HDtime 一个」的话，健康站压根不进 `blocking`，
+#       归一化整个坏掉也照样通过 —— 那是假测试。）
+db10 = make_db([(1, "HDtime", "RATE_LIMITED",
+                 ms(datetime.datetime.now() + datetime.timedelta(hours=24)), 1),
+                (2, "NanyangPT (南洋)", "RATE_LIMITED",
+                 ms(datetime.datetime.now() + datetime.timedelta(hours=24)), 1)])
+st10, _, _ = run_session(db10, n=12, max_wait=1800.0,
+                         indexers=["HDtime", "NanyangPT"])
+ck("括号后缀归一后认得出是同名站 ⇒ 判「全在退避」⇒ 中止", bool(st10.aborted), True)
+ck("一条都没发", st10.sent, 0)
+
+print("\n== ⑫ 全部退避且**没传名单** → 保守中止（兜底方向宁可吵）==")
+#   同 ⑥，但显式钉住"不知道配置了哪些站时不改行为"这一条兜底。
+db11 = make_db([(1, "HDtime", "RATE_LIMITED",
+                 ms(datetime.datetime.now() + datetime.timedelta(hours=24)), 1)])
+st11, _, _ = run_session(db11, n=12, max_wait=1800.0)
+ck("说不知道就照旧中止", bool(st11.aborted), True)
+ck("一条都没发", st11.sent, 0)
+
 print()
 if fails:
     print(f"!!! {len(fails)} 个失败")

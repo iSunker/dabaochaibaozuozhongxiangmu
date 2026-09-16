@@ -36,8 +36,33 @@ except Exception:
     pass
 
 ROOT = "/vol1/movies"
-T0 = "2026-09-01 00:00:00"                  # 上次搜索时间（"很久以前"）
-T_NEXT = "2026-09-15 00:00:00"              # T0 + DEFAULT_CADENCE_DAYS
+
+# ★★ 这一节**必须把时钟冻住**，不能靠「写死一个 T0」。
+#
+#   `next_due_at`（orchestrator/state.py）的收尾是：
+#       return soonest if soonest > now else None     # 「已经该搜的返回 None」
+#   所以写死的 T0 一旦让 `T0 + 周期` 落进过去，期望值就从字符串**变成 None** ——
+#   整节无端变红。2026-09-15 起就是这样，红了整整两天没人发现（一个常红的测试
+#   会把下一次真失败淹掉，正是本仓反复记档的那件事）。
+#
+#   ★ 把 now 钉死之后，这一节的语义（"软锁还剩一天"）与真实日期**彻底脱钩**，
+#     不会烂。换日期只是把引信拉长，不是修。
+import orchestrator.state as _S             # noqa: E402
+
+
+class _FrozenNow(datetime):
+    """`datetime.now()` 永远返回 2026-09-10 12:00（其余行为不变）。"""
+
+    @classmethod
+    def now(cls, tz=None):
+        return cls(2026, 9, 10, 12, 0, 0)
+
+
+_S.datetime = _FrozenNow
+
+T_NOW = "2026-09-10 12:00:00"               # 冻住的"现在"
+T0 = "2026-09-01 00:00:00"                  # 上次搜索时间（T_NOW 之前 9 天）
+T_NEXT = "2026-09-15 00:00:00"              # T0 + DEFAULT_CADENCE_DAYS（仍 > T_NOW）
 
 fails = []
 
@@ -146,7 +171,7 @@ print("== ③ 被保留下来的 indexer_seen，把 next_retry_at 推到**未来
 ck("indexer_seen 仍是合并保留的", json.loads(row["indexer_seen"]), {"HDtime": T0})
 ck(f"next_retry_at = T0 + {DEFAULT_CADENCE_DAYS} 天", row["next_retry_at"], T_NEXT)
 ck("★ 它现在既不 SEEDING 也不重搜 —— 要等到那个时刻才轮到它",
-   row["next_retry_at"] is not None and row["next_retry_at"] > "2026-09-12 00:00:00",
+   row["next_retry_at"] is not None and row["next_retry_at"] > T_NOW,
    True)
 
 print()

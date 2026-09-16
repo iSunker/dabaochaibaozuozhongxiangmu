@@ -626,6 +626,9 @@ def cmd_drive(args) -> int:
             max_wait=args.max_wait,
             timeout=args.timeout,
             pause_on_backoff=not args.no_pause_on_backoff,
+            # ★ 同 drive-loop：交给会话去区分「所有站都在退避」与「只禁了一部分」。
+            #   手工跑没收 `--indexers` 时是空表 ⇒ 退化回旧行为（该等就等）。
+            indexers=_idx_list(getattr(args, "indexers", None)),
             on_event=on_event,
         )
         stats = sess.run(paths)

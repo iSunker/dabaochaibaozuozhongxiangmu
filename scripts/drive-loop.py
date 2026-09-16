@@ -412,12 +412,11 @@ def alert_if_all_done(packs: list[str], db: str) -> bool:
 def _norm_indexer_name(n: str) -> str:
     """取站名主干：'NanyangPT (南洋)' → 'nanyangpt'。
 
-    cross-seed 里的名字来自站点 caps，常带括号后缀；`--indexers` 是人手写的短名。
-    直接比集合会每次都误报，所以去掉括号后缀与大小写再比。
+    ★ 实现**只有一份**，在 `orchestrator/state.py`（2026-09-16 挪过去）：本站的
+      「`--indexers` 与库里站名对账」和 `DriveSession` 的「是不是所有站都在退避」
+      必须用同一把尺，各写一份迟早会分叉。这里只留一个转发，调用点不动。
     """
-    # ★ maxsplit 必须写成关键字：Python 3.13 起按位置传会发 DeprecationWarning
-    #   （re.split(pattern, string, maxsplit) 里 maxsplit 是 keyword-only 的语义）。
-    return re.split(r"[(（]", n.strip(), maxsplit=1)[0].strip().lower()
+    return S.norm_indexer_name(n)
 
 
 def check_indexers(args) -> None:
@@ -1931,6 +1930,9 @@ def run_round(pack: str, args, api_key: str) -> S.DriveStats | None:
         max_wait=args.max_wait,
         timeout=args.timeout,
         pause_on_backoff=not args.no_pause_on_backoff,
+        # ★ 把 `--indexers` 交给会话：它靠这份名单区分「**所有**站都在退避」（该等/该中止）
+        #   与「只禁了一部分、还有健康站」（不等、照发）。不传 = 退化回旧行为。
+        indexers=idx,
         on_event=on_event,
     )
     stats = sess.run(paths)
