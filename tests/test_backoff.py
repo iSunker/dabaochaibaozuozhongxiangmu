@@ -369,6 +369,47 @@ ck("退避正文里带**日期**（MM-DD HH:MM）",
 ck("阴性对照：只有 HH:MM:SS 的旧写法**判不出来**",
    bool(_re.search(r"\d{2}-\d{2} \d{2}:\d{2}", "索引器 HDtime 被限流（RATE_LIMITED），解禁 01:31:11")), False)
 
+print("\n== ⑭ ★★ 「已过去的残值」不许说成「解禁」（#116）==")
+#   现场（2026-09-16 10:41:06，实测行）：
+#     `索引器 HDtime 被限流（RATE_LIMITED），解禁 10:21:19`
+#     `索引器 NanyangPT (南洋) …，解禁 09:22:06`
+#   ★ 两个「解禁」**都早于**触发时刻 10:41 —— 与 `cross-seed.db` 的 `retry_after`
+#     **逐秒相同**（权威值：HDtime 10:21:19 / NanyangPT 09:22:06）
+#     ⇒ **数没印错，是"解禁"这个词印错了**：它不是「将要解禁」，
+#        而是「上次那个窗口**已经在 … 结束了**」。
+#   ★ 代价（真实发生）：按"将要解禁"读 ⇒ 得到"时间倒流" ⇒ 把一条**陈旧残值**
+#     读成「今天上午又被限了一次」，而那天**根本没有**新的限流事件
+#     （09-16 全天 `要等到` 计数 = 0）。
+#   ★ 这一格与 ⑬ 的关系：⑬ 管**格式**（要带日期），⑭ 管**语义**（过去 ≠ 将来）。
+#     两条**不重叠** —— 旧写法（带日期、但说"解禁"）在 ⑬ 是绿的，在这里必须红。
+db13 = make_db([(2, "HDFans", "OK", None, 1)])
+
+
+def expire_2min(call_no, clock):
+    # 第 2 条之后写一个**已过去 2 分钟**的窗口 ⇒ 走 snoozed 分支
+    if call_no == 2:
+        set_row(db13, 2, "RATE_LIMITED", ms(clock.t - datetime.timedelta(minutes=2)))
+
+
+_ev.clear()
+run_session(db13, n=8, on_item=expire_2min,
+            on_event=lambda *a: _ev.append(a))
+_w14 = " ".join(a[1] for a in _ev if a and a[0] == "warn")
+ck("★ 走到了（不是空集上断言）", bool(_re.search(r"曾被限流|被限流", _w14)), True)
+ck("★★ 说的是「窗口已于 … 结束」而不是「解禁」",
+   ("窗口已于" in _w14 and "结束" in _w14), True)
+ck("★★ 且**不出现**「解禁」（那个词只属于**未来**的时刻）",
+   "解禁" in _w14, False)
+ck("★ 明说它**当下不挡路**（否则读者会以为还要等它）",
+   "当下不挡路" in _w14, True)
+#   ★★ 阴性对照：**光看格式判不出来** —— 旧文案（带日期 + 说"解禁"）满足 ⑬ 的判据，
+#      但它是**错的**。这一条钉的就是"⑭ 必须比 ⑬ 强"。
+_old_good_date = "索引器 HDtime 被限流（RATE_LIMITED），解禁 09-16 10:21:19"
+ck("阴性对照：旧文案**满足 ⑬ 的日期判据**（所以 ⑬ 单独不够）",
+   bool(_re.search(r"\d{2}-\d{2} \d{2}:\d{2}", _old_good_date)), True)
+ck("★★ 但旧文案**通不过 ⑭**（它把过去说成了将来）",
+   ("窗口已于" in _old_good_date), False)
+
 print()
 if fails:
     print(f"!!! {len(fails)} 个失败")

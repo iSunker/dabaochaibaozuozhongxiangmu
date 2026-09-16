@@ -2530,9 +2530,33 @@ class DriveSession:
                     #    真相是**两把锁各有一个时刻**（见 ENVIRONMENT `ERR-SVC-17`）。
                     #    ⇒ 跨午夜的时刻一律带日期，与 `:1028` / `:2574` / `:2581` 统一为
                     #      `%m-%d %H:%M`；**判据**：`tests/test_backoff.py` 断言跨午夜输出里带日期。
-                    self._on_event("warn", f"索引器 {b.name} 被限流（{b.status}）"
-                                   + (f"，解禁 {b.until:%m-%d %H:%M}" if b.until
-                                      else "，未给解禁时间"))
+                    #
+                    # ★★★ 措辞**必须区分「还在等」与「已经过去了」**（2026-09-17，#116）：
+                    #    这条路（`snoozed` 分支）的 `until` **可能是已经过去的时刻** ——
+                    #    库里 `RATE_LIMITED` 是个**不会被擦掉**的陈旧标记，
+                    #    `retry_after` 早过期了它还在。实测 2026-09-16 10:41:06 那两条：
+                    #        `索引器 HDtime 被限流（RATE_LIMITED），解禁 10:21:19`
+                    #        `索引器 NanyangPT (南洋) …，解禁 09:22:06`
+                    #    两个「解禁」**都早于触发时刻** —— 与库里 `retry_after` 逐秒相同
+                    #    （`cross-seed.db` 权威值：HDtime 10:21:19 / NanyangPT 09:22:06）
+                    #    ⇒ **数没印错，是"解禁"这个词印错了**：它不是「将要解禁」，
+                    #      而是「**上次那个窗口已经在 … 结束了**」。
+                    #    ★ 代价（真实发生）：审阅时按「将要解禁」去读，就得到"时间倒流"，
+                    #      于是把一条**陈旧残值**读成「今天上午又被限了一次」——
+                    #      而那天根本没有新的限流事件（09-16 全天 `要等到` 计数 = 0）。
+                    #    ⇒ 分两句说：窗口已过 → 说明"窗口已于 … 结束"；未过 → 才叫"解禁"。
+                    #      ★ 与 `README`「读数要能自证」同族：**措辞不能把"过去"说成"将来"**。
+                    _until = b.until
+                    if _until and _until <= self._now():
+                        self._on_event(
+                            "warn",
+                            f"索引器 {b.name} 曾被限流（{b.status}）"
+                            f"，窗口已于 {_until:%m-%d %H:%M} 结束"
+                            f"（陈旧标记，**当下不挡路**）")
+                    else:
+                        self._on_event("warn", f"索引器 {b.name} 被限流（{b.status}）"
+                                       + (f"，解禁 {_until:%m-%d %H:%M}" if _until
+                                          else "，未给解禁时间"))
                 self._snooze_seen[b.name] = key
             if not blocking:
                 return True
