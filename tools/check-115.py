@@ -117,12 +117,40 @@ def analyse(b, *, verbose=True):
         r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", lines[-1]) else dt
     body = "\n".join(lines)
 
+    # ★★ 先判这一批**跑的是不是新代码** —— 判据 2/3 只在部署后才有意义。
+    #   ★ 这是个**独立的轴**，别把它和「本批有没有出事」搅在一起：
+    #     实测（2026-09-17）：日志里 `=== drive-loop 启动 ===` 有 **430+ 次**，
+    #     而批次数**远多于** `===` 的条数 ⇒ **有批次没有自己的批头**
+    #     （crontab 唤醒后直接走 `--once` 那条路）。
+    #     ⇒ 「倒数第 N 批」这种数法**会指错**，可能指到部署**之前**的老行为上。
+    #     所以：① 部署前一律给 **PRE**，不参与判定；② `--batch N` 要提示这一点。
+    after_deploy = dt.astimezone(timezone.utc) >= DEPLOY_UTC
+    ok_n = len(OK.findall(body))
+    skip_n = len(SKIP.findall(body))
     # 该批 `--max-wait`：★ 从日志读，读不到就用默认 30 并**明说这是默认**。
     mw = MAXWAIT.search(body)
     maxwait = float(mw.group(1)) if mw else 30.0
 
-    ok_n = len(OK.findall(body))
-    skip_n = len(SKIP.findall(body))
+    if not after_deploy:
+        # ★ 第四种结论：**老代码，不参与 #115 判定**。
+        #   它的中止在当时是**正确行为**，把它算成 FAIL 是本仓反复防的
+        #   「把历史读成结论」。
+        verdict = "PRE"
+        why = (f"该批在部署（{DEPLOY_UTC:%m-%d %H:%M} UTC）之前 ⇒ 跑的是旧代码，"
+               "它的中止是**正确行为**，不能当 #115 的结论")
+        if verbose:
+            print("─" * 72)
+            print(f"批次 @{ln}  {dt:%Y-%m-%d %H:%M:%S} +0800"
+                  f"   = {dt.astimezone(timezone.utc):%m-%d %H:%M} UTC")
+            print(f"  包 {packs}   indexers={indexers}")
+            print(f"  ok={ok_n}  跳过={skip_n}  中止={'是' if '提前中止' in body else '否'}"
+                  f"  --max-wait={maxwait:.0f} 分钟")
+            print("  部署之后？否")
+            print(f"  ⇒ 结论 **{verdict}**：{why}")
+        return verdict, why, dict(ln=ln, dt=dt, ok=ok_n, judged={},
+                                  ship=0, healthy=[], maxwait=maxwait,
+                                  after=False)
+
     aborted = "提前中止" in body or "本批中止" in body
     ship = [l for l in lines if SHIP_ANYWAY.search(l)]
     healthy = HEALTHY.findall(body)
@@ -252,6 +280,19 @@ def main():
     print(f"共 {len(bs)} 批"
           + (f"（--since 之后）" if since else "")
           + f"；最后一批 @{bs[-1][0]}  {bs[-1][1]:%Y-%m-%d %H:%M:%S} +0800")
+    #   ★★ 这两个数**对不上是正常的**（实测 2026-09-17：切出 44 批、`===` 只有 42 条，
+    #      而日志里其实跑了几百批）⇒ **批次数远多于 `===` 的条数**。
+    #      成因：crontab 唤醒后直接走 `--once`，**不是每次都有批头**。
+    #      ⇒ 「倒数第 N 批」只能当**近似**，判据 2/3 一律以**批头之后那一段**为准。
+    _n_head = 0
+    with open(a.log, encoding="utf-8", errors="replace") as _f:
+        for _l in _f:
+            if HEAD.match(_l.rstrip()):
+                _n_head += 1
+    if _n_head != len(bs):
+        print(f"  ★ 提醒：日志里 `=== drive-loop 启动 ===` 有 {_n_head} 条，"
+              f"而本次切出 {len(bs)} 批 —— 两者不等说明**有批次没有批头**；"
+              f"`--batch N` 只当近似，别用它定位关键批次。")
     print(f"部署分界线 {DEPLOY_UTC:%Y-%m-%d %H:%M} UTC"
           f" = {(DEPLOY_UTC.astimezone(LOG_TZ)):%m-%d %H:%M} +0800")
 
