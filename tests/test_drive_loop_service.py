@@ -107,10 +107,18 @@ if YML and isinstance(svcs.get("drive-loop"), dict):
        dl.get("profiles") == ["drive-loop"], repr(dl.get("profiles")))
     #   ★ 反向：别的服务**不许**带 profile。少了这条，一个手滑把 profile
     #     加到 prowlarr 上就会把它锁住，而表现是"cross-seed 搜不到任何站"。
+    #   ★★ 2026-09-17：`autoheal` **必须排除在外** —— 它**故意**带同一个 profile
+    #     （与 drive-loop 同生同死，见 ⑦ 段）。不排除的话，这条一加服务就红，
+    #     而它红得**有道理却指错方向**（读者会去删 autoheal 的 profile）。
+    _LOCKED = {"drive-loop", "autoheal"}          # ← 唯二允许带 profile 的服务
     _others = {n: s.get("profiles") for n, s in svcs.items()
-               if n != "drive-loop" and s.get("profiles")}
+               if n not in _LOCKED and s.get("profiles")}
     ck("★★ ①c 其余服务**都不带** profiles（带 = 被一起锁住，另一种事故）",
        _others == {}, repr(_others))
+    #   ★ 再钉一条：**允许带 profile 的恰好是那两个**，别多也别少
+    _withp = sorted(n for n, s in svcs.items() if s.get("profiles"))
+    ck("★ ①c2 带 profile 的服务**恰好**是 autoheal + drive-loop（多一个就是误锁）",
+       _withp == ["autoheal", "drive-loop"], repr(_withp))
 
     # ---- ①d 不写 build:（NAS 上 build 上下文不同）-------------------------
     ck("★ ①d drive-loop 不写 build:（NAS 的构建上下文是 compose 目录，写了会炸）",
@@ -177,6 +185,37 @@ if YML and isinstance(svcs.get("drive-loop"), dict):
     ck("★ ①n drive-loop **不加** user:（与宿主那份同为 root，否则属主来回换）",
        "user" not in dl, repr(dl.get("user")))
 
+    # ---- ①o/①p ★ healthcheck（2026-09-17 加；本仓第一个 healthcheck）---------
+    #   判据是**心跳新鲜度**：15.a 把 `heartbeat_ts` 补上之后它才存在。
+    _hc = dl.get("healthcheck")
+    ck("★ ①o drive-loop 有 healthcheck（卡死接管的**判据**；没有它 autoheal 无从判）",
+       isinstance(_hc, dict) and _hc.get("test"), repr(_hc))
+    if isinstance(_hc, dict):
+        _t = _hc.get("test")
+        _t_s = " ".join(_t) if isinstance(_t, list) else str(_t)
+        #   ★ 判据本体：读 `.drive-loop.state` 的 heartbeat_ts，阈值 900s
+        ck("★★ ①p healthcheck 判的是**心跳新鲜度**（900s 阈值 + 读 .drive-loop.state）",
+           "heartbeat_ts" in _t_s and "900" in _t_s and ".drive-loop.state" in _t_s,
+           _t_s[:160])
+        #   ★★ `start_period` 必须有 —— 没有它，容器刚起来（状态文件还没写）
+        #      就会判 unhealthy ⇒ 被 autoheal **反复重启**。这是**必须**的一条。
+        ck("★★ ①q healthcheck 有 start_period（没有它：刚起来就判 unhealthy ⇒ 反复重启）",
+           bool(_hc.get("start_period")), repr(_hc.get("start_period")))
+        #   ★ 用 python 读 JSON，不用 sed/grep 抠（本仓踩过 sed 抠 JSON 静默抠错）
+        ck("★ ①r healthcheck 用 python 读 JSON（不用 sed/grep 抠 —— 那会静默抠错）",
+           "python" in _t_s, _t_s[:120])
+
+    # ---- ①s ★ label：autoheal 的**唯一作用域开关** ---------------------------
+    _lbl = dl.get("labels")
+    if isinstance(_lbl, dict):
+        _lbl_s = " ".join(f"{k}={v}" for k, v in _lbl.items())
+    elif isinstance(_lbl, list):
+        _lbl_s = " ".join(str(x) for x in _lbl)
+    else:
+        _lbl_s = ""
+    ck("★★ ①s drive-loop 带 label autoheal=true（没它 ⇒ 侧车**不会**管这个容器）",
+       "autoheal=true" in _lbl_s, repr(_lbl))
+
 # ==========================================================================
 print("\n=== ② compose：profiles 的**真语义**（有 docker 就真跑）===")
 # ==========================================================================
@@ -211,9 +250,14 @@ if _DOCKER:
        "drive-loop" not in _default, repr(sorted(_default)))
     ck("★★ ②c 加 --profile drive-loop 后**才**出现（显式启用才生效）",
        "drive-loop" in _profiled, repr(sorted(_profiled)))
-    ck("★ ②d 默认集仍含其余四个（锁只锁住了 drive-loop，没误伤）",
+    ck("★ ②d 默认集仍含其余四个（锁只锁住了 drive-loop/autoheal，没误伤）",
        {"prowlarr", "flaresolverr", "cross-seed", "reseed-orchestrator"}
        <= _default, repr(sorted(_default)))
+    #   ★★ 2026-09-17：**两个**都必须不在默认集里（`autoheal` 与 `drive-loop` 同 profile）
+    ck("★★ ②e 默认集里 **autoheal 也不在**（它俩同 profile ⇒ 同生同死）",
+       "autoheal" not in _default, repr(sorted(_default)))
+    ck("★★ ②f 加 --profile 后 **autoheal 也在**（与 drive-loop 一起被显式启用）",
+       "autoheal" in _profiled, repr(sorted(_profiled)))
 else:
     print("  --   本机没有可用的 docker ⇒ ② 段未验（**不是通过**）。")
     print("  --   要补验：在有 docker 的机器上跑 "
@@ -425,6 +469,57 @@ ck("⑥a deploy.sh 的 FILES 里有 drive-loop-resident.sh → drive-loop/run-re
    "白名单里没有它 ⇒ 部署后容器找不到入口脚本")
 ck("⑥b drive-loop-nas.sh 仍在白名单里（生产那份不能被顶掉）",
    '"scripts/drive-loop-nas.sh::drive-loop/run.sh"' in _DEP, "run.sh 掉出白名单了")
+#   ★ chk58.sh **故意不进** FILES（它是 NAS 侧诊断件，不部署）——
+#     这条钉的是"别顺手把它加进去"（加了就是**假一致**：生产上有个没人调的脚本）。
+ck("★ ⑥c chk58.sh **不在**白名单里（NAS 侧诊断件，不部署；加进去=假一致）",
+   "chk58.sh" not in _DEP, "chk58.sh 被加进 FILES 了")
+
+# ==========================================================================
+print("\n=== ⑦ autoheal 侧车：卡死接管 ===")
+# ==========================================================================
+#   ★ 这一段钉的是**接管机制**（2026-09-17 加）。为什么它是**新的一层**：
+#     `restart: unless-stopped` 只对容器**退出**生效 —— **卡死**（进程活着、
+#     心跳停了、但不退出）**不会**触发任何重启。要有人看着 `unhealthy` 并动手。
+#   ★★ 最大的一条风险是**爆炸半径**：`/var/run/docker.sock` ≈ **root 等价**
+#     （能创建/删除/exec 任何容器），而**本仓此前没有任何东西挂过它**。
+#     所以下面几条**必须**逐条钉住：只读挂 + 作用域限定 + 与主容器同 profile。
+if YML:
+    _ah = (svcs.get("autoheal") if isinstance(svcs, dict) else None) or \
+          (YML.get("services", {}) or {}).get("autoheal")
+    ck("⑦a compose 里有 autoheal 服务（卡死接管侧车）", isinstance(_ah, dict),
+       repr(sorted((YML.get("services") or {}).keys())))
+    if isinstance(_ah, dict):
+        #   ★★ 同 profile ⇒ 与 drive-loop **同生同死**。不带的话 `up -d` 会单独
+        #      把它拉起来，而它要治的容器还没启用 ⇒ 空转的、握着 docker.sock 的容器。
+        ck("★★ ⑦b autoheal 与 drive-loop **同一个 profile**（同生同死，不空转）",
+           _ah.get("profiles") == ["drive-loop"], repr(_ah.get("profiles")))
+        #   ★★ 只读挂 docker.sock —— 能少给一分权限就少给一分
+        _av = _ah.get("volumes") or []
+        _sock = [v for v in _av if "docker.sock" in str(v)]
+        ck("★ ⑦c autoheal 挂了 /var/run/docker.sock", bool(_sock), repr(_av))
+        _ro = all((v.get("read_only") is True) if isinstance(v, dict)
+                  else str(v).endswith(":ro") for v in _sock) if _sock else False
+        ck("★★ ⑦d docker.sock 是 **:ro 只读挂**（≈root 等价的东西，不给写）",
+           _ro, repr(_sock))
+        #   ★★ 作用域：只治带该 label 的容器（= 只有 drive-loop），不是"治好一切"
+        _aenv = _ah.get("environment") or []
+        if isinstance(_aenv, dict):
+            _aenv = [f"{k}={v}" for k, v in _aenv.items()]
+        _aenv_s = " ".join(str(e) for e in _aenv)
+        ck("★★ ⑦e 有 AUTOHEAL_CONTAINER_LABEL（限定只治一个容器，不是治好一切）",
+           "AUTOHEAL_CONTAINER_LABEL" in _aenv_s, _aenv_s)
+        #   ★ 常驻 + 日志上限（本仓四个服务全有 logging，这个也不许漏）
+        ck("⑦f autoheal restart = unless-stopped", _ah.get("restart") == "unless-stopped",
+           repr(_ah.get("restart")))
+        _alg = _ah.get("logging")
+        ck("★ ⑦g autoheal 有 logging（走 *logging-limits；漏了=无上限日志）",
+           isinstance(_alg, dict) and _alg.get("driver") == "json-file", repr(_alg))
+    #   ★ 反向：autoheal **不许**吃 env_file（它不需要 .env 里的任何凭据 ——
+    #     它要的只有 docker.sock。给它 .env 等于白送一份密钥面）。
+    ck("★ ⑦h autoheal **不吃 env_file**（它不需要任何凭据，别白送密钥面）",
+       isinstance(_ah, dict) and "env_file" not in _ah, repr(_ah.get("env_file") if isinstance(_ah, dict) else None))
+else:
+    print("  --   没有 PyYAML ⇒ ⑦ 段未验（**不是通过**）")
 
 # ==========================================================================
 print(f"\n{'=' * 60}")

@@ -186,8 +186,12 @@ services:
   #   `build-farm.sh` 的 `COMPOSE_DIR`、`--env "$COMPOSE_DIR/.env"`、告警出栈口
   #   `notify/spool/`、以及 `ROOT = HERE.parent` 那条推导。
   #   ⇒ **挑着挂不会报错，只会静默退化**（`first_existing()` 返回 `None` + 一行 warning）。
-  #   ★ 最容易漏的是 `drive-loop/scripts/` 下那五个 `.state` 文件（**不在** `hlink/` 里），
+  #   ★ 最容易漏的是 `drive-loop/scripts/` 下的 `.state` 文件（**不在** `hlink/` 里），
   #     漏了的后果是**静默**的：对账 / 无人认领的基线会被当成「首次读数」重新记一遍。
+  #     ★ 2026-09-17 更正：这里原写「**五个**」，**实测是六个** ——
+  #       `.daily-report` / `.drive-loop` / `.farm-check` / `.linkguard` / `.notify` / `.reconcile`。
+  #       其中 `.linkguard.state` 最大（约 **827 KB**，那是基线本身）。
+  #       ⇒ 清单以 `scripts/chk58.sh` 的 `[3]` 段为准（它会逐个点名 + 报字节数）。
   #
   # ★★ 爆炸半径（写明，不是没看见）
   # -----------------------------
@@ -229,10 +233,35 @@ services:
     #     「**这是需要人工显式决策的第二条路**」，不是分类标签。
     #   ★ 不给别的服务加 profile（否则它们会被一起锁住，那是另一种事故）。
     profiles: ["drive-loop"]
-    # 常驻服务 —— 同 `cross-seed`。★ 但见下面那条警告：它只对**退出**生效，
-    # healthcheck 不健康**不**触发重启 ⇒ 「卡死能接管」还得靠 autoheal 侧车，
-    # 那是另一个决定，本次**没做**（README 15.a 末段）。
+    # 常驻服务 —— 同 `cross-seed`。
+    # ★ 它只对**退出**生效。**「卡死」（进程活着、不干活）不触发它** ——
+    #   那种情形靠下面 `healthcheck` + `autoheal` 侧车（2026-09-17 已加）。
     restart: unless-stopped
+    # ★★ healthcheck：判据取**心跳新鲜度**（15.a 修好的 `.drive-loop.state` 的
+    #   `heartbeat_ts`）。这是本仓**第一个** healthcheck。
+    #   ★ 为什么用 python 而不是 sed/grep 抠 JSON：镜像就是 python:3.12-slim
+    #     （python 一定在），而本仓**踩过一次**「sed 抠 JSON 静默抠错」
+    #     （`drive-loop-resident.sh` 闸门里那句注释），且 `tests/README.md`
+    #     有「**别让判据需要转义**」这条。
+    #   ★★ 阈值 900s **故意比 `batch_alive()` 的 `HEARTBEAT_STALE_SEC`(600s) 松**：
+    #     healthcheck ⇒ 要不要**重启容器**（重动作，宁晚不误杀）；
+    #     `batch_alive` ⇒ 要不要**跳过本轮**（轻动作）。两者权衡方向不同。
+    #   ★★ `start_period: 120s` **必须有**：容器刚起来时状态文件还没写，
+    #     判据会失败 ⇒ 没有它则开局即判 unhealthy ⇒ 被 autoheal **反复重启**。
+    #   ★ 这条判据**查不出**「容器从没起来过」：那种情形 `docker ps` 的 STATUS
+    #     会说话（见 README 15.d 的收尾核对），不由 healthcheck 负责。
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import json,sys,time;st=json.load(open(sys.argv[1],encoding='utf-8'));hb=float(st.get('heartbeat_ts') or 0);sys.exit(0 if hb and time.time()-hb<=900 else 1)",
+             "/volume2/docker_ssd/prowlarr_cross-seed_autohardlink/drive-loop/scripts/.drive-loop.state"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+    # ★★ 这个 label 是 **autoheal 侧车的唯一作用域开关** —— 没有它，
+    #   下面那个容器**不会**管 `drive-loop`（autoheal 默认只治带此 label 的容器）。
+    labels:
+      - autoheal=true
     env_file: [.env]
     environment:
       - TZ=${TZ}
@@ -251,6 +280,62 @@ services:
       - /volume1/video:/volume1/video
     command: ["sh", "drive-loop/run-resident.sh"]
     networks: [reseed-net, qbit-net]
+    logging: *logging-limits
+
+  # ------------------------------------------------------------------ #
+  # autoheal：**卡死接管**侧车（`#58`，2026-09-17 加）
+  #
+  #   为什么必须有它（而不是"配个 healthcheck 就完事"）
+  #   ------------------------------------------------
+  #   `restart: unless-stopped` 只对容器**退出**生效。**卡死**（进程活着、
+  #   心跳停了、但不退出）**不会**触发任何重启 ⇒ 得有人看着 `unhealthy` 并动手。
+  #   Docker 自己没有这个能力 ⇒ 要么这个侧车，要么 DSM 轮询 `docker inspect`。
+  #   ★ 15.a 把 `heartbeat_ts` 补上之后，**判据才存在**（之前没有它可判）。
+  #
+  # ★★ 为什么带 `profiles`（**与 drive-loop 同一个**）
+  # ------------------------------------------------
+  #   不带 ⇒ `docker compose up -d` 会**单独**把它拉起来，而它要治的容器
+  #   （`drive-loop`）**还没启用** ⇒ 一个空转的、**握着 docker.sock** 的容器。
+  #   带上同一个 profile ⇒ **两者同生同死**，启用仍是那一条显式命令：
+  #       docker compose --profile drive-loop up -d drive-loop autoheal
+  #
+  # ★★ 爆炸半径（这是本次**最大的新增风险**，写明不是没看见）
+  # ------------------------------------------------
+  #   `/var/run/docker.sock` ≈ **root 等价** —— 挂它的容器能创建/删除/exec
+  #   **任何**容器。★ 本仓此前**没有任何东西**挂过这个 socket（我 grep 过）。
+  #   缓解三条，缺一不可：
+  #     ① 挂成 **`:ro`**（只读挂载 —— autoheal 只需读状态 + 发 restart 请求）；
+  #     ② `AUTOHEAL_CONTAINER_LABEL=autoheal` ⇒ **只治带了那个 label 的容器**，
+  #        即**只有 `drive-loop` 一个**（不是"治好一切"）；
+  #     ③ `profiles` 锁 ⇒ 它的生命周期由人的显式决策决定。
+  #   ★ 代价仍然写着：**它一旦起来，就能碰这台 NAS 上的所有容器。**
+  #
+  # ★ 镜像标：`willfarrell/autoheal:latest`
+  #    ★★ 本机（Windows，写这个文件时）**无法联网核实**该 tag 与那几个 env 的
+  #      默认值 —— 所以**这一条是待验的**。落地时先在有网的机器 / NAS 上跑
+  #      一下 `docker pull willfarrell/autoheal:latest`（或 `docker manifest inspect`）
+  #       确认标存在，再把**实测到的 tag 与 digest 写回这里**。
+  #    ★ NAS 能拉镜像（`ghcr.io/flaresolverr/flaresolverr:latest` 成功拉过 12 层，
+  #      见 README），所以走 `docker compose` 时它会自动拉，不需要手工 `docker load`。
+  # ------------------------------------------------------------------ #
+  autoheal:
+    image: willfarrell/autoheal:latest
+    container_name: reseed-autoheal
+    profiles: ["drive-loop"]
+    restart: unless-stopped
+    environment:
+      - TZ=${TZ}
+      # ★ 作用域：只治带 `autoheal=true` label 的容器（= 只有 drive-loop）
+      - AUTOHEAL_CONTAINER_LABEL=autoheal
+      # 巡检间隔（秒）；30s 足够，不必更快
+      - AUTOHEAL_INTERVAL=30
+      # 启动后先等一会儿再开始判 —— 与上面 healthcheck 的 start_period 同理
+      - AUTOHEAL_START_PERIOD=120
+    volumes:
+      # ★ 只读挂载（见上面「爆炸半径」）。★ 路径用字面量 /var/run/docker.sock：
+      #   群晖上它就是这个位置（不是 /run/docker.sock）。
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks: [reseed-net]
     logging: *logging-limits
 
 networks:

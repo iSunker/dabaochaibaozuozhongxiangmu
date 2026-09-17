@@ -2026,10 +2026,30 @@ schtasks /Delete /TN "reseed-drive-loop" /F
    ⇒ 于是「卡死被接管」的**判据这才存在**（改之前 `batch_alive()` 对容器版只信心跳，
      缺 `heartbeat_ts` 时**保守返回 `True`** ⇒ 永远判「在跑」，接管**永不发生**）。
 
-   **★★ 仍然没解决的（别把上面的 ✅ 读成"接管做完了"）**：`restart: unless-stopped`
-   只对容器**退出**生效 —— **healthcheck 不健康并不会触发重启**。所以"卡死能接管"
-   还得再加一个 `autoheal` 侧车（或 DSM 轮询 `docker inspect`）。**本次没做**（另一个决定）。
-   ⇒ 一句话：**这次是让判据存在，不是让接管发生。**
+   **★★ 接管机制 —— ✅ 已做（2026-09-17 晚）**。原缺口是：`restart: unless-stopped`
+   只对容器**退出**生效 —— **healthcheck 不健康并不会触发重启** ⇒ 容器**卡死**
+   （进程活着、心跳停了、但不退出）时**没有任何东西救它**。
+   ⇒ 现在两层：
+   * **`drive-loop` 的 `healthcheck`**（本仓**第一个**）：判据 = **心跳新鲜度** ——
+     读 `.drive-loop.state` 的 `heartbeat_ts`，超 **900s** 判 unhealthy。
+     ★ **为什么 900 而不是 `batch_alive()` 的 600**：healthcheck 决定**要不要重启容器**
+       （重动作，宁晚不误杀），`batch_alive` 决定**要不要跳过本轮**（轻动作）——
+       两者权衡方向不同。★ `start_period: 120s` **必须有**：容器刚起来时状态文件还没写，
+       没有它则开局即判 unhealthy ⇒ 被反复重启。
+   * **`autoheal` 侧车**：看着 `unhealthy` 就 `docker restart`（Docker 自己没这能力）。
+     ★★ **它的三条约束，每条都对应一个风险**：
+     ① 与 `drive-loop` **同一个 `profiles`** ⇒ **同生同死**（不带的话 `up -d` 会单独
+        把它拉起来，而它要治的容器还没启用 ⇒ 空转的、**握着 docker.sock** 的容器）；
+     ② **`/var/run/docker.sock` 挂成 `:ro`** —— 那是 **root 等价**，而**本仓此前
+        没有任何东西挂过它**（这是本次**最大的新增风险**，刻意写明）；
+     ③ **`AUTOHEAL_CONTAINER_LABEL`** ⇒ 只治带了 `autoheal=true` label 的容器，
+        即**只有 `drive-loop` 一个**（不是"治好一切"）。
+   ⇒ 一句话更新：**判据与接管现在都存在了**（原来只有判据）。
+
+   **★ 仍未验的（别把上面读成"接管已经生效过"）**：本机**没有**在 NAS 上真跑过
+   —— 「容器卡死 → 侧车把它重启」这条**端到端从未复现过**（要 NAS + docker +
+   一次人为卡死，如 `docker pause`）。★ 另：`willfarrell/autoheal:latest` 这个**镜像标**
+   在本机（无网络）**无法核实**，落地时先在 NAS 上 `docker pull` 一次确认。
 
    **b. 已落地（取代了原「方案 B」的 `docker run` 草案）：`compose.yaml` 里的 `drive-loop` 服务**
    + 常驻入口 `scripts/drive-loop-resident.sh`（部署为 `drive-loop/run-resident.sh`）。
@@ -2063,8 +2083,13 @@ schtasks /Delete /TN "reseed-drive-loop" /F
    `build-farm.sh` 的 `COMPOSE_DIR`、`--env "$COMPOSE_DIR/.env"`、告警出栈口
    `notify/spool/`、以及 `ROOT = HERE.parent` 那条推导。挑着挂**不会报错**，
    只会**静默退化**（`first_existing()` 返回 `None`，然后只打一行 warning）。
-   ★ 最容易漏的是 `drive-loop/scripts/` 下那五个 `.state` 文件 —— 它们**不在** `hlink/` 里，
+   ★ 最容易漏的是 `drive-loop/scripts/` 下的 `.state` 文件 —— 它们**不在** `hlink/` 里，
    而漏了的后果是**静默**的：对账 / 无人认领的基线会被当成「首次读数」重新记一遍。
+   ★ **2026-09-17 更正**：这里原写「**五个**」，**实测是六个** ——
+     `.daily-report` / `.drive-loop` / `.farm-check` / `.linkguard` / `.notify` / `.reconcile`
+     （其中 `.linkguard.state` 约 **827 KB**，那是基线本身）。
+     ⇒ 清单以 **`scripts/chk58.sh` 的 `[3]` 段**为准 —— 它会逐个点名 + 报字节数，
+       并在"目录里还有清单之外的 `.state`"时提醒更新清单。
    ★ 代价也要写明：挂整个 compose 目录 = 把 `.env`、`prowlarr/`、`cross-seed/`、
    `notify/notify.conf` 一并交给这个容器 —— 这是**新扩大的爆炸半径**，躲不掉。
    `profiles` 锁把"什么时候交出去"变成人的决策，但**不能**减小半径。

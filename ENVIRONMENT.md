@@ -243,8 +243,18 @@ NAS 上还跑着**别人的**容器（IYUU Plus、另一套 qB、opencd），它
 
 | 文件寿命 | 放哪 | 例 |
 |---|---|---|
-| **一次性的**（中转包、验证脚本、导入的 tar） | ★ **专用的临时目录 + 用完立刻删** —— 目录名要**一眼看出是临时的**（如 `<compose>/_tmp-<用途>/`），**不许放共享根**、**不许放 `/volume1`** | `_chk58.sh`、`_drive-loop-img.tar.gz` |
-| **长期用的**（脚本、配置、日志、状态） | ★ **只在生产地址**：`/volume2/docker_ssd/prowlarr_cross-seed_autohardlink/` 下**它该在的那一层**（见 `deploy.sh` 的 FILES 映射） | `drive-loop/scripts/*`、`notify/*` |
+| **一次性的**（中转包、验证脚本、导入的 tar） | ★ **专用的临时目录 + 用完立刻删** —— 目录名要**一眼看出是临时的**（如 `<compose>/_tmp-<用途>/`），**不许放共享根**、**不许放 `/volume1`** | `_drive-loop-img.tar.gz`、`_tmp129/` 下的 `_del.sh` |
+| **长期用的**（脚本、配置、日志、状态） | ★ **只在生产地址**：`/volume2/docker_ssd/prowlarr_cross-seed_autohardlink/` 下**它该在的那一层**（见 `deploy.sh` 的 FILES 映射）；★ 或**入库**（在 NAS 上手工跑、只进 `check-deploy-drift.py` 的 `LOCAL_ONLY`） | `drive-loop/scripts/*`、`notify/*`；`scripts/chk58.sh`、`scripts/chk-volume1-free.sh` |
+
+> ★★ **一条代价（2026-09-17 实测，它把这条规则的边界划出来了）**：
+> **「用完就删」是对的，但"判据"不能跟着脚本一起删。**
+> 实例：`#58` 的 NAS 侧验证脚本当初叫 `<compose>/_tmp58/_chk58.sh`，按本表当**一次性件**
+> 放临时目录、用完删掉。**结果「五段只读验证」要验哪五段，一处都没留下** ——
+> `git log --all -p -S chk58` **搜不到任何代码**，全仓只有两处提到它的**名字**。
+> ⇒ 后来只能**从零重建**（`scripts/chk58.sh`）。
+> ⇒ 判据：**删一次性件之前，先问"它验的是什么"有没有落到文档或仓库里**；
+>   没有 ⇒ 要么把它**升级为长期件**（入库 + `LOCAL_ONLY`），要么把**该验什么**写进
+>   `SUMMARY`。★ 与 `B.10` 第 14 条同族：**删掉脚本 ≠ 那件事不用验了。**
 
 **为什么这条要立**（两条实测的代价，不是洁癖）：
 - ★ **`/volume1` 是 100% 满、且正被删除占着 I/O** —— 往里放 46 MB 是**添乱**（本次实际发生过：
