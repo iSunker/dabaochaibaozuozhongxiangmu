@@ -1186,23 +1186,39 @@ spool 积压: 0 条告警
    ```
 4. **DSM 任务计划**建**三个**任务，**用户都选 `root`**（要读 `.env` / spool，还要发信）：
 
-   | 任务 | 计划 | 脚本 | 发送运行详情 |
-   |---|---|---|---|
-   | 排空 spool | 每 5 分钟 | `sh <路径>/notify-spool.sh` | **不要勾** |
-   | 每日摘要 | 每天 21:00 | `sh <路径>/notify-spool.sh --digest` | **不要勾** |
-   | 驱动跑批 | 每 15 分钟 | `sh <路径>/drive-loop/run.sh` | **不要勾** |
+   | 任务 | 计划 | 脚本 | 发送运行详情 | 2026-09-17 起的状态 |
+   |---|---|---|---|---|
+   | 排空 spool | 每 5 分钟 | `sh <路径>/notify-spool.sh` | **不要勾** | ✅ **保持启用**（`reseed-notify-drain`）|
+   | 每日摘要 | 每天 21:00 | `sh <路径>/notify-spool.sh --digest` | **不要勾** | ✅ 保持启用 |
+   | 驱动跑批 | 每 15 分钟 | `sh <路径>/drive-loop/run.sh` | **不要勾** | ⛔ **已停用**（`reseed-drive-loop`，由容器取代）|
 
    > ★★ **2026-09-17 迁移说明（`#58`）**：这条「驱动跑批」任务**在 `drive-loop` 容器启用后应当停掉** ——
    > 两者是**同一个工作的两条路**、且**没有跨进程互斥**：同时发 webhook ⇒ 一次 429 可能废掉几百条（坑 4）。
    > ⇒ **正确顺序：① 先在 DSM 里停掉这条任务；② 再**显式**启用容器：**
    > ```bash
-   > docker compose --profile drive-loop up -d drive-loop
+   > docker compose --profile drive-loop up -d drive-loop autoheal
    > ```
-   > ★ **启用命令是显式的 —— `docker compose up -d` 不会起它**（那个服务带 `profiles: ["drive-loop"]`，
+   > ★ **启用命令是显式的 —— `docker compose up -d` 不会起它**（那两个服务带 `profiles: ["drive-loop"]`，
    > 这是一把**防呆锁**：代码已就绪、`deploy.sh` 会推，但不会被谁顺手拉起来）。
-   > ★ 详细取舍、仍**未解决**的接管机制、以及刻意与其余三个服务不同的两处，见「还没做」第 15 条。
+   > ★ 详细取舍、接管机制（`healthcheck` + `autoheal`）、以及刻意与其余三个服务不同的两处，
+   > 见「还没做」第 15 条。
    > ⚠ **没停 DSM 任务就起容器 = 两条路同时跑**（容器入口自己有一道兜底闸门会退出码 3，
    > 但它只是兜底，**别当主闸**）。
+   > ★★ **实测记录（2026-09-17 晚）**：启用那一刻确实短暂并行过（`--once` 那条 23:45:03 那次
+   > 撞上容器），而 `--once` **自己让开了** —— `drive-loop.log` 原话：
+   > `上一批（pid 14）仍在运行，跳过本轮`。现已 `disabled`，窗口关上。
+   >
+   > ★★★ **但「排空 spool」那条（`reseed-notify-drain`）不能跟着停 —— 保持启用。**
+   > 它和容器**不是**同一个工作的两条路，而是**分工**：
+   > `drive-loop.py` **只往 `notify/spool/` 写事件**（它自己的注释：「发信由 NAS 上的
+   > `notify-spool.sh` 读 DSM 自己的 SMTP 配置完成」），**排空/发信只有 `notify-spool.sh` 做**。
+   > ⇒ 停了它 = **告警只进不出，全堆死在 `spool/` 里**。
+   > ★ 而且它**搬不进容器**：`notify-spool.sh` 读的是 **DSM 自己的 `/etc/ssmtp/`**，
+   > **容器里没有那个文件**（在容器里跑 `--test-mail` 会报 `No such file or directory`）。
+   > ⇒ 详见 `ENVIRONMENT.md` 的 `ERR-SCHED-08` 与 `ERR-DOCKER-10`。
+   > ★ **两条 DSM 任务状态不同是刻意的**：跑批 `disabled`、发信 `enabled`。
+   > 复核用 `sudo /usr/syno/bin/synoschedtask --get | grep -A 5 'Name: \[reseed-'`
+   > （★ 只能**读**，`synoschedtask` **没有**改状态的子命令 —— `ERR-DSM-10`）。
 
 > ⚠ **三个都不要勾「发送运行详情」**：排空任务每 5 分钟一趟 = **一天 288 封**，
 > 驱动任务一天 96 封 —— 那不是告警，是骚扰。结果一定是你去建一条
@@ -2046,10 +2062,38 @@ schtasks /Delete /TN "reseed-drive-loop" /F
         即**只有 `drive-loop` 一个**（不是"治好一切"）。
    ⇒ 一句话更新：**判据与接管现在都存在了**（原来只有判据）。
 
-   **★ 仍未验的（别把上面读成"接管已经生效过"）**：本机**没有**在 NAS 上真跑过
-   —— 「容器卡死 → 侧车把它重启」这条**端到端从未复现过**（要 NAS + docker +
-   一次人为卡死，如 `docker pause`）。★ 另：`willfarrell/autoheal:latest` 这个**镜像标**
-   在本机（无网络）**无法核实**，落地时先在 NAS 上 `docker pull` 一次确认。
+   **★★ 已落地并在 NAS 上实测（2026-09-17 晚）** —— 启用之后逐条现读，**不是静态对账**：
+   * `docker ps` ⇒ `reseed-drive-loop  Up 4 minutes (healthy)`、`reseed-autoheal  Up (healthy)`
+     ⇒ **healthcheck 判据在真容器上跑通了**（这是它第一次真跑）；
+   * `/proc` 里两层进程（容器里**没有 `ps`**，用 `/proc/[0-9]*/cmdline` 读，`ERR-DOCKER-08`）：
+     ```
+     /proc/1:  sh …/drive-loop/run-resident.sh
+     /proc/14: python …/drive-loop.py --url http://cross-seed:2468 …（★ 无 --once）
+     ```
+     ⇒ **常驻分支**，`--once` 那条路确实没在跑；
+   * `drive-loop.log` 连续推进 `[1/40] … [10/40]`（每 30s 一条）⇒ **真在跑批**；
+   * `.drive-loop.state`：`mode=resident` + `running_pid_pidns=container` + `heartbeat_ts` 在涨；
+   * ★★ **两条路的互斥实测生效**：23:45:03 那次 `--once` 打的是
+     `上一批（pid 14）仍在运行，跳过本轮` —— 它**认出了容器那个 pid 并主动让开**。
+     ⇒ 这是 (d) 「两条路不许并跑」从"设计"变成"实测"的证据。
+   * ★ **`round` 每轮末尾才刷新** ⇒ `round: 0` + 日志在推进 **= 第一轮还没跑完，不是卡住**；
+     真要判"卡没卡"，看 `consec_abort`/`consec_backoff` 有没有涨（实测两者均为 0）。
+
+   **★ 仍未验的（别把上面读成"接管已经生效过"）**：「**容器卡死 → 侧车把它重启**」这条
+   **端到端从未复现过**（要 NAS + docker + 一次人为卡死，如 `docker pause`）——
+   上面验的是"**判据**在真容器上给出正确结论（`healthy`）"，
+   **不是**"侧车真的救过一次"。
+   ★ `willfarrell/autoheal:latest` 这个**镜像标**本机（无网络）无法核实，
+   但 NAS 上 `docker compose` **实际拉取成功**（`Up (healthy)`）⇒ 标**存在**已得旁证。
+   ★ 属主/权限（两边同为 root 那个决定）仍**没验过**。
+
+   **★ 顺带定案一件事：`notice`（DSM 的 `reseed-notify-drain`）**跟着容器**一起搬进来**了 ——
+   **不搬，保持 `enabled`**。理由是**它和容器是分工，不是重复**：
+   容器**只写 spool**（`drive-loop.py` 注释原话：「发信由 NAS 上的 `notify-spool.sh` 完成」，
+   `grep` 全文件**没有一处调用它**），`notify-spool.sh` 才**排空**（它读 DSM 的 `/etc/ssmtp/`，
+   **容器里没有那个文件** ⇒ 搬进去也发不出信）。详见 `ERR-SCHED-08` / `ERR-DOCKER-10`。
+   ⇒ **`reseed-drive-loop`（跑批）已 `disabled`，`reseed-notify-drain`（发信）保持 `enabled`
+   —— 两条状态不同是刻意的。**
 
    **b. 已落地（取代了原「方案 B」的 `docker run` 草案）：`compose.yaml` 里的 `drive-loop` 服务**
    + 常驻入口 `scripts/drive-loop-resident.sh`（部署为 `drive-loop/run-resident.sh`）。
@@ -2103,11 +2147,12 @@ schtasks /Delete /TN "reseed-drive-loop" /F
      两边相对路径不同 ⇒ 写了会在 NAS 上 build 失败。镜像 `reseed-drive-loop:0.1.0`
      **只 load 不 build**（`§26.5` 表）。
 
-   **★ 边界（别把本节读成"已经跑通过了"）**：容器里**真跑一遍没做过**，
-   闸门跨容器**连跑两轮没验过**，属主/权限**没验过**，接管机制**没做** ——
-   以上全是静态对账 + 本机离线断言（`tests/test_drive_loop_service.py` 43 条）。
-   ★ 而 `profiles` 那把锁**本机若没 docker 就是"未验"**：该文件会打印一条 `--` 行明说，
-   **别把它的绿读成「锁生效了」**。**
+   **★ 边界（2026-09-17 晚已更新 —— 原文写"容器里真跑一遍没做过 / 接管机制没做"）**：
+   * ✅ **容器里已真跑过**（见上面那段：`healthy` + `/proc` + `[N/40]` 推进 + 互斥让开）；
+   * ✅ **接管机制的判据已真跑过**（healthcheck 给出 `healthy`）；
+   * ⏳ **仍未验**：「卡死 → 侧车重启」**端到端**、属主/权限、闸门跨容器**连跑两轮**。
+   ★ `profiles` 那把锁若本机没 docker 就是"未验"：该测试会打印一条 `--` 行明说，
+   **别把它的绿读成「锁生效了」**（NAS 上已用 `docker compose config --services` 两个方向实测过）。
 
    **g. 顺带修掉一条"自己造的陈旧描述"**：本节上面那段原写 `rm-staging.sh`「只认三类路径」，
    而它 2026-09-13 已撤成**两类**（旧根删完即撤）—— 已按现状更正。

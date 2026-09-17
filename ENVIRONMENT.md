@@ -1160,6 +1160,64 @@ NAS 上还跑着**别人的**容器（IYUU Plus、另一套 qB、opencd），它
 - **边界**：通用。★ 配套：`StateStore(create=…)` 那条根因闸 —— **库不存在时绝不许把文件建出来**
   （连父目录都不能建），否则会留下 0 字节 `state.db`（本项目的 `ERR-SQL-04`）。
 
+### ERR-DOCKER-08 ★★ 容器里**没有 `ps`**（`python:3.12-slim` 极简镜像）—— 判"在不在跑"要用 `/proc`
+- **症状**：`sudo docker exec reseed-drive-loop ps -eo pid,args` ⇒
+  `OCI runtime exec failed: exec: "ps": executable file not found in $PATH`。
+  ★ **这不是"容器有问题"，是"镜像里没这个二进制"**（与 `ERR-DSM-01`"BusyBox 的 `ps` 只显示 comm"是**两条不同的坑**）。
+- **环境前提**：`drive-loop` 的镜像基于 **`python:3.12-slim`**（刻意极简 —— 无 pip 依赖，import 闭包纯标准库）。
+- **根因**：slim 镜像**不含 `procps`**（也不含 `net-tools`/`curl` 之类）。`docker exec` **不继承宿主工具链**。
+- **触发条件**：照宿主机习惯用 `ps` / `netstat` / `dig` 去容器里查。
+- **规避做法**：**用 `/proc`（内核接口，不需要任何工具）**：
+  ```bash
+  sudo docker exec reseed-drive-loop sh -c \
+    'for p in /proc/[0-9]*; do echo "$p: $(cat $p/cmdline 2>/dev/null | tr "\0" " ")"; done'
+  ```
+  ★ 它比 `ps` **信息更多**：`cmdline` 给出**完整命令行**（能直接看出有没有 `--once`）。
+  实测输出（`#58` 收口时的原样）：
+  ```
+  /proc/1:  sh …/drive-loop/run-resident.sh
+  /proc/14: python …/drive-loop.py --url http://cross-seed:2468 --qbit-url http://qbittorrent-reseed:3060 …
+  ```
+  ⇒ `pid 1` 是入口脚本、`pid 14` 是 python ⇒ **两层父子关系**；`--url` 里**没有** `--once` ⇒ **常驻分支**。
+- **怎么发现的**：`#58` 迁容器后想确认"容器到底在不在干活"，`ps` 缺席，改用 `/proc`。
+- **边界**：**只对极简镜像成立**（`cross-seed` / `prowlarr` 那些镜像里 `ps` 是有的）。
+  ★ **`/proc/14` 这个 pid 与状态文件里的 `running_pid` 是同一个数** —— 这不是巧合：
+  容器里 `os.getpid()` 在 pidns 内可见，而 `running_pid_pidns: "container"` 就是为它标的。
+
+### ERR-DOCKER-09 ★★ **`docker exec` 的工作目录是容器的 `WORKDIR`，不是你的宿主 cwd**
+- **症状**：在 `<compose>/` 下敲
+  `sudo docker exec reseed-drive-loop sh notify/notify-spool.sh --test-mail`
+  ⇒ `sh: 0: cannot open notify/notify-spool.sh: No such file`（**读着像"容器里没这个文件"，其实有**）。
+- **环境前提**：卷是**整目录 1:1 同名同路径**挂载（宿主 `/volume2/…/<compose>` == 容器同路径）。
+- **根因**：`exec` 不继承宿主的 `cwd`；镜像 `WORKDIR=/app` ⇒ 相对路径解析到 `/app/notify/…`，**那里没有**。
+- **触发条件**：把宿主上"相对某个目录"的路径写法直接搬进 `docker exec`。
+- **规避做法**：**一律用绝对路径**（挂载是 1:1，所以宿主路径 == 容器路径）：
+  ```bash
+  sudo docker exec reseed-drive-loop sh /volume2/docker_ssd/prowlarr_cross-seed_autohardlink/notify/notify-spool.sh --test-mail
+  ```
+  ★ 自证这条假设的一行（`#58` 实测）：`pwd` 打 `/app`、`ls -d /volume2/…/<compose>` 打得出来
+  ⇒ **相对不成立、绝对成立**，一次说清。
+- **怎么发现的**：`#58` 想验"容器写的告警真能发出去"时踩到。
+- **边界**：通用容器知识，但**本仓的 1:1 挂载让绝对路径恰好等于宿主路径**，容易误以为相对也能用。
+
+### ERR-DOCKER-10 ★★ **发信这半边天生在容器外**：`notify-spool.sh` 读的是 DSM 的 `/etc/ssmtp/`
+- **症状**：`sudo docker exec reseed-drive-loop sh …/notify/notify-spool.sh --test-mail` ⇒
+  `读不到 /etc/ssmtp/ssmtp.conf: [Errno 2] No such file or directory（任务计划的用户要选 root）`。
+  ★ **这不是故障，是"搬进容器必然如此"**。
+- **环境前提**：`notify-spool.sh` 靠 **DSM 自己的 SMTP 配置**发信（`ERR-DSM-04`：真路径
+  `/usr/syno/etc/synosmtp.conf`，而 `/etc/ssmtp/ssmtp.conf` 是空壳）。
+- **根因**：那个配置**只在宿主机上，容器里没有**（镜像里没有、也没挂进去）。
+- **触发条件**：把"发信"当成能跟着容器一起搬过去的东西。
+- **规避做法**：**让发信留在容器外**（DSM 任务计划里那条 `reseed-notify-drain`，以 root 跑）；
+  容器侧只负责**写 spool**。两侧分工见 `ERR-SCHED-08`。
+  ★ 若哪天真要搬：得**再挂宿主机的 `/etc/ssmtp`**（或 `/usr/syno/etc/synosmtp.conf`）——
+  那等于把**邮箱口令**再多暴露给一个容器，**权衡不划算**。
+- **怎么发现的**：`#58` 收口时想验"整条通知链通不通"，在容器里跑 `--test-mail` 撞上；
+  ★ **它反而把"notice 不搬"这个决定从"我推的"升级成了"实物证据"**。
+- **边界**：**DSM 专有**（换一台普通 Linux 就没有这条）。
+  ★ 与 `B.10` 第 1 条（"某台机器上没有" ≠ "环境里都没有"）**同族但方向相反**：
+  这里**确实是"容器里没有"**，而**正确的解读是"它本该在容器外"**，不是"要去装一个"。
+
 ### B.4.3 凭据边界
 
 ### ERR-SEC-01 哪些端口 / 目录对外可见
@@ -1877,6 +1935,42 @@ NAS 上还跑着**别人的**容器（IYUU Plus、另一套 qB、opencd），它
 
 ## B.8 定时 / 任务调度层
 
+### ERR-DSM-10 ★★ `synoschedtask` **没有 `--disable`** ⇒ 停/启用任务**只能在 DSM 面板**做
+- **症状**：`sudo synoschedtask --disable 10` 报
+  `Arguments error! No arguments are required. [1]` —— **读着像"参数写错了"，其实是"根本没有这个动词"**。
+- **环境前提**：想用 CLI 停一条任务（怕面板点不准、想留下可复核的命令）。
+- **根因**：`synoschedtask --help` 的**全部**子命令只有
+  `--get` / `--del <id=x>` / `--run <id=x>` / `--reset-status` / `--sync` / `--help`。
+  ⇒ **只有 `--get` 是"按 id 读"**，**没有任何 "按 id 改状态" 的动作**。
+  ★ `--run` 是"立刻跑一次"，**不是"启用"**；`--del` 是**删掉整条任务**（危险，且不可逆）。
+- **触发条件**：照 `--get` 的形态外推 `--disable`（**"我推的"当成"验过的"**，`B.10` 第 12 条同族）。
+- **规避做法**：**停用/启用在 DSM 面板里点**；CLI **只用来回读核实**：
+  ```bash
+  sudo /usr/syno/bin/synoschedtask --get | grep -A 5 'Name: \[reseed-'
+  ```
+  期望看到 `State: [disabled]`（要停的）与 `State: [enabled]`（要留的）。
+- **怎么发现的**：`#58` 迁容器时想停 `reseed-notify-drain`，照 `--get` 形态外推 `--disable 10` ⇒ 报错；
+  读 `--help` 才知没这个动词。**同一个会话里同一族的第 1 次**（详见 `§26.6`）。
+- **边界**：**DSM 专有**。★ 另一个反直觉点：`--get` 输出的 **`Next Trigger` 是"调度器上次算的"，
+  停用之后它**可能仍是旧值**（本次实测：任务已 `disabled`，`Next Trigger` 还挂着 `2026-09-18 00:00`）
+  ⇒ **`State` 才是权威，别拿 `Next Trigger` 当"还在排队"的证据。**
+  ★★ 还有一个**读错方向的陷阱（本次踩到）**：CLI 的 `State: [enabled]` 与 **`notify/spool/` 为空**
+  放在一起，很容易读成"容器在排空 spool"；实际是**两条独立的证据，都不指向那个结论**。
+
+### ERR-DSM-11 ★★ `synoschedule` 的**真身不是那个 `.db`**（它是 0 字节）
+- **症状**：`sudo sqlite3 /usr/syno/etc/synoschedule.db "SELECT … FROM task"` ⇒
+  `Error: in prepare, no such table: task`；`ls -la` 显示该 `.db` **0 字节**。
+- **环境前提**：想"读文件"而不是"问 CLI"，以为任务表是个可直接查的库。
+- **根因**：任务**不在那个 `.db` 里**。真身是目录
+  `/usr/syno/etc/synoschedule.d/<user>/`（本次实测 `root/` 下有内容，含 `.task_260822_…` 备份文件）；
+  而 `/usr/syno/etc/synoschedule.db` 是个 **0 字节空壳**。
+- **触发条件**：拿"文件大小为 0"当"没有任务"，或**信一个不是权威视图的表名**。
+- **规避做法**：**任务列表只有一条权威路：`synoschedtask --get`**（`ERR-DSM-05` 也是这么读的）。
+  ★ 与 `ERR-DSM-04`（`/etc/ssmtp/ssmtp.conf` 0 字节空壳）**同族**：
+  **DSM 把它们自己的配置挪了地方、留个空壳在原地。**
+- **怎么发现的**：`#58` 里先查 `.db`（无表）⇒ 才转去 `--get`（全量读出 16 条任务）。
+- **边界**：**DSM 专有**。
+
 ### ERR-SCHED-01 DSM 任务计划**小时位存错** ⇒ "手动能跑、计划不跑"
 > 交叉引用：本体登记在 `ERR-DSM-05`（DSM 侧）。**从调度层的看法**：
 > 这是"任务的**定义**与任务的**行为**不一致"，且**没有任何东西会提醒你**。
@@ -1932,6 +2026,31 @@ NAS 上还跑着**别人的**容器（IYUU Plus、另一套 qB、opencd），它
 > 交叉引用：三处路径的完整表在 `A.12`。
 > **从调度层的看法**：`<compose>/drive-loop/**` 是**热路径**（拷完即生效），
 > 构建上下文副本要 `--build`，`cross-seed` 完全不吃我们的文件。**别拷错一层。**
+
+### ERR-SCHED-08 ★★ 通知是**两条路分工**：容器**只写 spool**，DSM 那条**才排空** —— 所以它不能停
+- **症状（会犯的错）**：看到"容器里有 `notify/`、DSM 里还有一条 `notify-spool.sh` 任务"，
+  读成**重复** ⇒ 把 DSM 那条停掉"消除重复" ⇒ **告警只进不出，全堆死在 `spool/` 里**。
+- **环境前提**：`#58` 把跑批搬进容器后，DSM 上**仍留着** `reseed-notify-drain`（跑 `notify-spool.sh`）。
+  ★ 而 DSM 上那条**跑批**任务 `reseed-drive-loop`（跑 `drive-loop/run.sh --once`）**已停用**。
+  ⇒ **两条 DSM 任务、两种处置，不是一个答案。**
+- **根因（实测判据）**：**`drive-loop.py` 只写 spool，不排空。** 代码自己的注释（`drive-loop.py:89-91`）：
+  > 「只往 NAS 本机的 spool 写纯文本事件文件，零凭据；**发信由 NAS 上的 `notify-spool.sh` 读 DSM
+  > 自己的 SMTP 配置完成**」
+  `grep -n 'notify-spool\|spool' drive-loop/scripts/drive-loop.py` 的命中里
+  **没有一处是"调用 `notify-spool.sh`"** —— 全是注释、打印路径、`--notify-spool` 参数、父目录自检。
+  ⇒ **分工，不是重复**：容器 = **生成告警**；DSM 那条 = **发出去**（读 `/etc/ssmtp`，`ERR-DOCKER-10`）。
+- **触发条件**：把"同一个脚本名出现在两处"当成"两处在做同一件事"。
+- **规避做法**：**`reseed-notify-drain` 保持 `enabled`**（`ERR-DSM-10`：只能面板改状态）。
+  ★ 判"容器有没有把事件写出来"**别看 `spool/` 空不空** —— 它往往**刚被 DSM 排空所以是空的**；
+  看 **`notify/archive/` 的 mtime**（排空的现场）或 **`drive-loop.log`**（真跑批的现场）。
+  ★★ **两个证据都不指向同一个结论**：`spool/` 为空 + CLI 说 `State: [enabled]`
+  放在一起很容易读成"容器在排空"；实测**容器不排空**（见上）。
+- **怎么发现的**：`#58` 收口时用户提出"notice 能不能也进 docker"，先查 `grep` 才定案；
+  容器内 `--test-mail` 失败（`ERR-DOCKER-10`）反而把结论钉死。
+- **边界**：★ **"搬进容器"不是默认更优** —— `notify-spool.sh` 是**短命、每 5 分钟、幂等**
+  （发完即移进 `archive/`）的排空动作，**不需要和跑批同生共死**；搬它反而多暴露一份邮箱口令。
+  **对比 `drive-loop`：它必须搬，因为它要常驻 + 要接管。** 判据是"**要解决什么真问题**"，不是整齐。
+  ★ 另一面：正因两边都读同一个 `spool/`，**并行时最多丢一条告警、不会重复发信**（移走即幂等）。
 
 ---
 
@@ -2005,9 +2124,22 @@ NAS 上还跑着**别人的**容器（IYUU Plus、另一套 qB、opencd），它
 | 14 | ★★ **输出本身不承载判据** —— **空集像"没事"、非空集像"有事"，三个方向都能骗人**（前两个骗「有没有」、第三个骗「是什么」）（本项目新增）| **空集**：`grep "by HDtime"` 得 **0 条**，读着像"HDtime 没货"，其实是站名在 `on` 后面、`by` 后面跟的是决策类型 ⇒ 这条 grep **恒为 0**（见 `SUMMARY` §20.9.5）。**非空集**：投影 hash 比对**三份全红**，读着像"三份结构都被改了" —— 其实**只有 `refs` 是真变**（+3 条真引用），`headings` / `terms` **只是行号列在动**；★ **光看 hash 分不出哪个是哪个**（见 `tools/doc-audit/INDEX-USAGE.md`）。同族：`ERR-AI-05`（绿，但绿可能是规则压根没参与匹配）、`SUMMARY` §18.17.3。★ **第三个方向**：判据本体是好的、输出形态也正常，可**正文替一件它并不知道的事下了结论** —— 2026-09-14 实测：`controls_ok=False` 那支把「本日尚无 Found 行」写成「**匹配逻辑坏了**」（见 `tests/README.md` 里「测试会把误判固化成契约」那条）|
 | 15 | ★★ **证据在场，结论没跟上** —— 报数时用了**静默兜底**（`.get() or <默认>` 之类），而**能修正它的证据就在同一份输出的另一行**（本项目新增）| `#62`：`probe-62b.py` 已经把 `total_downloaded info=(缺) prop=<有值>` **打在屏幕上**，而分桶逻辑写的是 `t.get("total_downloaded") or 0` ⇒ 100 条**全落进「0 字节」桶** —— 那个 100 是**构造出来的**，不是量到的。改用 `properties`（真带这个键的接口）重算那 22 条 error：**22/22 全部 <1%**（16 KB ~ 4.6 MB），**无一为 0**（见 `#62` 描述顶部的勘误）|
 | 16 | ★★ **工具把数据换了写法，而下游的"过滤条件"是按原始写法写的** ⇒ **一条都不匹配，且不报错**（本项目新增）| `core.quotepath` 默认 **true** ⇒ `git diff --name-only` / `git ls-tree` 对**非 ASCII 路径**输出成**带引号 + 八进制转义**（`"summary/22-matched…\346\201\222…"`）。于是 `grep '^summary/'` 或 `for f in $(git …)` **一个中文名文件都拿不到**，而 **git 和 grep 都退出 0**。★ 本仓**大量文件名是中文**（`summary/*.md`、NAS 上的目录名）⇒ 这是**会反复复发**的形状，不是一次性失误。★ 真实代价：一次凭据扫描里 24 个 `summary/*.md` **全被跳过**，而屏幕上打的是「工作区零命中」—— **差点据此判定"无凭据风险"**（见 `ERR-GIT-04`）|
+| 17 | ★★ **"我推的语法/路径/前提"当成"验过的"** —— 把一条命令**按同类命令的形态外推**出来就发给人（本项目新增）| `#58` 收口一轮里**连犯四次**，全是同一形状：① `sudo synoschedtask --disable 10` —— 照 `--get` 的形态外推，**该命令根本没有这个动词**（见 `ERR-DSM-10`）；② 断定"容器会排空 spool"⇒ **据此推荐了"停掉 DSM 排空任务"**，而 `grep` 证明它**只写不排**，**方案被自己的侦察否掉**（见 `ERR-SCHED-08`）；③ `docker exec … sh notify/notify-spool.sh` —— 用**相对路径**，而 `exec` 的 cwd 是容器 `WORKDIR`（见 `ERR-DOCKER-09`）；④ 日志路径写成 `drive-loop/log/drive-loop.log` —— 真身是 `drive-loop/scripts/drive-loop.log`；顺带还说了容器里有 `ps`、以及"每轮 43 条"（真值 **40**）。★ **代价不对称**：④ 类只是多跑一轮；**② 那类会给出一条"会堵死告警"的操作建议** —— 而它**读起来完全合理**。★ 补法：**给命令之前，先问"这条命令我自己读过它的 `--help`/源码/路径吗"**；答不出就用一条**只读侦察**换掉猜测（`--help`、`find`、`grep`、`ls -d`），**别把"侦察"和"动作"合成一步**。同族：`B.10` 第 12 条（"我觉得"≠"已证实"）、第 14 条（输出不承载判据）|
 
-> ★ 第 10~16 条是**本项目自己加的**（1.txt 只列到第 9 条）—— 它们全是"AI 在真实会话里
+> ★ 第 10~**17** 条是**本项目自己加的**（1.txt 只列到第 9 条）—— 它们全是"AI 在真实会话里
 > **实际犯过**、且**当场没意识到**"的那几种。**判据：能配一个真实实例的才收进来。**
+>
+> ★★ **第 17 条与第 10、11、12 条都不同，别合并**（四条都是"发出去的指令有问题"，但病灶不同）：
+>
+> | 条 | 病灶 | 补法 |
+> |---|---|---|
+> | 10 | **没估代价**（命令本身是对的，代价大）| 先估运行时长/危害再发 |
+> | 11 | **格式错**（说明文字混进代码块）| 代码块里只放能直接粘的东西 |
+> | 12 | **结论**没验（"我觉得是这样"）| 把结论建在实测上 |
+> | **17** | ★ **指令本身**没验（语法/路径/前提按同类外推）| 发之前**读一次 `--help`/源码/`ls`**；答不出就先只读侦察 |
+>
+> ⇒ 17 的独特之处：**它不是"结论错了"，是"我给出的工具本身不存在/不成立"** ——
+> 用户照着敲会撞上 `No arguments are required` / `No such file`，而**这些报错读起来像用户的错**。
 >
 > ★★ **第 16 条与第 4 条、第 14 条各不同，别合并**（三条都长成"过滤后当全量"，但补法不同）：
 >
