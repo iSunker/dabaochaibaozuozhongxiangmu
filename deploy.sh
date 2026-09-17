@@ -83,6 +83,13 @@ FILES=(
   "scripts/notify.py::drive-loop/scripts/notify.py"
   "scripts/reseed-state.py::drive-loop/scripts/reseed-state.py"
   "scripts/drive-loop-nas.sh::drive-loop/run.sh"
+  # ★ 2026-09-17（`#58` C 方案）：容器内**常驻**入口。与上面那份是**两条路**，
+  #   不是替代关系 —— `run.sh` 带 `--once`（DSM 每 15 分钟唤醒一次，容器外跑），
+  #   本文件**不带** `--once`（容器内 `while` 循环，`restart: unless-stopped` 兜底）。
+  #   ⇒ 两份都要在，谁也不能顶掉谁（tests/test_drive_loop_service.py ④a 钉 run.sh 仍在、
+  #     ⑥a 钉本文件已在）。★ 它由 compose 里 `drive-loop` 服务的 command 调用，
+  #     而那个服务带 `profiles: ["drive-loop"]` ⇒ **不会**被 `up -d` 默认拉起来。
+  "scripts/drive-loop-resident.sh::drive-loop/run-resident.sh"
   "orchestrator/state.py::drive-loop/orchestrator/state.py"
   "orchestrator/__init__.py::drive-loop/orchestrator/__init__.py"
   # 通知：NAS 侧脚本 + 配置模板（跑在 NAS 宿主机上，不在容器里，但放 compose 目录下）。

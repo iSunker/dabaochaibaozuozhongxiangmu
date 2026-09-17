@@ -145,6 +145,114 @@ services:
     logging: *logging-limits
     restart: "no"
 
+  # ------------------------------------------------------------------ #
+  # drive-loop：容器**自带常驻 while 循环**的跑批驱动（`#58`，C 方案）
+  #
+  #   ★★ 它默认**不会**被 `docker compose up -d` 拉起来 —— 见下面 `profiles`。
+  #
+  # 它取代了什么
+  # ------------
+  #   取代「DSM 任务计划每 15 分钟唤醒一次 `drive-loop/run.sh`（带 `--once`）」。
+  #   入口是 `drive-loop/run-resident.sh`（仓库里 `scripts/drive-loop-resident.sh`），
+  #   **不带** `--once` —— 循环在 python 里，DSM 那侧只管"容器还活着吗"。
+  #
+  # ★★ 启用前**必须**先在 DSM 里停掉那个跑 `run.sh` 的任务
+  # ------------------------------------------------------
+  #   两条路**没有任何跨进程互斥**（`§26.5` 前提 ②）：同时发 webhook ⇒
+  #   一次 429 可能废掉几百条（README 坑 4）。
+  #   ★ 它比"两个同类进程"更隐蔽：**两边写的东西不一样**
+  #     （常驻写 `mode=resident`、`--once` 不写 mode）⇒ 改之前从状态文件上
+  #     **根本看不出有两个在跑**。`#58` 的 15.a 修复给常驻分支补了 mode 与心跳，
+  #     就是为了让这件事**能被看出来**。
+  #   ⇒ 启用是**两步**、且**顺序不能倒**：
+  #       ① DSM → 控制面板 → 任务计划：停掉「驱动跑批」那条（见 README 部署表）
+  #       ② docker compose --profile drive-loop up -d drive-loop
+  #   ⇒ `run-resident.sh` 自己还有一道前置闸门（读到"另一条路在跑"就退出，码 3），
+  #     但它只是**兜底**：`mode=resident` 时它无法区分"上一轮残留"与"另一个常驻"。
+  #     **别把兜底当主闸。**
+  #
+  # ★ 为什么 `build:` 不写 —— 这条是硬约束
+  # ---------------------------------------
+  #   本仓的 docker build 上下文是**仓库根**，而 NAS 上的构建上下文是 **compose 目录**
+  #   （`docker compose build` 在 NAS 上是从 compose 文件所在目录起步）。两边相对路径
+  #   不同 ⇒ 写 `build:` 会在 NAS 上 build 失败。镜像 `reseed-drive-loop:0.1.0` 已在
+  #   本机 build 并 `docker load` 到 NAS（`§26.5` 表），**只 load 不 build**。
+  #   ★ 同一条约束也记在 `scripts/check-deploy-drift.py` 的 LOCAL_ONLY 里
+  #     （`drive-loop.Dockerfile` 那条）。
+  #
+  # ★ 挂载为什么是**整目录 1:1**、不是挑几个子目录
+  # ---------------------------------------------
+  #   代码里的路径**全是绝对路径**：`CROSSSEED_DIRS[0]`（硬编码）、
+  #   `build-farm.sh` 的 `COMPOSE_DIR`、`--env "$COMPOSE_DIR/.env"`、告警出栈口
+  #   `notify/spool/`、以及 `ROOT = HERE.parent` 那条推导。
+  #   ⇒ **挑着挂不会报错，只会静默退化**（`first_existing()` 返回 `None` + 一行 warning）。
+  #   ★ 最容易漏的是 `drive-loop/scripts/` 下那五个 `.state` 文件（**不在** `hlink/` 里），
+  #     漏了的后果是**静默**的：对账 / 无人认领的基线会被当成「首次读数」重新记一遍。
+  #
+  # ★★ 爆炸半径（写明，不是没看见）
+  # -----------------------------
+  #   挂整个 compose 目录 = 把 `.env`、`prowlarr/`（cookie + db）、
+  #   `cross-seed/`（含 API key）、`notify/notify.conf`（邮箱口令）一并交给这个容器。
+  #   **躲不掉**（要 1:1 就必然如此）。`profiles` 锁把"什么时候交出去"变成人的决策，
+  #   但**不能**减小半径。
+  #
+  # ★ 用户与属主：**不加 `user:`**（与另外三个服务不同，这是刻意的）
+  # -------------------------------------------------------------
+  #   宿主那份 `run.sh` 由 DSM 以 **root** 跑 ⇒ 它写下的 `.drive-loop.state`、
+  #   `attempts.log`、`drive-loop.log` 属主都是 root。容器这边若切成 `${PUID}:${PGID}`，
+  #   同一个文件就会**两个属主换来换去**，其中一边必然写不进去。
+  #   ⇒ 两边**同为 root**，一致。（`drive-loop-docker.sh` 头部"还没验的三件事 ③"记的就是这条。）
+  #   ★ 代价：容器里跑的代码是 root。它的动作面是 `--url`/`--qbit-url`（HTTP）+
+  #     写 `$COMPOSE_DIR` 与 `/volume1/video` 下的文件（建硬链接、农场目录）。
+  #     这些**本来**就在 root 的权限下发生（宿主那份也是 root），所以这不是**新增**权限，
+  #     只是把同一权限挪了个地方。
+  #
+  # ★ 网络要**两个** —— 和 `cross-seed` 同形，别猜网络名
+  # ------------------------------------------------
+  #   `cross-seed` / `prowlarr` 在 `reseed-net`；`qbittorrent-reseed` 在 `qbit-net`
+  #   （=`qbittorrent-reseed_default`，external）。两条缺一不可：
+  #   少了 reseed-net 连不上 `cross-seed:2468`，少了 qbit-net 连不上
+  #   `qbittorrent-reseed:3060`。★ 别改成 `${NAS_IP}` —— 群晖上
+  #   「容器 → 宿主机 LAN IP → DNAT 回另一容器」会 timeout（README 坑 4）。
+  #
+  # ★ 接线与迁移状态：README「还没做」第 15 条 + `summary/26-...md` §26.5
+  # ------------------------------------------------------------------ #
+  drive-loop:
+    image: reseed-drive-loop:0.1.0
+    container_name: reseed-drive-loop
+    # ★★ 「生效但不自动上线」的安全锁（`#58` 的 15.a 修复之外的第二条前提）。
+    #   带 profile 的服务，`docker compose up -d` **默认不启动**；
+    #   必须 `docker compose --profile drive-loop up -d drive-loop`。
+    #   ⇒ 于是：代码就绪、进白名单、`deploy.sh` 会推，但**不会被任何人顺手拉起来**。
+    #     要启用必须显式打那条命令 —— 而那一步的前置是**先在 DSM 里停掉 run.sh 任务**。
+    #   ★ profile 名与 service 名同名**是巧合**：它的语义是
+    #     「**这是需要人工显式决策的第二条路**」，不是分类标签。
+    #   ★ 不给别的服务加 profile（否则它们会被一起锁住，那是另一种事故）。
+    profiles: ["drive-loop"]
+    # 常驻服务 —— 同 `cross-seed`。★ 但见下面那条警告：它只对**退出**生效，
+    # healthcheck 不健康**不**触发重启 ⇒ 「卡死能接管」还得靠 autoheal 侧车，
+    # 那是另一个决定，本次**没做**（README 15.a 末段）。
+    restart: unless-stopped
+    env_file: [.env]
+    environment:
+      - TZ=${TZ}
+      # 容器方言 ①：镜像里没有 /usr/bin/python3（那是 DSM 自带的），python 在 PATH 上
+      - PY=python
+      # 容器方言 ②：镜像里没有 sudo，而 build-farm.sh 用 `${SUDO-sudo}` ——
+      #   给空串它就跳过 sudo 直接跑（那步本来也 `|| true`）
+      - SUDO=
+    volumes:
+      # ① compose 目录，**同名同路径**（见上面「挂载为什么是整目录 1:1」）
+      #    ★ 用绝对路径字面量，**不用 `./`** —— `./` 解析到容器内不存在的宿主路径，
+      #      而这里要求两边**逐字相同**。
+      - /volume2/docker_ssd/prowlarr_cross-seed_autohardlink:/volume2/docker_ssd/prowlarr_cross-seed_autohardlink
+      # ② 媒体卷，同理必须同名同路径；而且 **§9：硬链接不能跨卷** ⇒
+      #    农场与源数据必须同一条设备，所以这个挂载**只能是整卷**
+      - /volume1/video:/volume1/video
+    command: ["sh", "drive-loop/run-resident.sh"]
+    networks: [reseed-net, qbit-net]
+    logging: *logging-limits
+
 networks:
   reseed-net:
     driver: bridge

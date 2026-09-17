@@ -2502,6 +2502,58 @@ def main() -> int:
     # 包轮流：记录上次跑到哪个包，下次从下一个开始
     cur_pack_idx = 0
     consec = (0, 0)      # (连续真失败批数, 连续良性收工批数)，各自跨阈值报警
+
+    # ------------------------------------------------------------------ #
+    # ★★ `#58` 15.a 修复（2026-09-17）：**常驻分支也要落盘状态与心跳**。
+    #
+    # 修之前：`write_state()` 全文件只有三处调用，**全在 `once_round()` 里**
+    #   ⇒ 常驻模式 `.drive-loop.state` 的 `heartbeat_ts` **这键根本不存在**。
+    #   而 `batch_alive()` 对容器版**只信心跳**（缺心跳时**保守返回 True**）
+    #   ⇒ 「容器卡死后被接管」**永远不会发生**：新容器读到一个没有心跳的状态，
+    #     按保守分支判「上一批还在跑」，于是**永远不接管**。
+    #   ★ 这正是 README「还没做」15.a 记的那条「不报错、只是不动」的缺陷。
+    #
+    # 修法：**复用**已有机制（`write_state` / `Heartbeat`），不新造第二个写法 ——
+    #   与 `once_round()` 的 `:2296-2311` 段保持**同一形状**，读代码的人只需认一套。
+    #
+    # ★ 新增一个 `mode` 键，专为 `§26.5` 前提 ② 那个缺口：
+    #   常驻与 `--once` **没有任何跨进程互斥**（一个写 `"container"`、一个写 `"host"`，
+    #   `batch_alive()` 两者互不相识）。两条路同时在跑时，
+    #   光看状态文件**分不出是谁写的** —— `mode` 就是让这件事**能被看出来**。
+    #   ⇒ `cat .drive-loop.state` 一眼可知当前是 `resident` 还是 `once`。
+    #
+    # ⚠ **修完仍不能**解决「容器卡死后自动重启」：`restart: unless-stopped` 只对
+    #   容器**退出**生效，**healthcheck 不健康并不触发重启**（README 15.a 末段）。
+    #   接管要靠 `autoheal` 侧车或 DSM 轮询 `docker inspect` —— **本次不写**。
+    #   但心跳修好之后，那条路的**判据才存在**（在此之前判据恒不成立）。
+    # ------------------------------------------------------------------ #
+    _in_container = os.path.exists("/.dockerenv")
+    _resident_started = time.time()
+    #: 常驻模式的状态快照。**写在一个地方**（而不是在每个 `continue` 前各写一遍）——
+    #: 循环里有三处 `continue`、一处正常返回，抄四遍必然会漂。
+    def _resident_state(round_n: int, pack_idx: int, streak, note: str) -> None:
+        """刷新常驻状态：心跳 + round + 包下标 + 连续失败计数。
+
+        ★ 字段名**沿用 `once_round()` 已有的**（`last_pack_idx` / `consec_abort` /
+          `consec_backoff`），不新造同义词 —— 否则 `batch_alive()` 与文档都要认两套。
+        ★ `running_pid` 在容器里语义不同（恒为 1）⇒ 照 `once_round` 的做法带
+          `running_pid_pidns` 标记，让 `batch_alive()` 跳过 pid 那一半。
+        """
+        write_state({"running_pid": os.getpid(),
+                     "running_pid_pidns": "container" if _in_container else "host",
+                     "heartbeat_ts": time.time(),
+                     "mode": "resident",
+                     "round": round_n,
+                     "last_pack_idx": pack_idx,
+                     "consec_abort": int(streak[0]),
+                     "consec_backoff": int(streak[1]),
+                     "started_ts": _resident_started,
+                     "note": note})
+
+    _resident_state(0, -1, consec, "启动")
+    LOG.info("常驻模式：已写状态（pid=%d pidns=%s；round/heartbeat 每轮刷新）",
+             os.getpid(), "container" if _in_container else "host")
+
     while args.max_rounds == 0 or round_no < args.max_rounds:
         pack = packs[cur_pack_idx % len(packs)]
         round_no += 1
@@ -2521,13 +2573,19 @@ def main() -> int:
                 return 0
             cur_pack_idx += 1
             if not args.once:
+                _resident_state(round_no, cur_pack_idx - 1, consec, "dry-run")
                 time.sleep(min_sleep)
             continue
 
         t0 = time.time()
         LOG.info("[第 %d 轮] 跑包 %s ...", round_no, pack)
         try:
-            stats = run_round(pack, args, api_key)
+            # ★ 心跳线程只包住跑批阶段（与 once_round 同形）：跑完就停，
+            #   免得和循环尾部写状态打架。批次里有长时间不发请求的阶段
+            #   （等日志静默最多 --drain-max-wait、回灌），所以必须**独立线程**，
+            #   不能靠"每发一条 webhook 刷一次"（见 Heartbeat docstring）。
+            with Heartbeat():
+                stats = run_round(pack, args, api_key)
         except Exception as e:  # noqa: BLE001 —— 循环不能因单批异常而死
             LOG.exception("[%s] 本批异常（继续循环）", pack)
             emit("alert", f"{pack} 本批异常",
@@ -2539,6 +2597,7 @@ def main() -> int:
             consec = update_abort_streak(consec, None, failed=True)
             if args.once:
                 return 1
+            _resident_state(round_no, cur_pack_idx, consec, "本批异常")
             time.sleep(BACKOFF_SLEEP)
             cur_pack_idx += 1
             continue
@@ -2553,6 +2612,7 @@ def main() -> int:
                     return 0
             if args.once:
                 return 0
+            _resident_state(round_no, cur_pack_idx - 1, consec, "本批无动作")
             time.sleep(min_sleep)
             continue
 
@@ -2573,9 +2633,21 @@ def main() -> int:
             LOG.info("--once 模式：本轮完成，退出")
             return 0
         sleep_sec = max(sleep_sec, min_sleep)
+        _resident_state(round_no, cur_pack_idx - 1, consec, "正常收工")
         LOG.info("等待 %.1f 分钟后跑下一批（%s）", sleep_sec / 60, packs[cur_pack_idx % len(packs)])
         time.sleep(sleep_sec)
 
+    # ★ 循环正常结束（`--max-rounds` 到了）—— 收尾与 `once_round` 的 finally 同形：
+    #   把 running_pid 置空，免得下一次唤醒看到残留 pid。
+    #   ★ 这里**同时清掉 heartbeat_ts**（整体覆盖、不合并）——理由与 `once_round`
+    #     的注释写的一样：残留的心跳会让下一轮误判「上一批还在跑」。
+    write_state({"running_pid": None, "last_end_ts": time.time(),
+                 "last_pack_idx": (cur_pack_idx - 1) % len(packs),
+                 "consec_abort": int(consec[0]),
+                 "consec_backoff": int(consec[1]),
+                 "mode": "resident",
+                 "round": round_no})
+    LOG.info("常驻模式：已到 --max-rounds=%d，正常收尾。", args.max_rounds)
     return 0
 
 

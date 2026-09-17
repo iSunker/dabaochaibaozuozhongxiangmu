@@ -1192,6 +1192,18 @@ spool 积压: 0 条告警
    | 每日摘要 | 每天 21:00 | `sh <路径>/notify-spool.sh --digest` | **不要勾** |
    | 驱动跑批 | 每 15 分钟 | `sh <路径>/drive-loop/run.sh` | **不要勾** |
 
+   > ★★ **2026-09-17 迁移说明（`#58`）**：这条「驱动跑批」任务**在 `drive-loop` 容器启用后应当停掉** ——
+   > 两者是**同一个工作的两条路**、且**没有跨进程互斥**：同时发 webhook ⇒ 一次 429 可能废掉几百条（坑 4）。
+   > ⇒ **正确顺序：① 先在 DSM 里停掉这条任务；② 再**显式**启用容器：**
+   > ```bash
+   > docker compose --profile drive-loop up -d drive-loop
+   > ```
+   > ★ **启用命令是显式的 —— `docker compose up -d` 不会起它**（那个服务带 `profiles: ["drive-loop"]`，
+   > 这是一把**防呆锁**：代码已就绪、`deploy.sh` 会推，但不会被谁顺手拉起来）。
+   > ★ 详细取舍、仍**未解决**的接管机制、以及刻意与其余三个服务不同的两处，见「还没做」第 15 条。
+   > ⚠ **没停 DSM 任务就起容器 = 两条路同时跑**（容器入口自己有一道兜底闸门会退出码 3，
+   > 但它只是兜底，**别当主闸**）。
+
 > ⚠ **三个都不要勾「发送运行详情」**：排空任务每 5 分钟一趟 = **一天 288 封**，
 > 驱动任务一天 96 封 —— 那不是告警，是骚扰。结果一定是你去建一条
 > 「来自 NAS 的邮件」过滤规则，**连真正的告警一起过滤掉**。
@@ -1997,33 +2009,56 @@ schtasks /Delete /TN "reseed-drive-loop" /F
 
 15. ⬜ **2026-09-13：#58「drive-loop 迁容器」的静态对账 —— 含一条代码缺陷**
 
-   **a. ★ 缺陷（这条是新的，且是"不报错、只是不动"的形状）：常驻分支不写心跳、也不落盘状态。**
-   `drive-loop.py` 的 `write_state()` **全文件只有两处调用，都在 `once_round()` 里**
-   （批前写 `running_pid` + `heartbeat_ts`；收尾写 `{"running_pid": None, ...}`）。
-   常驻分支（`if args.once and not args.dry_run` 为假时走的那条）调 `run_round()` 时
-   **没有 `with Heartbeat()` 包着** ⇒ 常驻模式下：
-     * `.drive-loop.state` 的 `heartbeat_ts` **这键根本不存在**；
-     * 包轮换下标 `cur_pack_idx` 与连续失败计数 `consec` **都是局部变量**，进程/容器一重启就从头
-       （`--once` 那边是靠 `consec_abort` 落盘跨进程累计的，见 §17.5.4）。
-   ⇒ **后果**：若照「给常驻容器加 healthcheck，判据用心跳新鲜度」这条路做，
-     那套判据在常驻模式下**永远不成立**（键都没有）。要这么走得**先改代码**。
-   ⇒ ★ 这同时否掉了一份外部分析里「常驻模式代码已存在、不用改代码，只需改怎么跑」的结论 ——
-     **跑起来**确实不用改；**要"卡死能接管"** 就得改。
-   ⇒ 另记一条同源的：`restart: unless-stopped` 只对容器**退出**生效，
-     **healthcheck 不健康并不会触发重启** —— 所以常驻路线的接管机制得再加一个
-     `autoheal` 侧车（或 DSM 轮询 `docker inspect`），不是配一个 healthcheck 就完事。
+   **a. ★ 缺陷：「常驻分支不写心跳、也不落盘状态」—— ✅ 已修（2026-09-17）**
+   （原形状：`write_state()` **全文件只有两处调用，都在 `once_round()` 里**
+   —— 批前写 `running_pid` + `heartbeat_ts`；收尾写 `{"running_pid": None, ...}`；
+   而常驻分支调 `run_round()` 时**没有 `with Heartbeat()` 包着** ⇒ `heartbeat_ts`
+   **这键根本不存在**；包轮换下标 `cur_pack_idx` 与连续失败计数 `consec` **都是局部变量**，
+   进程/容器一重启就从头。）
 
-   **b. 迁容器（方案 B）的草案已落盘：`scripts/drive-loop-docker.sh`**
-   （`docker run` 包装 + 挂载清单 + 三处容器方言差异）。
-   **未部署、未进 `deploy.sh` 白名单 —— 有意为之**：白名单的语义是「两边必须一致」，
-   而这份还没在 NAS 上验过；现在就收进去，下次谁跑一次 `--apply` 就会造成假一致
-   （生产上有了这个文件、看着像在用的那套，而 DSM 任务调的还是 `run.sh`）。
-   ★ 若最终采用，**首选**其实不是这个包装，而是做成 `compose.yaml` 的一个服务
-     （网络与卷由 compose 统一声明，不用 `create → network connect → start` 绕），
-     届时本包装退化成一句 `docker compose run --rm drive-loop`。
-     现在不直接改 `compose.yaml` 的理由只有一条：**它在白名单里，改它 = 改生产**。
+   **改法**（`drive-loop.py` 的 `main()` 常驻循环，复用手边的 `Heartbeat` 与 `write_state()`，
+   **不新造机制**）：`run_round()` 那一步包进 `with Heartbeat():`（与 `once_round()`
+   **同一形状**），并加一个 `_resident_state()` 在「进循环前 / 每轮收工 / 本批无动作 /
+   本批异常 / 正常收尾」五处落盘 —— 落盘字段名沿用 `once_round` 已有的
+   （`last_pack_idx` / `consec_abort` / `consec_backoff`），**不新造同义词**。
+   ★ 新增一个 `mode: "resident"` 键，它是**常驻分支独有**的 —— 见下面 (d)。
 
-   ★★ 一条值得单独记的结论 —— **「挂载 1:1」不是「挑几个子目录挂」，而是整个 compose
+   ⇒ 于是「卡死被接管」的**判据这才存在**（改之前 `batch_alive()` 对容器版只信心跳，
+     缺 `heartbeat_ts` 时**保守返回 `True`** ⇒ 永远判「在跑」，接管**永不发生**）。
+
+   **★★ 仍然没解决的（别把上面的 ✅ 读成"接管做完了"）**：`restart: unless-stopped`
+   只对容器**退出**生效 —— **healthcheck 不健康并不会触发重启**。所以"卡死能接管"
+   还得再加一个 `autoheal` 侧车（或 DSM 轮询 `docker inspect`）。**本次没做**（另一个决定）。
+   ⇒ 一句话：**这次是让判据存在，不是让接管发生。**
+
+   **b. 已落地（取代了原「方案 B」的 `docker run` 草案）：`compose.yaml` 里的 `drive-loop` 服务**
+   + 常驻入口 `scripts/drive-loop-resident.sh`（部署为 `drive-loop/run-resident.sh`）。
+   ★ `scripts/drive-loop-docker.sh`（那份 `docker run` **草案**）**已作废**，
+     但**文件保留** —— 它记着挂载清单与三条容器方言的推导过程，是 `§26.5` 的判据；
+     在 `check-deploy-drift.py` 的 `LOCAL_ONLY` 里已改写成「已作废、保留为推导记录、不部署」。
+
+   **★★ c. 安全锁 —— `profiles: ["drive-loop"]`（本次最要紧的一条）**
+   原因就是 (d)：两条路**没有跨进程互斥**，同时发 webhook ⇒ 一次 429 可能废掉几百条。
+   给服务带 profile 之后，`docker compose up -d` **默认不会启动它**；
+   启用必须**显式**打 `docker compose --profile drive-loop up -d drive-loop`。
+   ★ 于是：**代码就绪、进了白名单、`deploy.sh` 会推，但不会被任何人顺手拉起来。**
+   ★ 反向也要守住：**其余四个服务都不许带 profile**（带上就被一起锁住 ——
+     `prowlarr` 起不来 ⇒ cross-seed 全站搜不到，是另一种事故）。两条都进测试钉住了。
+   ★ profile 名与 service 名**同名是巧合**，它的语义是「**这是需要人工显式决策的第二条路**」，
+     不是分类标签。
+
+   **★★ d. 启用是两步、且顺序不能倒（人工，不在本机范围）**
+   1. **先在 DSM → 控制面板 → 任务计划里停掉「驱动跑批」那条**（见部署步骤第 4 点那张表）；
+   2. 再 `docker compose --profile drive-loop up -d drive-loop`。
+   ⇒ 为什么必须先停：两条路**没有任何跨进程闸门**可互斥（`--once` 的 `batch_alive` 读
+     `running_pid_pidns`，容器写 `"container"`、宿主写 `"host"`，**两者互不相识**）。
+     ★ 而且它比"两个同类进程"更隐蔽 —— **两边写的东西不一样**（常驻写 `mode=resident`、
+     `--once` 不写 mode）⇒ 改之前**从状态文件上根本看不出有两个在跑**。
+     (a) 那次修复补上 `mode` 与心跳，就是为了让这件事**能被看出来**。
+   ★ `run-resident.sh` 自己还有一道**前置闸门**（读到"另一条路在跑"就退出，码 3），
+     但它只是**兜底**：`mode=resident` 时它无法区分"上一轮残留"与"另一个常驻"。**别把兜底当主闸。**
+
+   **e. ★ 一条值得单独记的结论 —— 「挂载 1:1」不是「挑几个子目录挂」，而是整个 compose
    目录按同名同路径挂。** 因为代码里的路径**全是绝对路径**：`CROSSSEED_DIRS[0]`（硬编码）、
    `build-farm.sh` 的 `COMPOSE_DIR`、`--env "$COMPOSE_DIR/.env"`、告警出栈口
    `notify/spool/`、以及 `ROOT = HERE.parent` 那条推导。挑着挂**不会报错**，
@@ -2032,13 +2067,24 @@ schtasks /Delete /TN "reseed-drive-loop" /F
    而漏了的后果是**静默**的：对账 / 无人认领的基线会被当成「首次读数」重新记一遍。
    ★ 代价也要写明：挂整个 compose 目录 = 把 `.env`、`prowlarr/`、`cross-seed/`、
    `notify/notify.conf` 一并交给这个容器 —— 这是**新扩大的爆炸半径**，躲不掉。
+   `profiles` 锁把"什么时候交出去"变成人的决策，但**不能**减小半径。
 
-   ★ **边界（别把这份对账读成"已经跑通过了"）**：容器里**真跑一遍没做过**，
-   闸门跨容器**连跑两轮没验过**，属主/权限**没验过** —— 以上全是静态对账
-   （读 NAS 上的 `run.sh` / `compose.yaml` + 本地代码）。本机不能在 NAS 上执行命令
-   （SSH 关着）。这三条也写在草案文件头部了。
+   **f. ★ 刻意不同的两处（别"顺手统一"回去）**
+   * **不加 `user:`**（另三个服务都有 `${PUID}:${PGID}`）：宿主那份 `run.sh` 由 DSM 以
+     **root** 跑 ⇒ 它写下的 `.drive-loop.state` / `attempts.log` / `drive-loop.log`
+     属主是 root。容器若切成 `${PUID}:${PGID}`，同一个文件**两个属主换来换去**，
+     必然有一边写不进去。⇒ 两边同为 root。
+   * **不写 `build:`**：本仓 build 上下文是**仓库根**、NAS 上是 **compose 目录**，
+     两边相对路径不同 ⇒ 写了会在 NAS 上 build 失败。镜像 `reseed-drive-loop:0.1.0`
+     **只 load 不 build**（`§26.5` 表）。
 
-   **c. 顺带修掉一条"自己造的陈旧描述"**：本节上面那段原写 `rm-staging.sh`「只认三类路径」，
+   **★ 边界（别把本节读成"已经跑通过了"）**：容器里**真跑一遍没做过**，
+   闸门跨容器**连跑两轮没验过**，属主/权限**没验过**，接管机制**没做** ——
+   以上全是静态对账 + 本机离线断言（`tests/test_drive_loop_service.py` 43 条）。
+   ★ 而 `profiles` 那把锁**本机若没 docker 就是"未验"**：该文件会打印一条 `--` 行明说，
+   **别把它的绿读成「锁生效了」**。**
+
+   **g. 顺带修掉一条"自己造的陈旧描述"**：本节上面那段原写 `rm-staging.sh`「只认三类路径」，
    而它 2026-09-13 已撤成**两类**（旧根删完即撤）—— 已按现状更正。
 
 #### 收尾命令（一次重建同时办完两件事）—— ✅ **已执行过，此节仅存流程**

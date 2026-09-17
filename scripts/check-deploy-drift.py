@@ -206,7 +206,7 @@ LOCAL_ONLY = [
     #   **先验，后进白名单**。验通过后的正确做法不是删掉这一行、而是：
     #   把它加进 deploy.sh 的 FILES，**并从本清单里移除**（两处必须同时改，
     #   只改一处就会被 B 方向当场报出来 —— 这正是这份清单存在的意义）。
-    (r"^scripts/drive-loop-docker\.sh$",          "**草案**，未部署（#58 迁容器方案 B）；验通过后应进白名单并删掉本行"),
+    (r"^scripts/drive-loop-docker\.sh$",          "**已作废**（#58 的 docker run 草案）—— 取代它的是 compose.yaml 里的 drive-loop 服务；保留为推导记录（挂载清单 + 三条容器方言），**不部署**"),
     (r"^prowlarr/\.gitkeep$",                     "占位符；生产的 prowlarr/ 是**不许碰**的"),
     (r"^scripts/(add-indexers|add-torznab-indexer|check-indexer-timestamps"
      r"|gen-datadirs|gen-nas-env-update|migrate-reseed-dirs|run-batch|wait-for-checks)"
