@@ -265,6 +265,57 @@ dl.once_round(["dc-collection", "frds-top250-2024", "mbf"], args_ns(), "k", dl.M
 ck("★ 同一个 last_pack_idx=0，mbf 挪到末尾 → 下一批变成 frds（顺序即调度）",
    _seen[0], "frds-top250-2024")
 
+# =========================================================================== #
+# ⑧ ★★ 容器里的 pid 那一半必须停用（`#58` D1，2026-09-17）
+# =========================================================================== #
+# 实测（真容器里 import 本文件被测的那个模块）：
+#   · 容器内 os.getpid() **恒为 1**（容器里第一个进程就是 PID 1）；
+#   · 于是容器写下的 running_pid 是 1，而**下一个容器自己也是 1**
+#     ⇒ 拿宿主那套 pid_alive 去读 ⇒ **恒真的假信号**（"上一批还在跑"）。
+# ⇒ 修法：容器版多写 running_pid_pidns="container"，batch_alive 据此**跳过 pid**。
+# ★ 为什么不能一起删 pid：宿主版还靠它（真 pid 有复用风险）。两边语义**不同**。
+_now = time.time()
+
+# ── 决定性的一格：只有 pid 那一半能决定结果 ──────────────────────────────
+# 心跳**新鲜**（只看心跳 ⇒ True）+ pid **不存在**（看 pid ⇒ False）
+# ⇒ 容器标记应得 True、宿主标记应得 False。**两者不同**才证明分支真的分开了。
+_ghost = 999999
+ck("前置：pid_alive(999999) 确为 False（否则这一格没有分辨力）",
+   dl.pid_alive(_ghost), False)
+
+ck("★ 容器标记 + 幽灵 pid + 心跳新鲜 → True（**不看 pid**）",
+   dl.batch_alive({"running_pid": _ghost, "running_pid_pidns": "container",
+                   "heartbeat_ts": _now}), True)
+ck("★ 宿主标记 + 同一组输入 → False（**看 pid**）",
+   dl.batch_alive({"running_pid": _ghost, "running_pid_pidns": "host",
+                   "heartbeat_ts": _now}), False)
+
+# ── 容器分支的四格（心跳说了算）────────────────────────────────────────
+ck("容器 + pid=1 + 心跳新鲜 → True（心跳新鲜）",
+   dl.batch_alive({"running_pid": 1, "running_pid_pidns": "container",
+                   "heartbeat_ts": _now}), True)
+ck("容器 + pid=1 + 心跳陈旧 → False（**接管**，不再被那个恒真的 pid 拖住）",
+   dl.batch_alive({"running_pid": 1, "running_pid_pidns": "container",
+                   "heartbeat_ts": _now - 10 * dl.HEARTBEAT_STALE_SEC}), False)
+
+# ── 阴性对照：**撤掉容器标记**，同一组输入必须变回 False ────────────────
+# 没有这一条，上面那条"True"可能是恒真的（万一 batch_alive 压根不看输入）。
+ck("★阴性对照：拿掉 pidns 标记（=旧格式）→ 同一组输入变 False",
+   dl.batch_alive({"running_pid": 1,
+                   "heartbeat_ts": _now - 10 * dl.HEARTBEAT_STALE_SEC}), False)
+
+# ── 旧文件（无标记、无心跳）仍走"保守当在跑"那条老路 ────────────────────
+ck("旧格式（无 pidns、无 heartbeat_ts、pid 活）→ True（保守，老行为不变）",
+   dl.batch_alive({"running_pid": __import__("os").getpid()}), True)
+
+# ── 写侧：容器里**必须**带上那个标记，否则上面整个分支形同虚设 ──────────
+# 判据不是"文件里有这个字符串"，而是"两条路都写了正确的值"。
+_src = SRC and open(SRC, encoding="utf-8").read()
+ck("★ 写侧写了 running_pid_pidns（容器/宿主两值）",
+   ('"running_pid_pidns": "container" if _in_container else "host"' in _src), True)
+ck("★ 判据用 /.dockerenv（运行时自生，不是人传的环境变量）",
+   ('os.path.exists("/.dockerenv")' in _src), True)
+
 print()
 if fails:
     print(f"!!! {len(fails)} 个失败")

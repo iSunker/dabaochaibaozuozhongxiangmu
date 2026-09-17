@@ -232,7 +232,15 @@ NAS 上还跑着**别人的**容器（IYUU Plus、另一套 qB、opencd），它
 **水位与行为**：`/volume1` 接近满 ⇒ **ENOSPC 会级联** —— 波及 cross-seed 注入、IYUU 辅种、
 甚至**日志**（实测：卷剩 0 字节时 `say` 的 stdout 坏掉，`set -e` 带走整趟，见 `ERR-SH-06`）。
 
-**「看着在但不在共享文件夹里」**：`/volume1/docker` **不是**共享文件夹，SMB 里看不到。
+**「看着在但不在共享文件夹里」** —— ★ **2026-09-17 实测更正：这句话原来是错的。**
+`/volume1/docker` **是**共享文件夹（DSM 自己的 `share_list.csv` 列为 `Shared Folder / Volume 1`），
+`//iSunker-DS423/docker` **UNC 可达**（`ls` / `stat` / `df` 都能跑，`df` 报 56 T = `cachedev_1`）。
+真正成立的是**较弱的那句**：**它不在"枚举"里** —— `net view iSunker-DS423` 与本机 `ls //iSunker-DS423/`
+**都只列出 5 个**共享，漏掉 8 个**能访问的**（`Download` / `docker` / `qb_temp` / `web` /
+`drive` / `homes` / `web_packages` / `ActiveBackupforBusiness`）。
+⇒ ★★ **「枚举里看不见」≠「不是共享文件夹」**（`net view` / `ls` **≠ 全量共享表**，见 `ERR-HW-03`）。
+★ 可用的**负对照**：`ls //iSunker-DS423/nosuchshare_zzz123` → `No such file or directory`
+⇒ MSYS **会**区分真假共享名，所以"可达"不是幻觉。
 
 **农场为什么能在满卷上跑**：农场与单片全是**硬链接，不占数据块**。
 ★ 反过来说：**机械盘被大量占用 = 一定有人在"拷贝"而不是"链接"** —— 2026-09-13 那批
@@ -541,6 +549,9 @@ NAS 上还跑着**别人的**容器（IYUU Plus、另一套 qB、opencd），它
 
 ### ERR-DSM-03 共享文件夹**看不出**在哪块物理盘上
 - **症状**：以为 `/volume1/docker` 和 `/volume1/video` 是一回事（都 `/volume1/`），实际归属要靠 `ContainerManager/all_shares` 读。
+  ★ 2026-09-17 更正：症状**前半句对、后半句过时** —— `docker` 与 `video` 其实**同属 `cachedev_1`**
+  （`docker` 是共享文件夹且**可达**，只是不进"枚举"，见 `ERR-HW-03`）；
+  而 `all_shares` **只在 NAS 上读得到**，本机有两条替代通路（见下「规避做法」）。
 - **环境前提**：DSM 上 `video` 与 `docker_ssd` 这类共享文件夹**分属两个不同的卷**，路径前缀却都是 `/volumeN/...`。
 - **根因**：共享文件夹 → 卷的映射是 DSM 的元数据，**不体现在路径字符串里**。
 - **触发条件**：任何"按路径前缀判断是不是同一块盘"的推理。
@@ -550,6 +561,13 @@ NAS 上还跑着**别人的**容器（IYUU Plus、另一套 qB、opencd），它
 - **怎么发现的**：2026-09-13 复测补上"卷归属表"那一格（SUMMARY §9 原话：当时没记，只写了两个挂载点）。
   ★ 2026-09-14 复核：`df`（Windows 侧）与群晖 Storage Analyzer 的 `share_list.csv`
   **两条独立来源逐格吻合**（`docker_ssd`/`qb_temp` 在 `cachedev_0`；`video` 等 6 个在 `cachedev_1`）。
+  ★★ 2026-09-17 实测：`share_list.csv` 是**三条里最强的一条** —— 它**逐共享**给出
+  `Volume` 列 + **精确到字节**的两个 size 列，本机经 SMB 直读（见 `A.3`），
+  实测 **12 个共享**（`docker` → **Volume 1**、`ActiveBackupforBusiness`/`Download`/`drive`/
+  `homes`/`video`/`web`/`web_packages` → Volume 1；`000 临时文件夹nas…`/`docker_ssd`/
+  `qb_temp`/`技术文档` → Volume 2）⇒ **一次读全，不依赖枚举**（★★ `ls` / `net view` 只列 5 个，
+  正是这里要绕开的东西）。★ 注意文件是 **UTF-16LE**（`utf-8-sig` 解会得到交错的空字节），
+  zip 内层名与列名按 `utf-16-le` 解才对（编码坑见 `ERR-ENC-01` 一族）。
 - **边界**：DSM 专有。★ 与 `A.3` 的 ★ 是同一条知识的两种表述（一个在前提层、一个在错误层），**都留**。
 
 ### ERR-DSM-04 `/etc/ssmtp/ssmtp.conf` 是 **0 字节空壳**，真路径是 `/usr/syno/etc/synosmtp.conf`
@@ -1118,16 +1136,21 @@ NAS 上还跑着**别人的**容器（IYUU Plus、另一套 qB、opencd），它
 - **触发条件**：增删索引器之后没重新核对。
 - **规避做法**：**每次增删索引器后都要重新核对**：
   ```bash
-  curl -s -H "X-Api-Key: <Prowlarr API key>" http://<NAS_IP>:9696/api/v1/indexer \
-    | python -c "import sys,json;[print(i['id'], i['name']) for i in json.load(sys.stdin)]"
+  python scripts/prowlarr-indexers.py --torznab
   ```
-  ★ **管道是必须的，不是顺手**：`/api/v1/indexer` 的响应**每一行都带 `fields`**
-  —— 那里面有 cookie / passkey（见本节开头「绝不打印 `indexer.fields`」）。
-  裸跑那个 `curl`（哪怕只为"看一眼结构"）就等于把全部站点的凭据打到终端上，
-  **而终端输出会进聊天、进日志、进截图**。要么保留管道，要么别调这个端点。
-  ★ 同族：**key 不进命令行**（会留在 shell 历史与进程列表里）。这条 curl 用
-  `-H "X-Api-Key: …"` 是历史写法；新写的查站工具应从 `.env` 读 key
-  （如 `scripts/prowlarr-indexerstatus.py`、`scripts/check-indexer-timestamps.py`）。
+  ★★ **2026-09-17 更正：给药改掉了 —— 原来这里的处方是一条裸 `curl`。**
+  这个端点的响应**每一条都带 `fields`**（那里面有 cookie / passkey）。
+  早先的补法是「管道是必须的，不是顺手」——**那条补法不够**：
+  · 它只挡住「裸跑」，挡不住「为了看一眼结构」而 `| head` / `| jq` / `| less`；
+  · 更根本的是**没有替代品** ⇒ 规矩和处方在同一个文件里打架（本文件开头就写着
+    「绝不打印 `indexer.fields`」，而处方逐字打出来）。
+  ⇒ 现在改成 `scripts/prowlarr-indexers.py`：**同一个端点，但只取
+    `id` / `name` / `enable`** 三个白名单字段，`fields` 从不进内存、更不进 stdout。
+  它的输出**可以安全粘贴**。★ 这是「**规矩要有工具守着**」那条的又一次落地：
+  光有规矩、没有能用的工具，处方就会被抄成违规的样子。
+  ★ 同族：**key 不进命令行**（会留在 shell 历史与进程列表里）。新脚本从 `.env`
+  读 key、只走 `X-Api-Key` header（同 `scripts/prowlarr-indexerstatus.py`、
+  `scripts/check-indexer-timestamps.py`）。
 - **怎么发现的**：SUMMARY §6.6。
 - **边界**：★ 还要区分：**「只在 Prowlarr 里禁用索引器」≠「cross-seed 不搜它」** ——
   cross-seed 只认自己的 `TORZNAB_URLS`，会继续请求已禁用的站，每搜一次吃一个 `HTTP 410` 并 snooze。
@@ -1785,12 +1808,34 @@ NAS 上还跑着**别人的**容器（IYUU Plus、另一套 qB、opencd），它
 > 交叉引用：本体登记在 `ERR-DSM-09`。**替代通道清单**：
 > 只读 → SMB（UNC）/ HTTP 端口；写 → `deploy.sh`（白名单）/ 给用户一条命令在 DSM 里执行。
 
-### ERR-HW-03 共享文件夹与 SMB 视图的差异（`/volume1/docker` 不是共享文件夹）
+### ERR-HW-03 共享文件夹与 SMB 视图的差异（`/volume1/docker` **是**共享文件夹，但**不在枚举里**）
 > 交叉引用：本体登记在 `ERR-DSM-03` / `A.3`。
+> ★★ **2026-09-17 更正：原结论（"不是共享文件夹 / SMB 看不到"）是错的** —— 它**可达**、DSM 也列为共享文件夹。
+> 成立的是**弱话**：**枚举 ≠ 全量共享表**。本机 `ls //iSunker-DS423/` 与
+> `net view iSunker-DS423` **都只列 5 个**，而**能访问的至少 11~12 个**
+> （`share_list.csv` 列 12 个；详见 `A.3` 与 `ERR-DSM-03`）。
+> **怎么发现的**：2026-09-14 实测 `//iSunker-DS423/docker` 可达（负对照 `nosuchshare_zzz123`
+> → `No such file or directory`，证明不是幻觉）；2026-09-17 复核 `share_list.csv` 的 `Volume` 列
+> 把 `docker` 列为 **Volume 1**。★ **本条的教训不是"docker 到底是不是共享文件夹"**，
+> 而是下面这两层：
+>
+> 1. ★★ **「枚举里看不见」≠「不存在」** —— 这条 ★ 本来就写在本节里，
+>    **却在 8 行之外被自己违反**（拿 `net view` 的枚举去断言"没有"）。
+> 2. ★★ **`net view` 在本机不稳，不能承重**（2026-09-17 实测）：
+>    `net view '\\iSunker-DS423'`（bash 直接传参）→ **系统发生 1702 错误 / 绑定句柄无效**；
+>    换 `net view iSunker-DS423`（裸名）**才通**。⇒ 原记录里那句
+>    「`net view` 没有任何备份共享」有 **"探针跑不通被读成没有"** 的嫌疑
+>    （`B.10` 第 1 条那个形状）。**即便跑通，它也只是一次枚举、不是全量** ⇒ 同样不能承重。
+
+### ERR-HW-03b ★ SMB 侧看不见 `@` 前缀的系统目录 ⇒ **"没有快照"不能用 `ls` 排除**
 > ★ 另一条同族、且**更隐蔽**的：**SMB 侧看不见 `@` 前缀的系统目录** ——
 > 所以"**没有快照**"这件事**不能靠 `ls` 排除**（`@snapshots` 之类根本不出现在 SMB 视图里）。
-> **怎么发现的**：查"有没有备份可恢复"时，`net view` 没有任何备份共享、4 处 `#snapshot` 均不存在 ⇒
-> 结论只能写成「**SMB 侧看不见**」，不能写成「**不存在**」。
+> ★★ **判据要挪到不依赖枚举的通道上**：`ls` / `net view` / `df` 都是"**枚举出一个集合**"，
+> 而"有没有快照 / 有没有备份"要的是"**全量**" —— 两者不是一回事（`B.10` 第 16 条同族）。
+> 现状只能写成「**SMB 侧看不见**」，**不能**写成「**不存在**」；
+> 要坐实需要一条**不枚举**的通路（NAS 侧 `btrfs subvolume list` / DSM 快照 UI）。
+> **怎么发现的**：查"有没有备份可恢复"时，`net view` 无任何备份共享、4 处 `#snapshot` 均不存在
+> ⇒ 结论只能写成「**SMB 侧看不见**」（★ 且如上，那次 `net view` 本身还未必跑通）。
 
 ### ERR-HW-04 File Station 的删除行为：**挪进 `#recycle` 而非真删**
 > 交叉引用：本体登记在 `ERR-DSM-07`。

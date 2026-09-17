@@ -196,8 +196,17 @@ class Notifier:
             f"title: {_clean_line(ev.title)}",
         ]
         if ev.metrics:
-            # 值里的空格会破坏 `k=v k=v` 的切分，一律换成下划线
-            kv = " ".join(f"{_clean_line(str(k))}={_clean_line(str(v)).replace(' ', '_')}"
+            # ★★ 空格在**键**和**值**里都要换掉 —— 两边都会破坏 `k=v k=v` 的切分：
+            #    · 值：`seeding:x=frds top` ⇒ 多出一段。
+            #    · 键：**更阴** —— `seeding:my pack=1` 被下游按空格切开后成了
+            #      `seeding:my`（**没有 `=`，整个键凭空消失**）+ `pack=1`（键**恰好
+            #      等于 `pack`**）⇒ 而摘要正是靠 `pack=` **整键相等**来数批次的
+            #      （`notify-spool.sh` 里那条 awk；`tests/README.md` 专门钉过
+            #      「`packs=` 不是 `pack=`」）⇒ 一个含空格的包名会让该行被
+            #      **误计为一批**，并污染 ok=0 计数与做种合计。
+            #    ⇒ 键与值走**同一条**规范化，别只治值那一半。
+            kv = " ".join(f"{_clean_line(str(k)).replace(' ', '_')}="
+                          f"{_clean_line(str(v)).replace(' ', '_')}"
                           for k, v in ev.metrics.items())
             head.append(f"metrics: {kv}")
         body = (ev.body or "").rstrip()

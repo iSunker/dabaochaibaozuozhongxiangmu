@@ -67,6 +67,49 @@ ck("表格行数 = 脚本数（每个脚本都得有一格）", len(rows), n_scr
 table_sum = sum(int(n) for _, n in rows)
 ck(f"② 表格 {len(rows)} 行相加 == ① 日期行里的数（两处各自会漂）", table_sum, n_assert_doc)
 
+# ---- ②b ★★ 表格逐格 == **实跑**出来的数 ------------------------------------
+# ★★★ 2026-09-17 补：上面那条 ② **有盲区** —— 它只查「表格 vs 日期行」，
+#   两处**一起漂**（各少算 9 条）时**照样绿**。
+#   实测撞到：我把 `test_once_gate.py` 从 32 条加到 41 条（+9），
+#   却没同步表格那一格、也没同步日期行 ⇒ **两边各漂一半、相互抵消** ⇒ ② 通过、
+#   而**真值是 866，README 仍写 857**。这正是 `#70` 那个形状：
+#   **判据看着有结构，而它覆盖的范围里恰好不含"事实"**。
+#   ⇒ 补这一条：**逐个脚本真跑一遍，数它的断言行**，与表格那一格比。
+#   ★ 代价要说清：这会把整套测试**再跑一遍**（几十秒）。
+#     对「README 是唯一出处」这件事值得；但若哪天太慢，宁可**减少频率**（人手动跑），
+#     也别把它换成"大概对一下"——那样就退回成 ② 了。
+#   ★★ 必须**排除自己**：本文件也在 `test_*.py` 的集合里，不排除就会
+#      **递归自我调用**（实测：跑成 0 字节输出、永不结束，只能杀掉）。
+_self = pathlib.Path(__file__).name
+#   ★ 数法：与 `tests/README.md` 里那条命令**同一套行型**（三种都要数，
+#     只数 `  ok  ` 会漏 —— 文档里实测会少 8 条）。
+import subprocess as _sp
+import re as _re2
+
+_ASSERT_LINE = _re2.compile(r"^  ok  |^ FAIL |: PASS|: FAIL")
+_mismatch = []
+for fname, want in rows:
+    if fname == _self:
+        # ★ 自己那一格不实跑（会递归）；它的数由它**跑完时**打印的最后一行给出，
+        #   而那一行本身也要对 ⇒ 单列一格说明，不当成"跳过"。
+        continue
+    fp = README.parent / fname
+    try:
+        _r = _sp.run([sys.executable, str(fp)], capture_output=True, text=True,
+                     encoding="utf-8", errors="replace", timeout=300)
+    except Exception as e:                                   # noqa: BLE001
+        _mismatch.append(f"{fname}: 跑不起来（{type(e).__name__}）")
+        continue
+    got = sum(1 for l in (_r.stdout or "").split("\n") if _ASSERT_LINE.search(l))
+    if got != int(want):
+        _mismatch.append(f"{fname}: 表格 {want} ≠ 实跑 {got}")
+ck("②b ★★ 表格每一格都 == **实跑**出来的断言数（② 查不出的『两处一起漂』由它兜）",
+   _mismatch, [])
+# ★ 自己那一格的替代判据：**它必须出现在表格里且行数自洽**（② 已兜）。
+#   ★ 明说为什么只跳过自己：**递归**（不是"它不重要"）。
+ck(f"②c 本文件（{_self}）在表格里有格（它自己不实跑，理由是**递归**）",
+   _self in dict(rows), True)
+
 # ---- ③ backoff 那一格 vs 日期行里那句「51 → 54」--------------------------
 bo = dict(rows).get("test_backoff.py")
 #   ★★ 这里**故意不写死一个数字**：写死就等于把「54」供成契约，

@@ -1635,6 +1635,40 @@ def reconcile_watch(args) -> tuple[str, dict]:
     return "\n".join(lines), m
 
 
+def pack_progress_watch(st) -> tuple[str, dict]:
+    """各包「做种 / 总数」→ (给日报正文的一段, 给 metrics 的字典)。
+
+    ★★ **必须在这个 `with S.StateStore(args.db) as st:` 里被调用**（`#96`）——
+      本函数**不自己开库**。理由不是风格：`report_daily` 里读库那段是
+      `try/with`（差的时候只往正文追一句「算不出」），而 `after_batch_reports`
+      的**外层** `except` 是 `LOG.debug(...)` ⇒ 一旦抛到那一层，
+      **整份日报连正文都没了**。所以新节必须落在**同一个** `try` 里。
+
+    ★ 读不到 ⇒ `n/a`，**不许给 0**（`n/a ≠ 0 ≠ 没事`，`ERR-AI-03`）。
+
+    ★ 每包带它**自己**的 `scanned_at`（`pack.scan_finished_at`）—— 日报挂在
+      「当天第一批」上，`stage` 却是**逐包**更新的，所以当天还没跑过的包，
+      那两数停在上次 sync。一个全局「截至 HH:MM」说不清这件事，
+      每包自己的时刻才说得清（`#94`）。
+    """
+    rows = S.pack_progress(st)
+    if not rows:
+        # 空 ⇒ 真的一个包都没登记。**这与「读不到」不同**，所以不是 n/a。
+        return "各包进度：（库里一个包都没登记）", {}
+
+    lines = ["各包进度（做种 / 总数，截至该包上次扫描）："]
+    m: dict = {}
+    for r in rows:
+        name = r["name"]
+        fin = r["scanned_at"] or "从未"
+        lines.append(f"  {name}：{r['seeding']} / {r['total']}（{fin}）")
+        # ★ 2N 个 kv，进 **metrics 这一个字段**（不是 TSV 的列，见 `#93`）。
+        #   ★ 键里的空格由 notify 侧规范化（`#95`），这里不预加工 —— 一处负责。
+        m[f"seeding:{name}"] = r["seeding"]
+        m[f"total:{name}"] = r["total"]
+    return "\n".join(lines), m
+
+
 def report_daily(args, *, force: bool = False, farm_note: str = "") -> bool:
     """每天最多投一次的台账：额度（来源 A+C）+ 新增做种趋势 + IYUU 辅种条数
     + qB 卡 999（停滞的未完成种子）+ 观测对账（a−b / b−c〔全量口径〕/
@@ -1669,8 +1703,15 @@ def report_daily(args, *, force: bool = False, farm_note: str = "") -> bool:
     try:
         with S.StateStore(args.db) as st:
             parts.append(st.trend(weeks=4).render())
+            # ★★ 各包进度**必须在这个 try/with 里**（`#96`）：放外面会抛到
+            #    `after_batch_reports` 的外层 `except: LOG.debug` ⇒ 整份日报消失。
+            pp_note, pp_metrics = pack_progress_watch(st)
+            parts.append(pp_note)
     except Exception as e:                  # noqa: BLE001
         parts.append(f"新增做种趋势：算不出（{type(e).__name__}: {e}）")
+        parts.append(f"各包进度：算不出（{type(e).__name__}: {e}）")
+        # ★ 读不到 ⇒ `n/a`，**不许**给 0（`ERR-AI-03`：`n/a` / 0 / 没事 是三件事）
+        pp_metrics = {"pp": "n/a"}
 
     # 农场巡检那一行摘要（§16.2.2 任务 6）。★ 它**不是**可有可无的装饰：
     #   巡检每天才跑一次，而 `batch` 级通知是**每批都真的投一条**（见本函数开头的说明），
@@ -1708,7 +1749,7 @@ def report_daily(args, *, force: bool = False, farm_note: str = "") -> bool:
     #   **不记正文**）—— 详见 iyuu_watch 的说明。
     if emit("batch", "每日台账", body=body, key="daily",
             metrics={"day": today, **iyuu_metrics, **rec_metrics, **qb_metrics,
-                     **lg_metrics}):
+                     **lg_metrics, **pp_metrics}):
         _daily_set(today)
         LOG.info("已投递每日台账（额度 + 趋势）")
         return True
@@ -2106,6 +2147,20 @@ def pid_alive(pid) -> bool:
         return False
     except PermissionError:
         return True
+    except OSError:
+        # ★★ 2026-09-17 补（`#58` 写测试时撞出来的）：**Windows 上少了这一支**。
+        #   实测：Windows 的 `os.kill(不存在的 pid, 0)` 抛的是
+        #   **`OSError`（winerror 87）**，而**不是** POSIX 的 `ProcessLookupError`
+        #   （连 pid=1 那种"存在但无权限"也是 87）⇒ 原来会**把 OSError 抛出去**。
+        #   ⇒ 生产只在 NAS(Linux) 跑，所以**生产没受影响**；但**测试在 Windows 跑**
+        #     ⇒ 直接崩在 `pid_alive(999999)` 上。
+        #   ★ 取值：`False`（判不出存活 ⇒ 当作**没在跑**）。
+        #     理由：对两个平台都安全 —— 最坏也只是"多跑一批"，而反过来（猜 True）
+        #     会变成"永远判在跑 ⇒ 静默停工"（本函数 docstring 说的正是这个坏法）。
+        #   ★ 注意：这**不是**在鼓励在 Windows 上用它 —— Windows 上"发 0 号信号
+        #     探测存活"是**探测即击杀**（见上面的注释），所以那边本来就不该调它。
+        #     这一支只是让"意外调到"时**失败得安全**，而不是抛出去打断整条闸门。
+        return False
 
 
 def batch_alive(st: dict) -> bool:
@@ -2113,8 +2168,38 @@ def batch_alive(st: dict) -> bool:
 
     只看 PID 会被 PID 复用骗到（详见 Heartbeat 的说明）——
     那会导致"永远判在跑 → 静默停工"。
+
+    ★★ 2026-09-17（`#58` D1）：**容器里 PID 这一半必须停用**。
+      实测（本机真容器里 import 本函数跑）：
+        · 容器内 `os.getpid()` **恒为 1**（容器里第一个进程就是 PID 1）；
+        · `pid_alive(1)` → **True**（那个 1 是**容器自己**）；
+        · `batch_alive({"running_pid": 1, "heartbeat_ts": now})` → **True**
+          ⇒ 下一个容器看到上一容器留下的 `1`，会判「上一批还在跑」——
+          **而它判的那个 pid 就是它自己**。
+      ⇒ 容器版写下的 `running_pid` **语义与宿主版不同**（宿主是真 pid，容器恒为 1），
+        拿宿主那套 `pid_alive` 去读它 = **恒真的假信号**。
+      ⇒ 所以容器版**显式标注** `running_pid_pidns="container"`，本函数据此**跳过 pid 那一半**，
+        只信心跳。★ 宿主版不受影响（不写那个键 ⇒ 走原逻辑）。
+      ★ 为什么不干脆删 pid 那一半：**宿主版还靠它**（pid 复用 + 心跳过期那道警告，
+        真环境里是有用的）。两边的语义不同 ⇒ 分开判，而不是一起删。
     """
     pid = st.get("running_pid")
+
+    # ★★ 容器写的 pid 不可比 —— 只信心跳（见 docstring）。
+    if st.get("running_pid_pidns") == "container":
+        hb = st.get("heartbeat_ts")
+        if hb is None:
+            # 容器版**一定**会带心跳（同一个 write_state 写进去的）⇒ 这里只可能是
+            # 文件被截断/手改。保守当"在跑"（与下面旧格式分支同理：宁少跑一轮）。
+            LOG.warning("容器版状态缺 heartbeat_ts（文件被截断？）—— 保守跳过本轮。")
+            return True
+        stale = time.time() - float(hb or 0)
+        if stale <= HEARTBEAT_STALE_SEC:
+            return True
+        LOG.warning("容器版状态的心跳已停 %.0f 分钟 —— 判定为残留，接管本轮。",
+                    stale / 60)
+        return False
+
     if not pid_alive(pid):
         return False
 
@@ -2204,7 +2289,17 @@ def once_round(packs: list[str], args, api_key: str, min_sleep: float) -> int:
 
     idx = (int(st.get("last_pack_idx", -1)) + 1) % len(packs)
     pack = packs[idx]
-    write_state({**st, "running_pid": os.getpid(), "heartbeat_ts": time.time()})
+    # ★★ `#58` D1：容器里 `running_pid` **语义不同**（恒为 1，见 batch_alive 的说明）。
+    #   这里自动判"我是不是在容器里"，容器版就多写一个标记键，让 batch_alive 跳过 pid。
+    #   ★ 判据用**文件系统**（`/.dockerenv`）而不是环境变量：环境变量可能是人传进来的、
+    #     也可能是 compose 特意设的，而 `/.dockerenv` 是**运行时自己长出来的**。
+    _in_container = os.path.exists("/.dockerenv")
+    write_state({**st, "running_pid": os.getpid(),
+                 "running_pid_pidns": "container" if _in_container else "host",
+                 "heartbeat_ts": time.time()})
+    if _in_container:
+        LOG.info("[容器] running_pid=%d（容器内 PID，**不参与存活判据**；只信心跳）",
+                 os.getpid())
     LOG.info("[--once] 跑包 %s（第 %d/%d 个）", pack, idx + 1, len(packs))
 
     stats = None

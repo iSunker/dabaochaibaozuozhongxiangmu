@@ -2311,7 +2311,8 @@ def sync_pack(
     rep.from_log = len(facts.searched)
     rep.skipped = len([d for d in facts.skipped if d not in facts.searched and d not in db_searched])
     rep.matched = len(db_matched)
-    rep.seeding = sum(1 for r in store.movies(pack_name) if r["stage"] == STAGE_SEEDING)
+    # ★ 计数只有一份：见 pack_seeding_total（日报的 pack_progress 调的是同一个）
+    rep.seeding, _ = pack_seeding_total(store, pack_name)
     rep.stage_counts = changed
     store.mark_scan(pack_name, finished=True, complete=True)
     return rep
@@ -2319,6 +2320,58 @@ def sync_pack(
 
 def _norm_one(token: str, alias: dict[str, str]) -> str:
     return normalize_indexer(token, alias)
+
+
+# --------------------------------------------------------------------------- #
+# 各包进度（日报用）—— ★ 计数**只有一份**，见 pack_seeding_total 的说明
+# --------------------------------------------------------------------------- #
+
+def pack_seeding_total(store: StateStore, pack: str) -> tuple[int, int]:
+    """`(seeding, total)` —— **唯一**那份「做种 / 总数」计数。
+
+    ★★ 为什么抽出来：`sync_pack` 末尾已经算过同一个表达式（`rep.seeding = ...`），
+       而日报的新节也要同一个数。本项目规矩是「一份判据只维护一处」——
+       两处各写一遍 `stage == STAGE_SEEDING`，改了其中一处就会**静默分叉**
+       （两个数都"看着对"，却对不上）。所以两处都调这里。
+
+    ★ `total` 是 `movie` 表的**行数**，即「**声明过**的单片」累计 ——
+      而 `register_dirs` 是 `ON CONFLICT(pack, dir_name) DO UPDATE`，
+      **从不删行**（`state.py` 里那条 INSERT 的原话）⇒ 源目录删过、而 `init`
+      没重跑时，这个数**必然大于** `reseed-state.py init --dry-run` 报的
+      「识别到 N 个单片」。**这不是 bug，是定义**；要与 dry-run 比，
+      前提是**先重跑一次 init**。
+    """
+    rows = store.movies(pack)
+    return (sum(1 for r in rows if r["stage"] == STAGE_SEEDING), len(rows))
+
+
+def pack_progress(store: StateStore) -> list[dict]:
+    """每个包的进度 → `[{name, seeding, total, scanned_at}, ...]`（按包名排序）。
+
+    ★ **返回结构化数据，不在这里渲染** —— 渲染归 `drive-loop.py`：
+      现有各 watch（`iyuu_watch` / `reconcile_watch` / `qb_999_watch` /
+      `linkguard_watch`）都是「(正文一段, metrics 字典)」的形状，本函数照那个形状
+      只出数据，让渲染层一处负责措辞。
+
+    ★ **空列表 = 一个包都没登记**，与「库读不到」是两件事 ——
+      后者由调用方（`drive-loop.py`）在 `except` 里写成 `n/a`，
+      **不许**把两者都写成 `0`（`n/a ≠ 0 ≠ 没事`，见 `ERR-AI-03`）。
+
+    ★ `scanned_at` 取 `pack.scan_finished_at`（每包**自己**的时刻，`mark_scan`
+      写入）—— 比正文里一个全局「截至 HH:MM」精确：日报挂在「当天第一批」上，
+      而 `stage` 是**逐包**在各自批次里更新的，所以当天还没跑过的包，
+      它的两个数停在上次 sync（见 SUMMARY §23.5 订正④）。
+    """
+    out: list[dict] = []
+    for p in store.packs():
+        seeding, total = pack_seeding_total(store, p["name"])
+        out.append({
+            "name": p["name"],
+            "seeding": seeding,
+            "total": total,
+            "scanned_at": p["scan_finished_at"],
+        })
+    return out
 
 
 # --------------------------------------------------------------------------- #

@@ -359,9 +359,13 @@ docker compose run --rm reseed-orchestrator status                          # �
 2. 记下每个站的 **indexerId**（索引器详情页 URL 里的数字，如 `/indexer/3` → id=3）。
    > ⚠ **这个数字会变** —— 删站再重加，ID 往往就换了。**每次增删索引器后都要重新核对**：
    > ```bash
-   > curl -s -H "X-Api-Key: <Prowlarr API key>" http://<NAS_IP>:9696/api/v1/indexer \
-   >   | python -c "import sys,json;[print(i['id'], i['name']) for i in json.load(sys.stdin)]"
+   > python scripts/prowlarr-indexers.py --torznab
    > ```
+   > ★★ **不要用 `curl ... /api/v1/indexer`**：那个端点的响应**每一条都带 `fields`**
+   > —— 里面有 cookie / passkey。裸跑它（哪怕只为"看一眼结构"）等于把全部站点的
+   > 凭据打到终端上，**而终端输出会进聊天、进日志、进截图**。
+   > 这个脚本打的是**同一个端点**，但**只取 `id` / `name` / `enable`**，
+   > 所以它那一行输出可以安全粘贴。详见 `ENVIRONMENT.md` `ERR-SVC-02`。
    > 详见 SUMMARY §6.6。
 3. 把它的 Torznab 地址追加进 `.env` 的 `TORZNAB_URLS`，**逗号分隔、单行**（`scripts/add-indexers.py` 已自动化这步，会自动补 `/api`、只改一行、自动备份）：
    ```
@@ -1360,8 +1364,8 @@ python scripts/drive-loop.py --once --notify-spool "D:/tmp/x"    # 换个 spool
 | **14** | **两件等拍的** —— ① **17:40 观测**（Prowlarr 放行 HDtime 之后 cross-seed 动不动）：两个读数 `python scripts/prowlarr-indexerstatus.py`（② 机制）与 `python scripts/check-indexer-timestamps.py`（③ 机制）。★ **时刻到 ≠ 条件成立** —— 窗口本身已经变过一次（`disabledTill` 记的是 24 h，而 6 h 那个只是 14:27 的读数），**先读再判** ② **存储分析器互校**：三步探针已跑完，结论是**报告里没有可用空间**（`Used` 只有百分数，0.1% on 61.4 TB = 61 GB）⇒ **等拍**：换对照量还是换报告 | ① 这是唯一能把 `ERR-SVC-17` 里那处**剩余推断**（cross-seed 是原样转抄 `Retry-After`，还是按自己起算点重算）验掉的机会，**顺手答** `#60`（放行后动不动 ⇒ snooze 该怎么处置）；判据见那两条 | §22 · `INDEX-USAGE` §八 |
 
 | **15** | **ENVIRONMENT 卷归属复核：结论对、一处路径错、一味药没标适用范围** ✅ **已完成并推送（2026-09-14，`ead756d`）** —— ① **修路径**：`A.3` 的 `/volume1/docker_ssd` → **`/volume2/docker_ssd`**（同文件 212 行与归属表本来就是 `/volume2` ⇒ 三处自相矛盾；★ 而这行犯的**正是它上文 `ERR-DSM-03`/`ERR-FS-02` 登记的那个错**）② **补两条 Windows 侧通路**：`df -h <UNC>`（按底层文件系统分组，实测 **8/8 正确**）与 Storage Analyzer 的 `share_list.csv` 的 **`Volume` 列**（SMB、无凭据、每周三 04:07）—— 原来的 `ContainerManager/all_shares` **只在 NAS 上**读得到，本机没有 SSH ③ **`stat -c %d` 补适用范围**：**只在 NAS 侧成立**；Windows/SMB 侧实测**十个共享十个互不相同的号**（含同卷的 `video`/`Download`/`homes`/`drive`/`web`/`docker`）⇒ **分辨力为零**，对照量用 `df`；并记下 `build-farm.sh` 自承可从 SMB 跑 ⇒ 真那么跑会把**每个源目录**判成「不同卷，跳过」 | 一份专门教人「别按路径前缀判同一块盘」的文档，**照着错法写了一行**；而那枚被开了 4 处药的探针，**只在一个机器上有效** | §23.1 · §23.2 · `ENVIRONMENT.md` `A.3` |
-| **16** | **同族还剩三条（等拍：共享可见性 / 探针可用性）** —— ① **`/volume1/docker`「不是共享文件夹」×4 处**：实测 `//iSunker-DS423/docker` **UNC 可达**（负对照：不存在的共享名会报 `No such file or directory`，所以不是幻觉），DSM 自己的 `share_list.csv` 也把它列为 **Shared Folder / Volume 1**；而 `net view` 与本机 `ls` **都只列 5 个**（实际至少 11）⇒ **枚举里看不见 ≠ 不是共享文件夹** ② **`ERR-HW-03` 里承重的 `net view`**：本机 `net view '\\iSunker-DS423'` 报 **1702 绑定句柄无效**，换 `net view iSunker-DS423` 才通 ⇒「没有任何备份共享」有**探针跑不通被读成没有**的嫌疑 ③ **`SUMMARY` 的 ⬜② 可结案**：`//iSunker-DS423/docker` 根**没有** `.probe_done_*`，且**不需要 SSH** | ★ 三条是**同一个形状**：文档自己写着「看不见 ≠ 不存在」，却在 8 行之外用「看不见」断言了不存在 | §23.3 · §23.4 |
-| **17** | **一份「日报加各包进度」的方案：审出 8 条，★ 全部未落笔**（`pack_progress`）—— 骨架可用、口径选对了（`movie` 表 =「声明」，**且 `register_dirs()` 生产里只有 `init` 一个调用点** ⇒ 确实稳定），但：**① 例文真假日数据混着**（三个总数 **486/115/4 全对**，做种数写 `201/52` 而实测 **323/68** —— `201` 其实是 **`trend()` 的量**）**②「metrics 加两列」是错的**（它是 notify 事件里的**一个 `k=v` 字段**，不是 TSV 的列）**③ 两处引用错锚**（`#62` → `ERR-AI-01`/`n/a` 约定；`§16.3` → `§16.1.3`）**④ 新鲜度那条反了**（日报是在**该批回灌之后**投的；真风险是「当天没跑过的包数停在上次 sync」⇒ 改用每包 `pack.scan_finished_at`）**⑤ 包名含空格**是隐患（`_clean_line` 不动键）**⑥ 新节要放进同一个 `with S.StateStore`**，否则读库失败会带走整份日报 **⑦ 落笔前先判能否复用** `sync_pack` 的计数 **⑧ 判据①的名字**（`pack.roots` 是路径数组不是数）| ★ 这套方案的形状很典型：**机制名全对、判据全可跑通**，错的都在「想当然」那一层 —— 把 dict 说成列、把回灌前的时刻说成回灌后、把一个趋势数当成每包数 | §23.5（TaskList #90–#97）|
+| **16** | **同族三条（`#87`/`#88`/`#89`）** ✅ **已完成（2026-09-17）** —— 三处文档已按实测改正，并把判据换强：① **`/volume1/docker`「不是共享文件夹」×4 处** —— 实测 `//iSunker-DS423/docker` **UNC 可达**（负对照：不存在的共享名报 `No such file or directory`，所以不是幻觉），DSM 自己的 `share_list.csv` 把它列为 **Volume 1**；而 `net view` 与本机 `ls` **都只列 5 个**（实际 12）⇒ 结论改成 **「枚举里看不见」≠「不是共享文件夹」** ② **`ERR-HW-03` 里承重的 `net view`** —— `net view '\\iSunker-DS423'` 报 **1702 绑定句柄无效**，换裸名才通 ⇒ 已拆成独立的 `ERR-HW-03b`，并写明**该探针本机不稳、且即便跑通也只是枚举**（不能用来断言"不存在"）③ **`SUMMARY` 的 ⬜②** —— `//iSunker-DS423/docker` 根**没有** `.probe_done_*`，**不需要 SSH** 已结案 | ★ 三条是**同一个形状**：文档自己写着「看不见 ≠ 不存在」，却在 8 行之外用「看不见」断言了不存在。★ 顺带把判据换成 **`share_list.csv` 的 `Volume` 列 + 逐共享精确字节**（**一次给全 12 个共享、不依赖枚举**），本机 SMB 直读、`utf-16-le` 解 | §23.3 · §23.4 |
+| **17** | **一份「日报加各包进度」的方案：审出 8 条** ✅ **已落笔（2026-09-17 晚）**（`pack_progress`）—— 八条订正全部落成代码：`orchestrator/state.py` 加 `pack_seeding_total` + `pack_progress`（**复用** `sync_pack` 那条计数，全文件 `stage == STAGE_SEEDING` **只剩一处**）、`scripts/notify.py` 把**键**的空格也规范化、`scripts/drive-loop.py` 的 `pack_progress_watch` **接进 `report_daily` 同一个 `with S.StateStore`**、每包带**自己**的 `scan_finished_at`、metrics 加 **2N 个 `k=v`**；新增 `tests/test_pack_progress.py`（15 条，含**阴性对照**与变异验证）。★★ **`#95` 实测比原记录重**：含空格的包名不只「拆坏字段」，碎片能**伪造出 `pack=` 键** ⇒ 该行被**误计为一批**（摘要正是靠 `pack=` 整键相等数的）| ★ 这套方案的形状很典型：**机制名全对、判据全可跑通**，错的都在「想当然」那一层 —— 把 dict 说成列、把回灌前的时刻说成回灌后、把一个趋势数当成每包数 | §23.5（TaskList #90–#97）|
 
 #### ★ 09-13 首读实测：`unclaimed=1` 那条告警**不是修复失效**（2026-09-13 复核）
 
