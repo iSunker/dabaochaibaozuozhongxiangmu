@@ -200,6 +200,62 @@ LOCAL_ONLY = [
     (r"^scripts/(add-indexers|add-torznab-indexer|check-indexer-timestamps"
      r"|gen-datadirs|gen-nas-env-update|migrate-reseed-dirs|run-batch|wait-for-checks)"
      r"\.(py|sh)$",                               "在 Windows 上跑的工具/生成器（对着 NAS 的端口或 UNC 干活）"),
+    # ==========================================================================
+    # ★ 2026-09-17 本会话新增（`#83` / `#109` / `#58`）—— 判据同上一节：
+    #   「只读 + 不回显凭据 + 只打聚合/白名单字段」；写工具则比照
+    #   `scan-secrets.py` 那条先例（本机→生产的一次性操作，只在 Windows 上跑）。
+    # ==========================================================================
+    # #83 的替代品：列 Prowlarr 全部索引器的 id/name/enable。在 Windows 上跑；
+    #   读 NAS .env 的 key 但**绝不打印、绝不上命令行**。
+    #   ★ 只取**白名单三字段**（id/name/enable）—— 那个响应每条都带 `fields`
+    #     （cookie/passkey），所以「取白名单」而不是「排除 fields」才是它的全部理由：
+    #     黑名单挡不住 Prowlarr 将来新加的字段。
+    (r"^scripts/prowlarr-indexers\.py$",         "只读列 Prowlarr 索引器 id/name/enable（在 Windows 上跑；只取白名单三字段）"),
+    # #109 的写工具：换 NAS .env 里那条 key（PROWLARR_API_KEY + TORZNAB_URLS）。
+    #   ★ 它是**写**工具，与上面几条「只读」不同 —— 但**仍在 Windows 上对着生产干活**：
+    #     NAS 没有 SSH，所以「改 NAS 文件」只能在 Windows 做（同 scan-secrets.py 的形状）。
+    #   安全闸：默认 dry-run、只改那两行、其余逐字节不动、写前备份、原子写；
+    #   key **从文件读**（不走命令行 —— 会进 shell 历史与进程表）。
+    (r"^scripts/rotate-prowlarr-key\.py$",       "换 .env 的 Prowlarr key（在 Windows 上跑；写工具，默认 dry-run + 备份 + 原子写）"),
+    # #109 的写工具：换 cross-seed.db 的 indexer.apikey 列（4 行）。
+    #   安全闸：默认 dry-run、先 PRAGMA integrity_check、写前备份、事务写 + 回读核对；
+    #   ★ 另有一道**容器闸**（container_state）—— 查 docker inspect 的 State.Status，
+    #     **unknown 一律不放行**（宁可要人确认，也不在"不知道"时写生产库）。
+    (r"^scripts/rotate-crossseed-key\.py$",      "换 cross-seed.db 的 apikey 列（在 Windows 上跑；写工具，含容器闸 unknown 不放行）"),
+    # #58 的挂载自证：三查（硬编码目录 / state.db 里的绝对路径 / .env 前缀）。
+    #   ★ **它属于 #58，沿用 `drive-loop-docker.sh` 那条先例**：迁容器的东西**故意不进白名单**。
+    #     白名单的语义是「两边必须一致」，现在收进去 ⇒ 下次 deploy.sh --apply 就把它推到生产
+    #     ⇒ 制造**假一致**。**先验，后进白名单**（本会话已在本机验过正例+两反例，
+    #     但**还没在 NAS 的容器里真跑过** ⇒ 仍不算"验通过"）。
+    (r"^scripts/drive-loop-mount-selfcheck\.sh$","#58 挂载自证（未部署，先验后进白名单；本机验过正例+两反例）"),
+    # #58 的镜像定义。★ 同上面那条：属于**迁容器**的东西，**故意不进白名单**
+    #   （进白名单 = 下次 deploy.sh --apply 就推到生产 = 假一致）。
+    #   ★ 它还有个**只有它才有的**理由：本仓的 docker build 上下文是**仓库根**，
+    #     而 NAS 上的构建上下文是 **compose 目录** —— 两边的相对路径不同，
+    #     直接拷过去也 build 不起来（`COPY scripts/…` 在 NAS 上找不到 orchestrator/）。
+    #     ⇒ 真要上 NAS，得连构建方式一起设计，不是"加进 FILES"就完事。
+    (r"^scripts/drive-loop\.Dockerfile$",        "#58 镜像定义（未部署；且本仓/NAS 的 build 上下文不同，不能直接拷）"),
+    # ==========================================================================
+    # ★ 2026-09-17 补登记**本来就在库里、却一直没登记**的 —— 哨兵这些天一直红着。
+    #   而**「常红」等于「没有哨兵」**：天天红的东西没人看，真报出来的新漂移会被淹掉。
+    #   这一批是文档与仓库本地小工具，与已登记的 README/SUMMARY/ENVIRONMENT 同类。
+    # ==========================================================================
+    # SUMMARY 的分章正文（2026-09-16 从 SUMMARY.md 拆出，`split-summary.py` 自验逐字节不变）。
+    #   ★ 它们与 SUMMARY.md 是**同一份内容的两种装法** ⇒ 登记理由也相同（文档，不上 NAS）。
+    (r"^summary/",                                "SUMMARY 的分章正文（文档；与 SUMMARY.md 同类，不上 NAS）"),
+    # #115 现场验收的**只读**观察器：把 drive-loop.log 按批次切开算四件事，
+    #   给**三值结论**（PASS/FAIL/WAIT）。只读 NAS 日志，不碰生产文件。
+    (r"^tools/check-115\.py$",                   "#115 只读观察器（在 Windows 上跑；切批次给三值结论）"),
+    # 看一眼「这个会话用了多少 context」——只读本地会话文件。
+    (r"^tools/ctx\.py$",                         "只读本地会话文件（看 context 用量）"),
+    # 把 SUMMARY.md 拆成分章的**一次性**工具；产物就是上面那些 summary/*.md。
+    (r"^tools/split-summary\.py$",               "一次性拆分工具（在 Windows 上跑；产物是 summary/*）"),
+    # 探 context 上限的只读探针。
+    (r"^tools/probe-ctx-limit\.py$",             "只读探针（探 context 上限，在 Windows 上跑）"),
+    # ★ 兜底：tools/ 下若再加新脚本，不必每次都回来改这里 ——
+    #   **前提是它满足本目录的既有性质**（只读、不碰生产、不回显凭据）。
+    (r"^tools/",                                  "仓库本地运维/文档小工具（在 Windows 上跑，只读）"),
+
 ]
 
 # 受管、但**不在 git 里**的本地源（正常情况只有生成物）。没列在这里的会被 B 方向报出来 ——
