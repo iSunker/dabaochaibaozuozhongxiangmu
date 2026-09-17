@@ -61,6 +61,14 @@ scripts/nas-update-env.sh
 # 本地 NAS 地址（真实主机名 / 内网 IP）—— 各人自建，不入库
 scripts/.nasrc
 
+# ★ 2026-09-17 加：本机 AI 工具（claudine）的状态目录 —— 内容只有
+#   `{"conversations": [], "lastUpdated": "<时间戳>"}`，是**本机运行时状态**，
+#   不是项目事实。与上面 `.drive-loop.state` / `.notify.state` / `.reconcile.state`
+#   **同一族**：跟着"哪台机器、什么时候跑的"变，入库只会制造噪音 diff。
+#   ★ 它此前**不在任何 ignore 规则里**（所以一直显示为未跟踪）—— 不是"故意留着"，
+#     是**漏了**。与 `.env*` 那条同源：靠"我记得加了"不如靠一条规则兜住。
+.claudine/
+
 # 本地分析用的临时目录（复制 cross-seed.db 出来读）
 .tmp-db/
 
