@@ -96,7 +96,7 @@ grep -n '弯路 #' ENVIRONMENT.md
 | 大包源数据 | `/volume1/video/download/movies/…`、`/volume1/video/download/TV/…` |
 | 硬链接农场（当前 `DATA_DIRS`）| `/volume1/video/download/reseed/reseed_farm` |
 | 单片做种数据 | `/volume1/video/download/reseed/reseed_singles/<站点>/<发布名>` |
-| 未查清的第三方目录 | `/volume1/video/link`（7.47 TB 表观 / 150 个媒体目录）—— 任务 #81 |
+| 第三方媒体库目录（**已查清**，2026-09-17） | `/volume1/video/link` —— ★ **不是本项目的东西，也不是软链**（它本身是个**真目录**）。形状 = **moviepilot 风格的媒体库**：149 个媒体目录按**分类**摆放（`电影`/`电视剧`/`欧美剧`/`华语电影`/`未分类`/`综艺`/`纪录片`/`日韩剧`/`国产剧`/`国漫`/`儿童`…），每个片子目录里是 **`.nfo` + 封面图（`poster.jpg`/`backdrop.jpg`/`fanart.jpg`…）+ 媒体文件**；含 **TMDB 命名**（如 `白莲花度假村-2021-[tmdb=111803]`）。★ **7.47 TiB 是「表观」** —— 抽样见 `蝙蝠侠：影之谜 (2005)` 一个 **74 GB `.iso`**（全库至少 3 个 iso：62/74/91 GB），表观体积由这些大文件撑起。**是否硬链接 / 是否占真实空间，SMB 侧判不了**（正是 §23.2 那条：`stat -c %d` 只在 NAS 侧成立；Windows 侧 `[ -e /volume1/… ]` 恒假 ⇒ 必须换 `//YOUR-NAS/video/…` 才看得见）—— 要定论须在 NAS 上跑。★ 149 目录里 **23 个是空的**（分类占位）。 |
 | 状态机库 | `<compose>/drive-loop/hlink/state.db` |
 | cross-seed 库 | `<compose>/cross-seed/cross-seed.db` |
 | 链接守护基线 | `<compose>/drive-loop/scripts/.linkguard.state` |
