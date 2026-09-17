@@ -134,14 +134,35 @@ if YML and isinstance(svcs.get("drive-loop"), dict):
        isinstance(_lg, dict) and _lg.get("driver") == "json-file"
        and _lg.get("options", {}).get("max-size") == "10m", repr(_lg))
 
-    # ---- ①g 常驻语义：restart 要对，且 command 不是"跑一批就退出"---------
+    # ---- ①g 常驻语义：restart 要对，且入口不是"跑一批就退出"---------
     ck("①g restart = unless-stopped（常驻服务）",
        dl.get("restart") == "unless-stopped", repr(dl.get("restart")))
-    _cmd = dl.get("command")
+    #   ★★★ 2026-09-17 **实测炸过一次**：入口必须写在 `entrypoint:` 上，
+    #     **不能写 `command:`** —— 镜像的 `ENTRYPOINT ["python", "…/drive-loop.py"]`
+    #     **不会被 `command:` 覆盖**（`command:` 只替换 CMD）⇒ 实际执行的是
+    #         python /app/scripts/drive-loop.py sh drive-loop/run-resident.sh
+    #     ⇒ argparse 报 `unrecognized arguments` ⇒ 退出码 2 ⇒ 被 restart
+    #     **每 ~10 秒重拉一次**，而 `attempts.log` 里 **`[resident]` 一行都不写**
+    #     （根本没跑到那个脚本）⇒ 症状极像"路径不对"，真因是 ENTRYPOINT。
+    #     ⇒ 这条断言就是那次事故的回归测试：**它必须能红**。
+    _ep = dl.get("entrypoint")
+    _ep_s = " ".join(_ep) if isinstance(_ep, list) else str(_ep or "")
+    ck("★★★ ①h 入口写在 **entrypoint**（不是 command）里，且指向 run-resident.sh"
+       "—— command 覆盖不了 ENTRYPOINT，写错了容器起来即退（码 2）",
+       bool(_ep) and "run-resident.sh" in _ep_s, f"entrypoint={_ep!r}")
+    #   ★ 反向：**别同时写 command** —— 镜像的 ENTRYPOINT 已被 entrypoint 替换，
+    #     再给 command 只会变成"传给 run-resident.sh 的多余参数"（脚本用 "$@" 透传，
+    #     最终喂给 argparse ⇒ 又是 unrecognized arguments）。
+    ck("★ ①h2 没有同时写 command（会变成喂给脚本的多余参数）",
+       "command" not in dl, repr(dl.get("command")))
+    #   ★ 绝对路径：镜像 WORKDIR 是 /app，相对路径在容器里找不到（挂载是 1:1 同名同路径）
+    ck("★ ①h3 entrypoint 用**绝对路径**（容器 WORKDIR=/app，相对路径找不到）",
+       "/volume2/docker_ssd/prowlarr_cross-seed_autohardlink/drive-loop/run-resident.sh" in _ep_s,
+       _ep_s)
+    _cmd = dl.get("command") or dl.get("entrypoint") or []
     _cmd_s = " ".join(_cmd) if isinstance(_cmd, list) else str(_cmd)
-    ck("①h command 指向 run-resident.sh", "run-resident.sh" in _cmd_s, _cmd_s)
-    #   ★★ 这一条就是常驻与 `--once` 的分界。command 上带了它 ⇒ 跑一批就退出。
-    ck("★★ ①i command **不带** --once（带了 = 跑一批就退出，被 restart 反复拉起）",
+    #   ★★ 这一条就是常驻与 `--once` 的分界。入口上带了它 ⇒ 跑一批就退出。
+    ck("★★ ①i 入口**不带** --once（带了 = 跑一批就退出，被 restart 反复拉起）",
        "--once" not in _cmd_s, _cmd_s)
 
     # ---- ①j 两条网络都要（缺一条就有一半服务名解析不了）-------------------
