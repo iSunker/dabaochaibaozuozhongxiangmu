@@ -152,6 +152,17 @@ LOCAL_ONLY = [
     #   09-27 决策）—— 给人和工具看的说明，**不是第三份事实源**。
     (r"^tools/doc-audit/",                        "文档审计工具 + 索引用法（在 Windows 上跑；只读 md + UNC 只读 + HTTP 只读；不选 indexer.url 列，出口统一 redact()）"),
     (r"^deploy\.sh$",                             "同步工具本身（在 Windows 上跑）"),
+    # ★ 2026-09-17：/volume1 可用空间的 NAS 侧判据。它是**一次性诊断件**，但留下来
+    #   可复用（下次再遇"读数对不上"直接拿它跑），所以**进版本库、不进白名单**。
+    #   判据与上面 doc-audit / qb-census 那几条**同一形状**：
+    #   **只读 + 不回显凭据 + 只打聚合**（它不是"碰没碰凭据"的问题 —— 它根本不碰凭据，
+    #   只跑 df / btrfs filesystem usage / subvolume list）。
+    #   ★ 脚本内部**零写操作**已成契约（无 rm/mv/cp/chmod/chown/truncate），
+    #   且**刻意不写任何文件**（输出全走 stdout）—— 因为它的目标卷是满盘，
+    #   往那里写东西会触发 ERR-FS-03 的 ENOSPC 级联。
+    #   ★ 它读的是 NAS **原生路径**（/volume1），所以**只能在 NAS 上跑**；
+    #   从 Windows 跑只会得到"路径不存在"（正是 §26.7 那条"SMB 视图 ≠ NAS 视图"）。
+    (r"^scripts/chk-volume1-free\.sh$",           "卷水位判据（在 **NAS** 上跑；只读 df/btrfs，零写操作、不落盘、不碰凭据；一次性诊断件）"),
     (r"^scripts/check-deploy-drift\.py$",         "本哨兵（在 Windows 上跑）"),
     (r"^scripts/scan-secrets\.py$",               "推前凭据扫描（在 Windows 上跑；读本地 .env，但绝不打印命中到的值）"),
     (r"^scripts/audit-found-lines\.py$",          "对账 a−b（在 Windows 上跑；只读 NAS 的 info.current.log，不碰库）"),
