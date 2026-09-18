@@ -9,7 +9,7 @@
 #   `drive-loop/run-resident.sh` （仓库里：**本文件**）
 #       ★ 容器**内**常驻跑的那份。**不带** `--once` —— 循环在 python 里，
 #         DSM 那侧只管「容器还活着吗」。
-#   `scripts/drive-loop-docker.sh`
+#   `scripts/diag/drive-loop-docker.sh`
 #       **已作废**的 `docker run` 草案（取代它的是 `compose.yaml` 里的
 #       `drive-loop` 服务）。留着是为了留痕，不部署。见文件头。
 #
@@ -116,6 +116,33 @@ if [ ! -f "$SCRIPT" ]; then
   echo "[!!] 找不到 $SCRIPT —— deploy.sh 同步过了吗？" >&2
   echo "[$(date '+%F %T')] [resident] exit=127 (no script: $SCRIPT)" >> "$ATTEMPTS"
   exit 127
+fi
+
+# ---- 闸 ⓪：读到的**是不是这一版代码**（2026-09-18 立，SUMMARY §26.15）----
+# ★★ 为什么需要它 —— 一次真实的静默事故：
+#   `drive-loop.py` 在**两个地方**各有一份：镜像里 `COPY` 的 `/app/scripts/` 那份，
+#   与挂载进来的 `<compose>/drive-loop/scripts/` 那份。生产**应当**读挂载那份
+#   （`$SCRIPT` 就是这么算的），而 2026-09-18 实测：Part B 的新渲染**从未生效** ——
+#   全 7 天日报的 metrics 里 `packpct` 都是 0，三个位置的 `.py` 是**三个不同文件**
+#   （镜像那份连 `PHASE_IDLE` 都没有）。
+#   ⇒ 症状是"日报少了几个数"，**不报错、不退非零、日志一切正常** —— 最难查的那种。
+#
+# ★ 判据选 `PHASE_IDLE` 的理由：它同时是
+#   ① 「镜像早于 §26.5」的充分标志（那次修复新加的常量，旧版**不含**它）；
+#   ② 一个**纯字符串**判据 —— 不需要 python、不解析 JSON、不依赖任何外部命令
+#      （本仓踩过"用 sed/grep 抠 JSON 静默抠错"，而这里连 JSON 都不用碰）。
+#   ★ 这是**哨兵不是闸门**：它只证明"不是那一版很旧的"，不证明"是最新版"。
+#     真判据仍是回读 md5（见 Dockerfile 里那两条纪律）。
+#   ★ 用 `grep -q` 且取反 —— 注意本文件是 `set -eu`，`grep -q` 没找到时返回 1，
+#     所以必须写在 `if` 条件里（`if` 的条件不受 `set -e` 约束），别写成裸语句。
+if ! grep -q 'PHASE_IDLE' "$SCRIPT" 2>/dev/null; then
+  echo "[!!] $SCRIPT 里没有 PHASE_IDLE —— 这是 §26.5 之前的旧版代码。" >&2
+  echo "     ★ 不是「没同步」：文件在、但**版本旧**。多半是镜像里 COPY 的旧副本被读到了。" >&2
+  echo "     ⇒ 重建镜像并 docker load 到 NAS（见 scripts/drive-loop.Dockerfile 顶部两条纪律），" >&2
+  echo "       或核对挂载有没有盖住 /app。判据（NAS，单行）：" >&2
+  echo "       docker compose --profile drive-loop exec drive-loop md5sum /app/scripts/drive-loop.py drive-loop/scripts/drive-loop.py" >&2
+  echo "[$(date '+%F %T')] [resident] exit=3 (stale code: $SCRIPT)" >> "$ATTEMPTS"
+  exit 3
 fi
 
 echo "[$(date '+%F %T')] [resident] start  py=$PY" >> "$ATTEMPTS"

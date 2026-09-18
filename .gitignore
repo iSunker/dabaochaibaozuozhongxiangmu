@@ -33,11 +33,18 @@ hlink/state.db-*
 scripts/todo-paths.txt
 
 # 由状态机导出的派生数据（含真实片名/站点名，属运行时产物）
+# ★ 2026-09-18：`run-batch.sh` 搬进 `scripts/diag/` 后，`batch-report.tsv`/
+#   `unmatched.tsv` 也跟着产在那儿 —— 所以这条要跟着走，否则那两个文件
+#   会**从忽略列表里掉出来**（不再是 silence，而是显示成未跟踪）。
 scripts/*.tsv
+scripts/diag/*.tsv
 
 # drive-loop.py 的运行日志与状态文件（含真实片名/时间，属运行时产物）
 scripts/drive-loop.log
 scripts/.drive-loop.state
+# ★ 上面那份的**原子写临时文件**（write_state 先写它再 os.replace；微秒级存活，
+#   但崩在中间就会留下）。★ 必须单独列 —— `scripts/*.state` 那类通配**不覆盖**它。
+scripts/.drive-loop.state.tmp
 # 每日台账「今天发过没有」的标记（运行时产物；内容只是一个日期）
 scripts/.daily-report.state
 # 农场巡检「上次什么时候查的、结论是什么」（运行时产物）
@@ -71,6 +78,15 @@ scripts/.nasrc
 
 # 本地分析用的临时目录（复制 cross-seed.db 出来读）
 .tmp-db/
+
+# `A.2.1` 的**一次性件**约定：本机上给 NAS 中转用的临时目录（镜像 tar 包之类）。
+# ★ 为什么必须在这里有一条**通配**规则，而不是靠"我记得删"：
+#   `docker save reseed-drive-loop:0.1.0 | gzip > _tmp-*/_drive-loop-img.tar.gz`
+#   产出 **46 MB 二进制**，名字又人畜无害 ⇒ `git add -A` 直接吞进去，
+#   而**镜像层是删不掉的**（删了也还在历史里，同 `.dockerignore` 那条 `.env` 的教训）。
+#   ★ 与上面 `.env*` 那条同一族：**别让"会不会进仓库"取决于我们猜没猜对文件名。**
+#   ⇒ 按前缀 `_tmp-` 全兜；目录名本身就是约定（`A.2.1` 要求"一眼看出是临时的"）。
+_tmp-*/
 
 # 文档审计工具的产物：标题树 / 引用表 / 关键词倒排 / 探针读数。
 # 全是**可反复生成**的派生数据（01/02/03/04 各跑一次就回来），没有版本价值；

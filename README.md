@@ -98,9 +98,9 @@ qB recheck **不通过时不报错**，而是**就地重下**那几个 piece。�
 | 跑起来 / 继续跑 | **当前状态与下一步** ← 最常用，先看这个 |
 | **新会话开局 / 不了解这台机器** | **`ENVIRONMENT.md`** ← 环境前提 + 按症状 grep 的 `ERR-*` 条目（含全部 20 项技术弯路）|
 | 我卡住了（报错 / 搜不到 / 不动了） | **常见问题** + **交接必读的坑** → `ENVIRONMENT.md` 的 `ERR-*`（按症状检索）|
-| **想从电脑上手动跑点什么** | **⛔ 电脑端已不参与** ← 电脑只剩诊断用途：`deploy.sh`（推代码）、`check-deploy-drift.py`（查漂移）、`scan-secrets.py`（推前扫凭据）、`audit-found-*.py`（对账 `Found` 行） |
-| **想知道 NAS 上有没有我不知道的文件** | **漂移哨兵** ← `python scripts/check-deploy-drift.py` |
-| **想推代码，但怕把密钥一起推上去** | **推前凭据扫描** ← `python scripts/scan-secrets.py`（绿了再 `git push`） |
+| **想从电脑上手动跑点什么** | **⛔ 电脑端已不参与** ← 电脑只剩诊断用途（**都在 `scripts/diag/`**）：`deploy.sh`（推代码）、`check-deploy-drift.py`（查漂移）、`scan-secrets.py`（推前扫凭据）、`audit-found-*.py`（对账 `Found` 行） |
+| **想知道 NAS 上有没有我不知道的文件** | **漂移哨兵** ← `python scripts/diag/check-deploy-drift.py` |
+| **想推代码，但怕把密钥一起推上去** | **推前凭据扫描** ← `python scripts/diag/scan-secrets.py`（绿了再 `git push`） |
 | 加站 / 换站 | **多站点** → SUMMARY §13.3（完整流程，可复用） |
 | 让它出事了主动通知我 | **通知 / 告警（NAS 侧发信）** |
 | **下一步该做什么** | **当前状态与下一步** 的「🔴 下一步（按优先级）」 |
@@ -124,7 +124,7 @@ qB recheck **不通过时不报错**，而是**就地重下**那几个 piece。�
 
 > **占位符约定**：为便于公开分享，文档与脚本里的真实主机名 / 内网 IP / 私有站名
 > 已替换为 `YOUR-NAS`、`NAS_IP`、`SiteA`、`SiteB`。照着做时请换成你自己的。
-> 脚本没有硬编码这些值 —— `scripts/run-batch.sh` 与 `deploy.sh` 读环境变量，
+> 脚本没有硬编码这些值 —— `scripts/diag/run-batch.sh` 与 `deploy.sh` 读环境变量，
 > 或读 `scripts/.nasrc`（已 gitignore）。完整对照表见 SUMMARY.md §0。
 
 ---
@@ -292,6 +292,21 @@ docker compose run --rm reseed-orchestrator status                          # �
    ```
    且 `:3060` 该单种进度 100%、状态为做种（`status` 子命令里计入 `seeding`）。
 3. **全量后**：编排器报告的做种数与 `:3060` 分类 `reseed-singles` 实际数量一致。
+4. **日报「各包进度」带不带 ② 口径完成度**（Part B 的验收；`SUMMARY §26.15`）——
+   ★ 这条**必须是可执行命令**，不许写成「看一眼日报」：后一种写法**没有判据形态**，
+   而它正是 Part B 挂在「未验收」状态过了九次收口的原因。
+   ```bash
+   grep -c packpct "//iSunker-DS423/docker_ssd/prowlarr_cross-seed_autohardlink/notify/log/$(date +%F).tsv"
+   ```
+   * `>0` ⇒ **生效**：日报正文里该出现 `（95%，74/78）` 这样的「百分比 + 未约简分数」，
+     分母为 0 的包写 **`（n/a）`**（**不是** `0%`），末尾还有一行 `总计：…  ← 各包之和，非平均值`。
+   * `=0` ⇒ **没生效**。★ 先别怀疑代码 —— 按 `§26.15` 查**容器到底读的哪份 `drive-loop.py`**：
+     `drive-loop.py` **在镜像里与挂载里各有一份**，只有挂载那份会随 `deploy.sh` 更新。
+     ```bash
+     docker compose --profile drive-loop exec drive-loop sh -c 'md5sum /app/scripts/drive-loop.py drive-loop/scripts/drive-loop.py'
+     ```
+     两行 **md5 不同** ⇒ 镜像旧，**必须重建镜像并 `docker load`**（`deploy.sh --apply` 治不了）。
+     `run-resident.sh` 已在启动时自检：读到不含 `PHASE_IDLE` 的旧代码会**退 3** 并在 `attempts.log` 留一行。
 
 ---
 
@@ -359,7 +374,7 @@ docker compose run --rm reseed-orchestrator status                          # �
 2. 记下每个站的 **indexerId**（索引器详情页 URL 里的数字，如 `/indexer/3` → id=3）。
    > ⚠ **这个数字会变** —— 删站再重加，ID 往往就换了。**每次增删索引器后都要重新核对**：
    > ```bash
-   > python scripts/prowlarr-indexers.py --torznab
+   > python scripts/diag/prowlarr-indexers.py --torznab
    > ```
    > ★★ **不要用 `curl ... /api/v1/indexer`**：那个端点的响应**每一条都带 `fields`**
    > —— 里面有 cookie / passkey。裸跑它（哪怕只为"看一眼结构"）等于把全部站点的
@@ -367,7 +382,7 @@ docker compose run --rm reseed-orchestrator status                          # �
    > 这个脚本打的是**同一个端点**，但**只取 `id` / `name` / `enable`**，
    > 所以它那一行输出可以安全粘贴。详见 `ENVIRONMENT.md` `ERR-SVC-02`。
    > 详见 SUMMARY §6.6。
-3. 把它的 Torznab 地址追加进 `.env` 的 `TORZNAB_URLS`，**逗号分隔、单行**（`scripts/add-indexers.py` 已自动化这步，会自动补 `/api`、只改一行、自动备份）：
+3. 把它的 Torznab 地址追加进 `.env` 的 `TORZNAB_URLS`，**逗号分隔、单行**（`scripts/diag/add-indexers.py` 已自动化这步，会自动补 `/api`、只改一行、自动备份）：
    ```
    TORZNAB_URLS=http://prowlarr:9696/2/api?apikey=<Prowlarr API key>,http://prowlarr:9696/3/api?apikey=<同一个 key>
    ```
@@ -517,9 +532,9 @@ DC相关剧集全系列大合集/            ← ❌ 别把这里当 dataDir
 用附带的生成器产出这段（幂等，加片后重跑即可）：
 
 ```bash
-python scripts/gen-datadirs.py "//YOUR-NAS/video/download/movies/DC相关剧集全系列大合集" \
+python scripts/diag/gen-datadirs.py "//YOUR-NAS/video/download/movies/DC相关剧集全系列大合集" \
     --level 2 --nas-prefix /volume1/video --list           # 先核对
-python scripts/gen-datadirs.py "//YOUR-NAS/video/download/movies/DC相关剧集全系列大合集" \
+python scripts/diag/gen-datadirs.py "//YOUR-NAS/video/download/movies/DC相关剧集全系列大合集" \
     --level 2 --nas-prefix /volume1/video --append-to .env  # 追加
 ```
 
@@ -536,7 +551,7 @@ python scripts/gen-datadirs.py "//YOUR-NAS/video/download/movies/DC相关剧集�
 这条值长约 3.5 KB、含中文与全角括号、还有带空格的路径 —— **别手敲**。用生成器：
 
 ```bash
-python scripts/gen-nas-env-update.py          # 由本地 .env 生成 scripts/nas-update-env.sh
+python scripts/diag/gen-nas-env-update.py          # 由本地 .env 生成 scripts/nas-update-env.sh
 ```
 
 把生成的 `scripts/nas-update-env.sh` 传到 NAS（和 `compose.yaml` 同目录），然后：
@@ -645,7 +660,7 @@ sh build-farm.sh --verify           # 只校验农场 vs 源
 确认无误后，切换（**与"移除 BTSCHOOL"合并成一次容器重建更省事**）：
 
 1. 本地 `.env` 把 `DATA_DIRS` 改成农场那一条路径；
-2. `python scripts/gen-nas-env-update.py` 生成新的 `nas-update-env.sh`；
+2. `python scripts/diag/gen-nas-env-update.py` 生成新的 `nas-update-env.sh`；
 3. NAS 上 `sh nas-update-env.sh`（改 `.env` + `--force-recreate` 容器）；
 4. 验证：`drive-loop` 启动时的「索引器自检」与 searchee 数应与切换前**一致**。
 
@@ -865,7 +880,7 @@ reflink 只保护**新建**的链接。改动前已建的 **628 条仍是硬链�
   整文件读改写的）。
 - **接线**在 `drive-loop.linkguard_watch()`，挂在**每日台账**里，只报数量：
   `被改写 N · 新增 N · 消失 N · 正在动 N`。**首读不响**（现状不是新闻，#47 的规矩）。
-- **诊断端** `scripts/crossseed-linkguard.py`（Windows 上跑，**只读**）：告诉你
+- **诊断端** `scripts/diag/crossseed-linkguard.py`（Windows 上跑，**只读**）：告诉你
   具体是**哪几条**（默认只出 hash 12 位，`--show-names` 才出发布名）。
 - ★★ **`_linkguard_detail.changed` 在首读那一轮必须是空的**。首读 `base={}` ⇒
   `linkguard_diff` 把**整库**算进 `added`，而 `linkguard_watch` 把 `changed + added`
@@ -970,10 +985,10 @@ reflink 只保护**新建**的链接。改动前已建的 **628 条仍是硬链�
 三个文件都曾长期**靠手工拷**，2026-09-12 才逐个收进白名单。
 
 ```bash
-python scripts/check-deploy-drift.py              # 两个方向都查（DST 取自 --dst / 环境变量 / scripts/.nasrc）
-python scripts/check-deploy-drift.py --all        # 连已知生产独有的一并列出
-python scripts/check-deploy-drift.py --cleanup    # 额外打一份「整理杂物」的 mv 计划（仍然只读）
-python scripts/check-deploy-drift.py --no-nas     # 只查 B 方向（NAS 不通时也有用）
+python scripts/diag/check-deploy-drift.py              # 两个方向都查（DST 取自 --dst / 环境变量 / scripts/.nasrc）
+python scripts/diag/check-deploy-drift.py --all        # 连已知生产独有的一并列出
+python scripts/diag/check-deploy-drift.py --cleanup    # 额外打一份「整理杂物」的 mv 计划（仍然只读）
+python scripts/diag/check-deploy-drift.py --no-nas     # 只查 B 方向（NAS 不通时也有用）
 ```
 
 **退出码**：`0` 干净 · `1` 有需要人看一眼的 · `2` 环境问题（NAS 不可达 / `.env` 解析失败）。
@@ -1010,7 +1025,7 @@ python scripts/check-deploy-drift.py --no-nas     # 只查 B 方向（NAS 不通
 删掉也只是多一个 commit，历史里还在。所以在 push **之前**拦一道。
 
 ```bash
-python scripts/scan-secrets.py      # 0 = 可以推；1 = 有新引入的命中，别推
+python scripts/diag/scan-secrets.py      # 0 = 可以推；1 = 有新引入的命中，别推
 git push origin main                # 绿了再推
 ```
 
@@ -1374,7 +1389,7 @@ python scripts/drive-loop.py --once --notify-spool "D:/tmp/x"    # 换个 spool
 | ~~**2**~~ | ~~**换一个站替换 BTSCHOOL**~~ ✅ **已关闭（2026-09-12 17:15）—— 是「当初的判据失效了」，不是「换好了」**：BTSCHOOL 现在**搜得出去、也匹配得到** —— `matched_indexers` = **23 部**，命中率 **23/46 = 50%**（四个站里最高），且这 23 部**全在 DC 包里、是那个包的最大贡献者**（压过 HDFans 的 21 部）；实时搜 `The Dark Knight 2008` 回 **24 条**、`Spider-Man No Way Home 2021` 回 **40 条**，Prowlarr 日志里它的 warn/error = **0**。要换它是因为 2026-09-11 它在 Prowlarr 出 CF 挑战页 → 后来重新启用、`/3/api` 加回 `.env`、容器重建，**那道坎过了，只是没人回来销账**。下站工具 `add-torznab-indexer.py --remove` 留着备用 | **真要换，按数据该换的是 `NanyangPT`（4/452 = 0.9%），不是它** —— 不过南洋可能只是片库对不上这批包，得先看目录 | §18.11.6 |
 | ~~**3**~~ | ~~四个新功能~~ ✅ **四条全部实现并部署**（农场巡检的**前置**、额度感知、趋势、**把农场巡检挂成定期任务**）；★ 最后一条已于 **2026-09-12 14:30 在生产实跑验证**——见 **SUMMARY §16.2.2.1「已在生产验证」** | ~~⬜ 只写了设计，均未实现~~ | §16 |
 | — | ~~**人工**：删掉 Windows 计划任务 `reseed-drive-loop`~~ ✅ **已确认根本不存在（2026-09-12 傍晚）** —— `schtasks /Query /TN "reseed-drive-loop"` 报「系统找不到指定的文件」，且全表 **375 个任务**里 `grep reseed` 命中 **0**。**不用删了** | ~~两边同时驱动会打出成片 429~~（风险已随退役消失） | §14.6 + §18.11.3 |
-| **4** | **跑一次「农场那条防线」的对账** —— ✅ **前半已完（2026-09-12 晚）**：两个脚本已收进版本库并登记进漂移哨兵的「不部署」名单 —— `scripts/audit-found-lines.py`（对账 **a − b**）与 `scripts/audit-found-resolve.py`（对账 **b − c**，UNC 直读 `state.db`）。★ **判据本体已搬进 `orchestrator/state.py`**（见下一行），两个脚本现在是**薄壳**。**只剩后半**：等日志里出现 `[inject] … from dataDir (/volume1/video/download/reseed/reseed_farm/…)` 的 Found 行，重跑 `audit-found-resolve.py` 一次 | 2026-09-12 晚跑出的 a−b=0 / b−c=0 **只覆盖「原路径」这条制度**：1011 条 Found 行**全部**是 `[webhook]`、组5 **全部**是原路径 ⇒ `_RE_FOUND` 的 `[inject]` 分支、以及 `_resolve_searchee_to_pack()` 的**农场分支**流量为 **0**。**v3 农场那条防线至今没在生产里被走到过** —— 绿，但绿可能是因为规则压根没参与匹配。★ 脚本里那格 `组5 落在农场根下 0` 就是这道判据的自检：**它恒为 0 时，上面那个 0 覆盖不到农场** | §18.18.2 |
+| **4** | **跑一次「农场那条防线」的对账** —— ✅ **前半已完（2026-09-12 晚）**：两个脚本已收进版本库并登记进漂移哨兵的「不部署」名单 —— `scripts/diag/audit-found-lines.py`（对账 **a − b**）与 `scripts/diag/audit-found-resolve.py`（对账 **b − c**，UNC 直读 `state.db`）。★ **判据本体已搬进 `orchestrator/state.py`**（见下一行），两个脚本现在是**薄壳**。**只剩后半**：等日志里出现 `[inject] … from dataDir (/volume1/video/download/reseed/reseed_farm/…)` 的 Found 行，重跑 `audit-found-resolve.py` 一次 | 2026-09-12 晚跑出的 a−b=0 / b−c=0 **只覆盖「原路径」这条制度**：1011 条 Found 行**全部**是 `[webhook]`、组5 **全部**是原路径 ⇒ `_RE_FOUND` 的 `[inject]` 分支、以及 `_resolve_searchee_to_pack()` 的**农场分支**流量为 **0**。**v3 农场那条防线至今没在生产里被走到过** —— 绿，但绿可能是因为规则压根没参与匹配。★ 脚本里那格 `组5 落在农场根下 0` 就是这道判据的自检：**它恒为 0 时，上面那个 0 覆盖不到农场** | §18.18.2 |
 | — | **三条观测判据进生产（2026-09-12 夜）** ✅ —— ①口径改名 ②全场无人认领 ③a−b/b−c 进 metrics。判据本体全部落在 **`orchestrator/state.py`**（`count_found_lines` / `resolve_found_lines` / `unclaimed_searchees` / `pack_contexts`），接线在 `drive-loop.py` 的 `reconcile_watch()` → 每日台账 `metrics`，差不为 0 时立刻发 alert | **为什么判据必须住 state.py**：`drive-loop.py` 跑在 **NAS 宿主机**（`/usr/bin/python3`），而 `scripts/audit-found-*.py` 是 **LOCAL_ONLY**（`deploy.sh` 的 FILES 里没有它们）—— 那两个文件**根本不在 NAS 上**，且写死的 `//iSunker-DS423/...` 在 NAS 上不存在。`orchestrator/state.py` 被部署**两次**（构建上下文 + `drive-loop/orchestrator/`），是两侧**唯一都能到达**的地方 | §18.19 |
 | ~~**5**~~ | ~~**决定要不要给 `SyncReport` 加一格 `other_pack`**~~ ✅ **已判：不加（2026-09-12 夜）—— 不是因为"设计洁癖"，是因为它算出来就是个常数**。实测（NAS 只读）：三包**共用一个 `farm_root`** ⇒ 〔生产口径〕下 `other_pack` = **dc 865 / frds 146 / mbf 1011**，恒非零、大体恒定，**没有信息量**。真正该加的判据是**「全场无人认领」**（三包 dpaths 并集 vs 库里 searchee 全集），它才恒为 0，且非零时每条都指得出名字 | ★ 同时更正一处分寸：`audit-found-resolve.py` 报的那个 `other_pack = 0` 是**它自己循环构造的产物**（所有包一起试、命中即停），**不是日志的性质** —— 全量口径的 0 与生产口径的 865 不可比。这跟 `NanyangPT` vs `NanyangPT (南洋)` 是**同一个形状**：一个名字盖了两种模型。两个脚本现在都把口径名印在数旁边 | §18.19.1 + `tests/test_reconcile.py` |
 | — | **实测：全场恰好 1 条 searchee 无人认领** —— `/volume1/video/download/reseed/reseed_farm/0观影清单chrlee整理`，里面只有一个 `.xlsx` 清单、**三包都不认**、`searched`/`decisions` 里都没有它（所以今天不烧额度，是**潜伏**的）。这是新判据的对账基准：**报得出这个 1 才可信**，报 0 或 3 都说明判据自说自话 | 该计数器的期望值**指回了一条判据之外的真实记录** —— 这是三轮论证要的那个形状的第一个具体实例 | §18.19.2 |
@@ -1394,7 +1409,7 @@ python scripts/drive-loop.py --once --notify-spool "D:/tmp/x"    # 换个 spool
 | **12** | **qB（:3060）校验队列疑似卡死，卡住 145 条** —— 偏好里 `max_active_checking_torrents = 1`，而 **145 条 IYUU 种子**挤在 `checkingDL` 排队、**8 小时一步没挪**（另有 `error` 24 / `stalledDL` 1，全部 added 09-13 02:35–03:17，`pieces_have=0`、共 170 条 0 字节）。已排除三种：497 个文件逐个 `stat` **全部大小相符**、`save_path` **无映射失败** ⇒ **不是「保存路径错 / 根目录差一层 / 缺文件」**。★ **待坐实的一步（写操作，1 条，可逆）：对任意一条卡住的种子手动「强制重新校验」** —— 几秒内跳 100% ⇒ 坐实是**校验队列/校验器**卡住，不是内容问题；**未坐实前这只是「最符合证据的解释」** | 卡住的不是 1 条而是 **145** 条；校验不完就不做种，而**做种数正是这条链的产出** | — |
 
 | **13** | **`movie.matched_indexers` 全库恒空：查清 + 修（#73 / #75）** —— ✅ **代码已改、测试已过（2026-09-14），★ 未部署**。查下来**不是**「判据没被调用」：拿 09-12 的日志跑**现在**的解析函数**有值**（1011 行命中，归片后带站名 —— 南洋 285 / HDFans 448 / HDtime 44）。真根因是两段：**① 输入源易失** —— `facts.found` 的**唯一**输入是**当天**的 `info.current.log`（`searched` / `hashes` 都有 cross-seed.db 这第二条腿，**`found` 没有**）；**② 写入端不合并** —— `sync_movie` 对 `matched_indexers` 是**整行覆盖**，而同一个函数里 `indexer_seen` 是**合并**的、`searched_indexers` 是 union 的（**两列语义相同、写法相反 = 遗漏，不是设计**）。⇒ 日志跨天一滚动（`info.current.log` → `info.YYYY-MM-DD.log`），下一次 sync 就把整列抹成 `[]`；而 SEEDING 的行**不会再被搜** ⇒ **永不恢复**。生产见证：同一张 605 行的表 **09-12 非空 215 部 → 09-14 变 0 部**。修法：**与旧值取并集**（**不采用**「喂全部 `info.*.log`」—— 成本随保留天数涨，且仍不覆盖被轮换掉的），并在源头**不再造 `"A\|B"` 合体标签**（读侧 `_sites()` 按 JSON 数组**逐项**取，不认里面的 `\|`；老库残留的合体标签在写入端**拆开**再并）。回归 `tests/test_matched_indexers_union.py`（15 条，**红过再绿**：回退那两个 hunk ⇒ 红 4 条）| ★ 这一列是 `report` 的**站点归属**与 `trend` 的**按周 × 按站**换站决策表的输入 —— 它恒空等于**那些判据都在沙上建塔** | §22 |
-| **14** | **两件等拍的** —— ① **17:40 观测**（Prowlarr 放行 HDtime 之后 cross-seed 动不动）：两个读数 `python scripts/prowlarr-indexerstatus.py`（② 机制）与 `python scripts/check-indexer-timestamps.py`（③ 机制）。★ **时刻到 ≠ 条件成立** —— 窗口本身已经变过一次（`disabledTill` 记的是 24 h，而 6 h 那个只是 14:27 的读数），**先读再判** ② **存储分析器互校**：三步探针已跑完，结论是**报告里没有可用空间**（`Used` 只有百分数，0.1% on 61.4 TB = 61 GB）⇒ **等拍**：换对照量还是换报告 | ① 这是唯一能把 `ERR-SVC-17` 里那处**剩余推断**（cross-seed 是原样转抄 `Retry-After`，还是按自己起算点重算）验掉的机会，**顺手答** `#60`（放行后动不动 ⇒ snooze 该怎么处置）；判据见那两条 | §22 · `INDEX-USAGE` §八 |
+| **14** | **两件等拍的** —— ① **17:40 观测**（Prowlarr 放行 HDtime 之后 cross-seed 动不动）：两个读数 `python scripts/diag/prowlarr-indexerstatus.py`（② 机制）与 `python scripts/diag/check-indexer-timestamps.py`（③ 机制）。★ **时刻到 ≠ 条件成立** —— 窗口本身已经变过一次（`disabledTill` 记的是 24 h，而 6 h 那个只是 14:27 的读数），**先读再判** ② **存储分析器互校**：三步探针已跑完，结论是**报告里没有可用空间**（`Used` 只有百分数，0.1% on 61.4 TB = 61 GB）⇒ **等拍**：换对照量还是换报告 | ① 这是唯一能把 `ERR-SVC-17` 里那处**剩余推断**（cross-seed 是原样转抄 `Retry-After`，还是按自己起算点重算）验掉的机会，**顺手答** `#60`（放行后动不动 ⇒ snooze 该怎么处置）；判据见那两条 | §22 · `INDEX-USAGE` §八 |
 
 | **15** | **ENVIRONMENT 卷归属复核：结论对、一处路径错、一味药没标适用范围** ✅ **已完成并推送（2026-09-14，`ead756d`）** —— ① **修路径**：`A.3` 的 `/volume1/docker_ssd` → **`/volume2/docker_ssd`**（同文件 212 行与归属表本来就是 `/volume2` ⇒ 三处自相矛盾；★ 而这行犯的**正是它上文 `ERR-DSM-03`/`ERR-FS-02` 登记的那个错**）② **补两条 Windows 侧通路**：`df -h <UNC>`（按底层文件系统分组，实测 **8/8 正确**）与 Storage Analyzer 的 `share_list.csv` 的 **`Volume` 列**（SMB、无凭据、每周三 04:07）—— 原来的 `ContainerManager/all_shares` **只在 NAS 上**读得到，本机没有 SSH ③ **`stat -c %d` 补适用范围**：**只在 NAS 侧成立**；Windows/SMB 侧实测**十个共享十个互不相同的号**（含同卷的 `video`/`Download`/`homes`/`drive`/`web`/`docker`）⇒ **分辨力为零**，对照量用 `df`；并记下 `build-farm.sh` 自承可从 SMB 跑 ⇒ 真那么跑会把**每个源目录**判成「不同卷，跳过」 | 一份专门教人「别按路径前缀判同一块盘」的文档，**照着错法写了一行**；而那枚被开了 4 处药的探针，**只在一个机器上有效** | §23.1 · §23.2 · `ENVIRONMENT.md` `A.3` |
 | **16** | **同族三条（`#87`/`#88`/`#89`）** ✅ **已完成（2026-09-17）** —— 三处文档已按实测改正，并把判据换强：① **`/volume1/docker`「不是共享文件夹」×4 处** —— 实测 `//iSunker-DS423/docker` **UNC 可达**（负对照：不存在的共享名报 `No such file or directory`，所以不是幻觉），DSM 自己的 `share_list.csv` 把它列为 **Volume 1**；而 `net view` 与本机 `ls` **都只列 5 个**（实际 12）⇒ 结论改成 **「枚举里看不见」≠「不是共享文件夹」** ② **`ERR-HW-03` 里承重的 `net view`** —— `net view '\\iSunker-DS423'` 报 **1702 绑定句柄无效**，换裸名才通 ⇒ 已拆成独立的 `ERR-HW-03b`，并写明**该探针本机不稳、且即便跑通也只是枚举**（不能用来断言"不存在"）③ **`SUMMARY` 的 ⬜②** —— `//iSunker-DS423/docker` 根**没有** `.probe_done_*`，**不需要 SSH** 已结案 | ★ 三条是**同一个形状**：文档自己写着「看不见 ≠ 不存在」，却在 8 行之外用「看不见」断言了不存在。★ 顺带把判据换成 **`share_list.csv` 的 `Volume` 列 + 逐共享精确字节**（**一次给全 12 个共享、不依赖枚举**），本机 SMB 直读、`utf-16-le` 解 | §23.3 · §23.4 |
@@ -1449,8 +1464,8 @@ COMPOSE_DIR="$D" FARM="//iSunker-DS423/video/download/reseed/reseed_farm" \
 回**电脑上**再跑两条（查的不是农场，是「NAS 与仓库」本身、以及「待推的东西里有没有凭据」）：
 
 ```bash
-python scripts/check-deploy-drift.py      # 0 干净 / 1 有要看的 / 2 够不着 NAS
-python scripts/scan-secrets.py            # 0 可以推 / 1 有新引入的凭据形状命中
+python scripts/diag/check-deploy-drift.py      # 0 干净 / 1 有要看的 / 2 够不着 NAS
+python scripts/diag/scan-secrets.py            # 0 可以推 / 1 有新引入的凭据形状命中
 ```
 
 日报里**自动**带「每日台账」（额度 + 趋势），每 24 小时最多一条；
@@ -1469,7 +1484,7 @@ python scripts/scan-secrets.py            # 0 可以推 / 1 有新引入的凭�
 > （`info.current.log` 按天轮转）⇒ 天然是「**今天 00:00 到现在**」，会随一天推进而涨。
 > 所以日报里 `fa` 总是个小数字（实测 09-13 首批 = **76**）。
 > **1011 是 09-12 的「全天」数**（手工核时读的同一个文件、读得晚）—— 拿它当日报的期望值
-> 是**把一条全天记录写在了日初的读法旁边**。要核全量用 `scripts/audit-found-lines.py`。
+> 是**把一条全天记录写在了日初的读法旁边**。要核全量用 `scripts/diag/audit-found-lines.py`。
 > ★ `fb_c_farm` 恒为 `0` 是**自检**：它一旦长期为 0，就说明**农场那条防线还没被走到**
 > （`_RE_FOUND` 的 `[inject]` 分支 / `_resolve_searchee_to_pack()` 的农场分支流量为 0）
 > —— 上面那个 `fb_c_all = 0` 此时**覆盖不到农场**。绿是真的绿，但它管不到那条路。
@@ -1687,22 +1702,22 @@ python scripts/reseed-state.py drive --pack dc-collection --indexers HDFans,Nany
 schtasks /Delete /TN "reseed-drive-loop" /F
 #    不删也不影响 —— 它是"已禁用"状态，而且目标 .cmd 已经没了，永远不会跑。
 
-# 2) scripts/run-batch.sh 仍然保留（它是一次性的**手动**命中率试跑，不是调度）
+# 2) scripts/diag/run-batch.sh 仍然保留（它是一次性的**手动**命中率试跑，不是调度）
 #    但它从 Git Bash 跑，照样要读 scripts/.nasrc。
 ```
 
 **③ 明确保留的东西**
 
 - ✅ **`deploy.sh`** —— Windows Git Bash 跑的，**唯一**还从电脑发起的**写**操作。别删。
-- ✅ **`scripts/check-deploy-drift.py`** —— Windows Git Bash 跑的，**只读**。它回答
+- ✅ **`scripts/diag/check-deploy-drift.py`** —— Windows Git Bash 跑的，**只读**。它回答
   「NAS 上有没有我不知道的文件 / 仓库里有没有该部署却没进白名单的文件」，见「漂移哨兵」一节。
-- ✅ **`scripts/scan-secrets.py`** —— Windows Git Bash 跑的，**只读**。`git push` 前跑一遍，
+- ✅ **`scripts/diag/scan-secrets.py`** —— Windows Git Bash 跑的，**只读**。`git push` 前跑一遍，
   按值的形状找漏进仓库的凭据。★ 它**读**本地 `.env` 但**只算 sha256、从不打印命中到的值**，
   所以输出可以直接贴给人看。见「推前凭据扫描」一节。**只扫不改，也不是调度的一部分。**
-- ✅ **`scripts/run-batch.sh`** —— 手动试跑工具，不是调度的一部分。
+- ✅ **`scripts/diag/run-batch.sh`** —— 手动试跑工具，不是调度的一部分。
 - ✅ **`scripts/nas-update-env.sh`** —— **2026-09-12 晚已进 `deploy.sh` 白名单**（映射到
   `<compose>/nas-update-env.sh`），跟着 `deploy.sh --apply` 走，**不用再单独拷**。
-  它是**生成物**（`scripts/gen-nas-env-update.py` 产出，故本地被 gitignore）——
+  它是**生成物**（`scripts/diag/gen-nas-env-update.py` 产出，故本地被 gitignore）——
   之所以能进白名单，是因为它只装载 `DATA_DIRS` + `LINK_DIR` 两个**路径**键、不含任何凭据。
   ⚠ 若哪天它开始携带别的键，**先回看 `deploy.sh` 里那段注释**再同步。
 
@@ -1934,7 +1949,7 @@ schtasks /Delete /TN "reseed-drive-loop" /F
 14. ⬜ **2026-09-12 晚：「漂移哨兵 + 推前扫描」这一轮的收尾与遗留**
 
    ✅ **已完成**：白名单补齐（25→27，最后两个手工文件，见 §18.14.2）、
-   `scripts/check-deploy-drift.py`（漂移哨兵，§18.14.3）、`scripts/scan-secrets.py`
+   `scripts/diag/check-deploy-drift.py`（漂移哨兵，§18.14.3）、`scripts/diag/scan-secrets.py`
    （推前凭据扫描，§18.15）、`tests/test_scan_secrets.py`（25 条对照）、
    杂物整理（10 项 `mv` / 23 个文件进 `_cleanup-20260912/`）。
 
@@ -2097,9 +2112,9 @@ schtasks /Delete /TN "reseed-drive-loop" /F
 
    **b. 已落地（取代了原「方案 B」的 `docker run` 草案）：`compose.yaml` 里的 `drive-loop` 服务**
    + 常驻入口 `scripts/drive-loop-resident.sh`（部署为 `drive-loop/run-resident.sh`）。
-   ★ `scripts/drive-loop-docker.sh`（那份 `docker run` **草案**）**已作废**，
+   ★ `scripts/diag/drive-loop-docker.sh`（那份 `docker run` **草案**）**已作废**，
      但**文件保留** —— 它记着挂载清单与三条容器方言的推导过程，是 `§26.5` 的判据；
-     在 `check-deploy-drift.py` 的 `LOCAL_ONLY` 里已改写成「已作废、保留为推导记录、不部署」。
+     在 `scripts/diag/check-deploy-drift.py` 的 `LOCAL_ONLY` 里已改写成「已作废、保留为推导记录、不部署」。
 
    **★★ c. 安全锁 —— `profiles: ["drive-loop"]`（本次最要紧的一条）**
    原因就是 (d)：两条路**没有跨进程互斥**，同时发 webhook ⇒ 一次 429 可能废掉几百条。
@@ -2132,7 +2147,7 @@ schtasks /Delete /TN "reseed-drive-loop" /F
    ★ **2026-09-17 更正**：这里原写「**五个**」，**实测是六个** ——
      `.daily-report` / `.drive-loop` / `.farm-check` / `.linkguard` / `.notify` / `.reconcile`
      （其中 `.linkguard.state` 约 **827 KB**，那是基线本身）。
-     ⇒ 清单以 **`scripts/chk58.sh` 的 `[3]` 段**为准 —— 它会逐个点名 + 报字节数，
+     ⇒ 清单以 **`scripts/diag/chk58.sh` 的 `[3]` 段**为准 —— 它会逐个点名 + 报字节数，
        并在"目录里还有清单之外的 `.state`"时提醒更新清单。
    ★ 代价也要写明：挂整个 compose 目录 = 把 `.env`、`prowlarr/`、`cross-seed/`、
    `notify/notify.conf` 一并交给这个容器 —— 这是**新扩大的爆炸半径**，躲不掉。
