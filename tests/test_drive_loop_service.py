@@ -777,6 +777,187 @@ ck("★ ⑧ 反向：`chk58.sh` 的 ✓/✗ 同时有 shell printf 与 python �
    "chk58.sh 的 shell bad() 与 python 打印都在；锁只需管 python 那半")
 
 # ==========================================================================
+# ⑨ `phase` 的**默认值**与**三处收尾**（2026-09-19 加）
+# --------------------------------------------------------------------------
+#   ★★ 这一段的来历要说清楚，因为**我上一轮把结论搞反过**：
+#     我在 NAS 上 `cat .drive-loop.state` 看到 `phase:"running"`，就断言
+#     「收工后残留 running ⇒ 下一个容器永远判在跑 ⇒ 静默永久停工」。
+#     **那是错的** —— 7 分钟后同一条命令读到 `phase:"idle"`。
+#     ⇒ `running` 是**批次正在跑**时的正常瞬时值，睡眠期被
+#       `Heartbeat(phase=PHASE_IDLE)` 覆盖成 `idle`。**现场从头到尾是对的。**
+#     ★ 我错在**拿"读了一秒的那一帧"当稳定状态**，而这个字段**每 60 秒就翻一次**
+#       （心跳 `period=60.0`）。⇒ 教训写进 SUMMARY §29.8：
+#       **`cat` 一次 `.drive-loop.state` 不是有效的取证动作。**
+#
+#   ★ 所以这一段**不修任何东西**（没有缺陷可修），它钉的是**"别让将来的人
+#     把这三处之一改成 `running`"** —— 那才会造出我上一轮**以为**存在的那个缺陷：
+#       `_resident_state` 的 `phase` 形参有**一处默认值**，而它**四处调用里有三处
+#       不传参**（启动 / dry-run / 无动作 / 正常收工）⇒ **默认值写错 = 三处同时写错**，
+#       而症状是「永远判在跑 ⇒ 静默永久停工」（`Heartbeat` docstring 最怕的那个）。
+#   ★★ 判据用 **AST 读 `defaults`**，不用字符串匹配：
+#     字符串匹配分不出「默认值是 idle」和「注释里写了 idle」。
+# ==========================================================================
+print("\n=== ⑨ `phase` 默认值 + 三处收尾（2026-09-19 加；上轮结论搞反过）===")
+if _TREE is not None:
+
+    def _defn(name: str):
+        for _x in ast.walk(_TREE):
+            if isinstance(_x, ast.FunctionDef) and _x.name == name:
+                return _x
+        return None
+
+    # ---- ⑨a `_resident_state` 的 `phase` 形参默认值必须是 PHASE_IDLE ----
+    _rs = _defn("_resident_state")
+    ck("前提：找得到 `_resident_state()`（常驻状态凡唯一写入点）", _rs is not None)
+    if _rs is not None:
+        _a = _rs.args
+        #   ★ 形参名以 ast.arg.arg 报出；默认值在 args.defaults（**右侧对齐**）。
+        _pos = [x.arg for x in _a.args]
+        _dflt = _a.defaults
+        _off = len(_pos) - len(_dflt)          # 默认值只覆盖尾部
+        _map = {_pos[_off + i]: d for i, d in enumerate(_dflt)}
+        _ph = _map.get("phase")
+        _is_idle = (isinstance(_ph, ast.Name) and _ph.id == "PHASE_IDLE") or \
+                   (isinstance(_ph, ast.Constant) and _ph.value == "idle")
+        ck("★★ ⑨a `_resident_state` 的 `phase` 形参默认值是 `PHASE_IDLE`"
+           "（★ 四处调用里三处不传参 ⇒ 默认值写错=三处同时写错）",
+           _is_idle,
+           f"读到默认值 {ast.dump(_ph) if _ph is not None else None!r}；"
+           "若默认成 PHASE_RUNNING ⇒ 启动/dry-run/无动作/正常收工全写 running"
+           " ⇒ 下一个容器永远判在跑 ⇒ 静默永久停工")
+        #   ★ 反向：`phase` **必须带默认值**。不带的话四处调用里三处当场 TypeError
+        #     （症状是"常驻模式起不来"，比写错值更显眼，但仍然该钉）。
+        ck("★ ⑨a-2 `phase` **有**默认值（没有 ⇒ 三处不传参的调用当场 TypeError）",
+           "phase" in _map, f"形参 {_pos} / 默认 {list(_map)}")
+
+    # ---- ⑨b 三处收尾都**显式**写 `"phase"`（整体覆盖，不写=删掉该键）----
+    #   ★★ 为什么是"整体覆盖"这条性质在起作用：三处 `write_state({...})` 都是
+    #     **字典字面量、不是 `{**st, ...}` 合并** ⇒ **不写 `phase` 就等于删掉它**
+    #     ⇒ 下一个读者走「旧格式」分支（只信心跳）⇒ 「说在跑的那位早收工了」检测不到。
+    #
+    #   ★★★ 这一段的**第二版又栽了一次，同样被变异测试抓出来**（两次都栽在
+    #     「怎么算'收尾那个'」上，值得逐字记）：
+    #     第二版用 `ast.walk` 的**出现顺序取最后一个** —— 结果 `main()` 里取到的是
+    #     **嵌套函数 `_resident_state` 的 `write_state`（L2957）**，而不是常驻分支
+    #     真正的收尾（**L3073**）。⇒ 削掉 L3073 的 `phase` 之后断言**照样过**。
+    #     ★ 根因：`ast.walk` 是 **BFS**（先父后子、同级按字段顺序），**不是源码顺序**；
+    #       而 `_resident_state` 是 `main()` 的**嵌套函数**，它的调用点行号更小，
+    #       却在 walk 顺序里排得更晚。⇒ **凡"第几个/最后一个"都必须按 `lineno` 排。**
+    #     ★★ 第三版改成：**按 `lineno` 排序**，并且收尾那个用**结构特征**指名
+    #       ——`once_round` 的收尾认 `"last_end_ts"`（开跑那次没有这个键）；
+    #       `main` 的收尾也认 `"last_end_ts"`。**特征比位置稳**。
+    #     ★ 一句话：**"取最后一个"这种写法，在嵌套函数 + BFS 遍历下是错的。**
+    _want = [("once_round", "once_round() 的 finally 收尾", "tail", None),
+             ("main", "main() 常驻分支的 --max-rounds 收尾", "tail", None),
+             ("_resident_state", "_resident_state() 的每轮快照", "any", None)]
+
+    def _ws_dict_keys(fn_name: str) -> list:
+        """**按 `lineno` 排序**返回该函数里每个 `write_state(<字典字面量>)`。
+
+        返回 `[(lineno, [键名…]), …]`。
+        ★ 必须按 `lineno` 排，**不能靠 `ast.walk` 的出现顺序**（BFS：嵌套函数的调用
+          点行号更小却排得更晚 ⇒ "取最后一个"会取错，实测栽过）。
+        """
+        _f = _defn(fn_name)
+        if _f is None:
+            return []
+        out = []
+        for _n in ast.walk(_f):
+            if isinstance(_n, ast.Call) and isinstance(_n.func, ast.Name) \
+                    and _n.func.id == "write_state":
+                for _arg in _n.args:
+                    if isinstance(_arg, ast.Dict):
+                        out.append((_n.lineno,
+                                    [_k.value for _k in _arg.keys
+                                     if isinstance(_k, ast.Constant)]))
+        return sorted(out)
+
+    #: 收尾那次的**结构特征**：整体覆盖写、且带 `last_end_ts`（开跑那次没有）。
+    #: ★ 用特征而不是位置 —— 位置法已经栽过两次（BFS + 嵌套函数）。
+    _TAIL_MARK = "last_end_ts"
+
+    _dbg = {}
+    for _fn, _label, _which, _ in _want:
+        _calls = _ws_dict_keys(_fn)
+        _dbg[_fn] = _calls
+        #   ★ 前提：找得到（找不到就该红，别让下面两条"因为空集而恒真"）
+        ck(f"前提：⑨b `{_fn}` 里有 `write_state(<字典字面量>)` 可判",
+           bool(_calls), f"读到 {_calls!r}")
+        if not _calls:
+            continue
+        if _which == "tail":
+            #   ★★ 指名**收尾那一次**：`last_end_ts` 是"这批结束了"的落盘标记，
+            #      而开跑那次写的是 `running_pid_pidns`/`heartbeat_ts`。
+            _tails = [k for _ln, k in _calls if _TAIL_MARK in k]
+            ck(f"前提：⑨b `{_fn}` 里找得到**收尾那次**（带 `{_TAIL_MARK}`）",
+               len(_tails) == 1, f"命中 {len(_tails)} 次：{_calls}")
+            if len(_tails) != 1:
+                continue
+            _keys, _where = _tails[0], f"**收尾那次**（带 `{_TAIL_MARK}` 的整体覆盖写）"
+        else:
+            _keys = [k for _ln, _c in _calls for k in _c]
+            _where = "任一"
+        ck(f"★★ ⑨b {_label} 的 `write_state` 字面量里**含** `\"phase\"`"
+           f"（{_where}；整体覆盖 ⇒ 不写就是删掉它，读者退回「只信心跳」）",
+           "phase" in _keys,
+           f"`{_fn}` 的{_where}键表 = {_keys}；"
+           f"该函数全部 write_state（按行号）= {_calls}")
+
+    def _tail_has_phase(fn_name: str) -> bool:
+        return any("phase" in k for _ln, k in _ws_dict_keys(fn_name)
+                   if _TAIL_MARK in k)
+
+    ck("★★ ⑨b-2 三处**全部**有（漏一处 = 那条路的收尾退回旧格式）",
+       _tail_has_phase("once_round") and _tail_has_phase("main")
+       and any("phase" in k for _ln, k in _ws_dict_keys("_resident_state")),
+       f"逐函数 write_state（行号, 键）={_dbg}")
+
+    # ---- ⑨c ★★ 反向：`600s` 那条线**两个方向**都得成立 ----
+    #   ★ 这是本段**唯一**钉行为的一条，而且它**正反都要**：
+    #     · `running` + 心跳**新鲜**(60s)  ⇒ True  —— 别把**正常在跑**的判成可接管
+    #       （判错这一边 = 两批并发发 webhook ⇒ 一次 429 废掉几百条，README 坑 4）
+    #     · `running` + 心跳**陈旧**(900s) ⇒ False —— 卡死**必须**能被接管
+    #       （判错这一边 = autoheal 那套机制**白装**，卡死的容器永远没人接管）
+    #   ★★ 我上一轮提的「甲案」（把 600 抬到 1800）就是**牺牲后一边去修前一边**
+    #     —— 而前一边**本来就没坏**（`cat` 到的那帧 `running` 7 分钟后自己变 `idle`）。
+    #     这条断言把两个方向同时钉住，**将来谁再想抬这个阈值都会当场看到代价**。
+    if _DL is not None:
+        ck("★★ ⑨c-1 反向·正向：`running` + 心跳**新鲜**(60s) ⇒ **True**"
+           "（正常在跑的绝不许判成可接管 —— 两批并发=一次 429 废几百条）",
+           _ba(_st(phase="running", heartbeat_ts=_now - 60)) is True,
+           "把正常在跑的判成可接管了；这是 README 坑 4 那个事故的形状")
+        ck("★★ ⑨c-2 反向·负向：`running` + 心跳**陈旧**(900s) ⇒ **False**"
+           "（卡死必须能被接管；判成 True ⇒ autoheal 那套白装）",
+           _ba(_st(phase="running", heartbeat_ts=_now - 900)) is False,
+           "900s 判成「还在跑」⇒ 卡死检测被关掉了")
+        #   ★ 再钉一条**边界的方向**：阈值就在 600s 上下，
+        #     599s 该 True、601s 该 False —— 免得将来有人把比较写成 `>=`。
+        _TH = getattr(_DL, "HEARTBEAT_STALE_SEC", None)
+        ck("★ ⑨c-3 `HEARTBEAT_STALE_SEC` 仍是 600s（这条线的位置本身就是判据）",
+           _TH == 600, f"读到 {_TH!r}")
+        if _TH == 600:
+            #   ★★ 这条**证明的东西比第一版想的少，如实写清楚**（第一版措辞吹了）：
+            #     · 它**能**抓住**比较方向写反**（`<=` → `>=`）——
+            #       实测：这么改会让 ⑤e/⑤g/⑨c-1/⑨c-2/⑨c-4 **五条一起红**。
+            #     · 它**抓不住** `<=` → `<` 这种**边界开闭**的改动：
+            #       `time.time()` 不可能正好落在 `stale == 600.000000`，
+            #       599/601 两侧两种写法**行为完全一样**（实测：97 过 / 0 失败）。
+            #     ⇒ 想钉开闭只能**注入可控时钟**，本文件做不到（`batch_alive` 用的是
+            #       模块级 `time.time`）⇒ 那种改动**本机未验**，不许当成已覆盖。
+            ck("★ ⑨c-4 边界两侧取值方向没被判反：599s ⇒ True、601s ⇒ False"
+               "（★ 只证方向，不证开闭 —— 见上方注释）",
+               _ba(_st(phase="running", heartbeat_ts=_now - 599)) is True
+               and _ba(_st(phase="running", heartbeat_ts=_now - 601)) is False,
+               "边界两侧至少一侧判反了（注意：本机验不了 `<=` vs `<` 的开闭）")
+
+#   ★★ ⑨d 写成一个**未验**（不是通过）：`phase` 的**翻转频率**（60s/拍）
+#     决定了「`cat` 一次不算取证」这条方法学 —— 而它**离线判不了**
+#     （要真跑一个常驻进程、在两个时刻各读一次）。⇒ 显式打 `--` 行，
+#     **不计入断言数**：本项目铁律「拿不到 ≠ 通过」（B.10 第 14 条）。
+print("  --   ⑨d `phase` 翻转频率（60s/拍）⇒「cat 一次不算取证」—— **本机未验**，"
+      "要真常驻进程 + 两个时刻各读一次；**不是通过**")
+
+# ==========================================================================
 print(f"\n{'=' * 60}")
 print(f"断言 {_ok + _bad} 条：{_ok} 过 / {_bad} 失败")
 if not _DOCKER:
