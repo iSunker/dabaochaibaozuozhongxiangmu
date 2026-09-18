@@ -78,6 +78,8 @@ RESIDENT = REPO / "scripts" / "drive-loop-resident.sh"
 DOCKER_PY = REPO / "scripts" / "drive-loop.py"
 NAS_SH = REPO / "scripts" / "drive-loop-nas.sh"
 DEPLOY = REPO / "deploy.sh"
+MOUNT_SELFCHECK = REPO / "scripts" / "diag" / "drive-loop-mount-selfcheck.sh"
+CHK58 = REPO / "scripts" / "diag" / "chk58.sh"
 
 # ★★ 整份测试的**前提**：文件在不在。缺了就直接红，别让后面十几条
 #    全部"因为读不到而跳过"——那是把「没验」伪装成「通过」（B.10 第 14 条）。
@@ -734,6 +736,45 @@ if YML:
        isinstance(_ah, dict) and "env_file" not in _ah, repr(_ah.get("env_file") if isinstance(_ah, dict) else None))
 else:
     print("  --   没有 PyYAML ⇒ ⑦ 段未验（**不是通过**）")
+
+# ==========================================================================
+# ⑧ shell 工具里的 **python heredoc 必须锁 UTF-8**（2026-09-18 实测的哑火）
+# --------------------------------------------------------------------------
+#   ★★ 形状：② 段那个 heredoc 里 `print("  ✓/✗ …")` 打的是 U+2713/U+2717，
+#     而 Windows 的 python 默认 stdout 是 **GBK** ⇒ 编不出 ⇒ UnicodeEncodeError。
+#   ★ 症状**不是"整个脚本崩掉"**（那样反而显眼），是 **② 段半途而废**：
+#     前面的 `✓` 行都打完了，一到**第一条 `✗`** —— 也就是**真有问题、最该被看到**
+#     的那一行 —— 就抛。⇒ 那一段的**全部裁决** + `⇒ 路径不可达数` **一行都出不来**，
+#     只剩一个 traceback；而 `|| RC=1` 又兜住了退出码 ⇒ 脚本以 1 退出却**不给解释**。
+#   ★ 也就是说：**判据恰好在最该报的时候哑掉**（本项目最怕的形状）。
+#   ★ 处置是 `export PYTHONIOENCODING=utf-8`，本仓已有两处先例（`chk58.sh:107`、
+#     `drive-loop-nas.sh` / `run-resident.sh` 同句），属"照抄"而非新设计。
+#   ★★ 反向也要钉：shell 那侧的 `bad()`/`ok()`（`printf`）**不需要**这条 ——
+#     printf 不过 python 的编码器，实测在 GBK 下照打（本项目已在 `chk58.sh` 里验过）。
+#     别把"给 shell 也加一条"当补强 —— 那是把判据钉在一个**不存在**的失效模式上。
+print()
+_sh = {
+    p.name: p.read_text(encoding="utf-8", errors="replace")
+    for p in (MOUNT_SELFCHECK, CHK58)
+}
+for _n, _t in _sh.items():
+    _has_py = ("python" in _t) and ("<<'PY'" in _t or "<<'PYEOF'" in _t
+                                    or "\nPY\n" in _t or "\nPYEOF\n" in _t)
+    _marks = ("✓" in _t) or ("✗" in _t)
+    ck(f"⑧ {_n} 有 python heredoc 且打了 ✓/✗（所以这条断言对它有对象）",
+       _has_py and _marks, f"has_py={_has_py} marks={_marks}")
+    if _has_py and _marks:
+        ck(f"⑧ ★★ {_n} 锁了 PYTHONIOENCODING=utf-8"
+           "（没有它 ⇒ 第一条 ✗ 就把整段裁决吞掉）",
+           "export PYTHONIOENCODING=utf-8" in _t,
+           "缺 `export PYTHONIOENCODING=utf-8`；GBK 控制台上 python 打 ✗ 会抛")
+#   ★ 反向判据：这条**只**该加在"python 打 unicode"的地方。
+#     给纯 shell 的 printf 也加 = 钉一个不存在的失效模式（见上文）。
+ck("★ ⑧ 反向：`chk58.sh` 的 ✓/✗ 同时有 shell printf 与 python 两条路 —— "
+   "两处都必须被上面的断言覆盖到（别只改一处）",
+   ("printf '  ✗ %s\\n'" in _sh.get("chk58.sh", ""))
+   and ("export PYTHONIOENCODING=utf-8" in _sh.get("chk58.sh", "")),
+   "chk58.sh 的 shell bad() 与 python 打印都在；锁只需管 python 那半")
 
 # ==========================================================================
 print(f"\n{'=' * 60}")

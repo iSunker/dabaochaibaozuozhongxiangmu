@@ -23,6 +23,19 @@
 # =====================================================================
 set -eu
 
+# ★★ 让 python 的 stdout/stderr 强制 UTF-8 —— **否则本脚本会在 GBK 控制台上自己打挂自己**
+# --------------------------------------------------------------------------------------
+#   ② 段那个 heredoc 里 `print("  ✓/✗ …")` 打的是 U+2713/U+2717，而 Windows 的 python
+#   默认 stdout 编码是 **GBK**，编不出这两个字符 ⇒ python 抛 UnicodeEncodeError。
+#   ★ 症状**不是崩溃**，是**② 段半途而废**：前面的 `✓` 行打完了，一到**第一条 `✗`**
+#     （也就是真的有问题、最该被看到的那一行）就抛 ⇒ ② 的结论与那行 `⇒ 路径不可达数`
+#     **全都打不出来**，而退出码由 heredoc 那支 `|| RC=1` 兜住 ⇒ 整脚本仍以 1 退出，
+#     却**不给任何解释**。⇒ 恰好是"判据在最该报的时候哑掉"。
+#   ★ 处置与 `chk58.sh:107` / `drive-loop-nas.sh` / `run-resident.sh` **同一句**（照抄，不新设计）。
+#   ★ 为什么 shell 那侧的 `bad()`/`ok()`（printf）**不需要**这条：printf 走的是 shell 自己的
+#     字节输出，不过 python 的编码器 —— 所以只有 **python heredoc** 会中招，别一并改。
+export PYTHONIOENCODING=utf-8
+
 COMPOSE_DIR="${COMPOSE_DIR:-/volume2/docker_ssd/prowlarr_cross-seed_autohardlink}"
 VOL1="${VOL1:-/volume1/video}"
 DB="${DB:-$COMPOSE_DIR/drive-loop/hlink/state.db}"
