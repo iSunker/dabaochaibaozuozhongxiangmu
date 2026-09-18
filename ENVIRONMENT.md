@@ -119,10 +119,10 @@ grep -n '弯路 #' ENVIRONMENT.md
 > ```
 > 与**本机 SMB 探针**（`tools/doc-audit/04_probes.py`，走 `//iSunker-DS423/video`）13:10 报的
 > **5457.79 GiB** 一致（**差 0.01 GiB = 取整**）⇒ **探针读数可信、可复现**。
-> ★ 判据落点：`scripts/chk-volume1-free.sh`（NAS 侧只读，一次性诊断件）。
+> ★ 判据落点：`scripts/diag/chk-volume1-free.sh`（NAS 侧只读，一次性诊断件）。
 >
 > ★★★ **一条必须记住的口径差**：群晖自己的 **Storage Analyzer 周报**
-> （`scripts/sa-volume-usage.py` 可读）在同一时刻报 **Volume 1 Used = 99.9%**，
+> （`scripts/diag/sa-volume-usage.py` 可读）在同一时刻报 **Volume 1 Used = 99.9%**，
 > 反推可用只有 **~57 GiB** —— **与 `df` 差 5.27 TiB**。**两者都没错，但答的不是同一个问题**：
 >
 > | 口径 | 说的什么 | `/volume1` 的读数 |
@@ -244,14 +244,14 @@ NAS 上还跑着**别人的**容器（IYUU Plus、另一套 qB、opencd），它
 | 文件寿命 | 放哪 | 例 |
 |---|---|---|
 | **一次性的**（中转包、验证脚本、导入的 tar） | ★ **专用的临时目录 + 用完立刻删** —— 目录名要**一眼看出是临时的**（如 `<compose>/_tmp-<用途>/`），**不许放共享根**、**不许放 `/volume1`** | `_drive-loop-img.tar.gz`、`_tmp129/` 下的 `_del.sh` |
-| **长期用的**（脚本、配置、日志、状态） | ★ **只在生产地址**：`/volume2/docker_ssd/prowlarr_cross-seed_autohardlink/` 下**它该在的那一层**（见 `deploy.sh` 的 FILES 映射）；★ 或**入库**（在 NAS 上手工跑、只进 `check-deploy-drift.py` 的 `LOCAL_ONLY`） | `drive-loop/scripts/*`、`notify/*`；`scripts/chk58.sh`、`scripts/chk-volume1-free.sh` |
+| **长期用的**（脚本、配置、日志、状态） | ★ **只在生产地址**：`/volume2/docker_ssd/prowlarr_cross-seed_autohardlink/` 下**它该在的那一层**（见 `deploy.sh` 的 FILES 映射）；★ 或**入库**（在 NAS 上手工跑、只进 `scripts/diag/check-deploy-drift.py` 的 `LOCAL_ONLY`） | `drive-loop/scripts/*`、`notify/*`；`scripts/diag/chk58.sh`、`scripts/diag/chk-volume1-free.sh` |
 
 > ★★ **一条代价（2026-09-17 实测，它把这条规则的边界划出来了）**：
 > **「用完就删」是对的，但"判据"不能跟着脚本一起删。**
 > 实例：`#58` 的 NAS 侧验证脚本当初叫 `<compose>/_tmp58/_chk58.sh`，按本表当**一次性件**
 > 放临时目录、用完删掉。**结果「五段只读验证」要验哪五段，一处都没留下** ——
 > `git log --all -p -S chk58` **搜不到任何代码**，全仓只有两处提到它的**名字**。
-> ⇒ 后来只能**从零重建**（`scripts/chk58.sh`）。
+> ⇒ 后来只能**从零重建**（`scripts/diag/chk58.sh`）。
 > ⇒ 判据：**删一次性件之前，先问"它验的是什么"有没有落到文档或仓库里**；
 >   没有 ⇒ 要么把它**升级为长期件**（入库 + `LOCAL_ONLY`），要么把**该验什么**写进
 >   `SUMMARY`。★ 与 `B.10` 第 14 条同族：**删掉脚本 ≠ 那件事不用验了。**
@@ -265,7 +265,7 @@ NAS 上还跑着**别人的**容器（IYUU Plus、另一套 qB、opencd），它
 **判据（可执行，不是口号）**：
 1. **新增文件前先问**："它三个月后还在吗？" —— 不在 ⇒ 临时目录 + **写进清理步骤**；
 2. **临时目录必须有主人**：谁建的谁删，**并在同一个流程里安排**（别指望"回头再清"）；
-3. ★ **哨兵会替你查**：`python scripts/check-deploy-drift.py` 的 A 方向会报"未登记/未知" ——
+3. ★ **哨兵会替你查**：`python scripts/diag/check-deploy-drift.py` 的 A 方向会报"未登记/未知" ——
    **它红了就要么登记、要么删**，不许让它常红。
 
 **要在"批次间隙"才能做的事**：`deploy.sh --apply`（覆盖正被 `sh` 读的脚本）、`--force-recreate`。
@@ -295,7 +295,7 @@ NAS 上还跑着**别人的**容器（IYUU Plus、另一套 qB、opencd），它
   `docker_ssd`/`qb_temp` → 448 G / 33%）。
 - **群晖自己的报告**：Storage Analyzer 的 `share_list.csv` **带 `Volume` 列**
   （`…/home/存储空间分析器/synoreport/StorageAnalysisReport/<时刻>/csv/`，**每周三 04:07** 自动生成、
-  无凭据；`scripts/sa-volume-usage.py` 已在读它）。
+  无凭据；`scripts/diag/sa-volume-usage.py` 已在读它）。
 - 原来的 `ContainerManager/all_shares` **只在 NAS 上**读得到 —— 上面两条是
   **Windows 侧第一次能独立复核卷归属**的通路（本机没有 SSH，见 `A.2` 的 ★）。
 
@@ -381,7 +381,7 @@ NAS 上还跑着**别人的**容器（IYUU Plus、另一套 qB、opencd），它
 - `--prowlarr-api-key` **不许出现在命令行上**（会留在 shell 历史与进程列表里），只能从 `.env` 读
 - 需要回显 `TORZNAB_URLS` 核对时先脱敏：
   `grep '^TORZNAB_URLS=' .env | sed -E 's/(apikey=)[^,&]+/\1<redacted>/g'`
-- 推前必跑 `python scripts/scan-secrets.py`（0 才能推）
+- 推前必跑 `python scripts/diag/scan-secrets.py`（0 才能推）
 
 ## A.6 人的操作界面与响应节律
 
@@ -868,7 +868,7 @@ NAS 上还跑着**别人的**容器（IYUU Plus、另一套 qB、opencd），它
 
 > ★★★ **2026-09-17 补记：这条在"单文件"上也踩到了 —— 而上面 ② 恰恰写着"单文件是秒级"**
 >
-> **症状**：`scripts/chk-volume1-free.sh` 的 `[5]` 节按 ② 的指引去抽**单个文件**，
+> **症状**：`scripts/diag/chk-volume1-free.sh` 的 `[5]` 节按 ② 的指引去抽**单个文件**，
 > 结果又卡住：抽到 `reseed_singles/BTSCHOOL/Man.of.Steel.2013.2160p.UHD.BluRay.REMUX.HEVC.TrueHD.7.1.Atmos.-PTer.mkv`
 > 时**卡死**（用户 `Ctrl-Z` 挂起）。
 >
@@ -1231,7 +1231,7 @@ NAS 上还跑着**别人的**容器（IYUU Plus、另一套 qB、opencd），它
 
 > ★ **现状走的是哪一支**（2026-09-14 实测，不是推断）：`:3060` 用的是**免密白名单**这一支，
 > **不是** `.env` 里的口令。旁证：本机 `.env` 的 `QBIT_PASSWORD` 是**空串存根**（与 `.env.example`
-> 同形），而 `scripts/qb-census-savepath.py` 以 `admin` + 空口令**登录成功**。
+> 同形），而 `scripts/diag/qb-census-savepath.py` 以 `admin` + 空口令**登录成功**。
 > ⇒ ★ **Windows 侧那批只读工具（`qb-census-savepath.py` / 各 `probe-*.py`）能跑，靠的是白名单**，
 > 不是凭据 —— 所以「本地 `.env` 是存根」这件事一直没被谁发现。
 > ⇒ 失效形态是**响亮的**：白名单一收紧，它们当场**登录失败**（rc=1），
@@ -1331,7 +1331,7 @@ NAS 上还跑着**别人的**容器（IYUU Plus、另一套 qB、opencd），它
 - **触发条件**：增删索引器之后没重新核对。
 - **规避做法**：**每次增删索引器后都要重新核对**：
   ```bash
-  python scripts/prowlarr-indexers.py --torznab
+  python scripts/diag/prowlarr-indexers.py --torznab
   ```
   ★★ **2026-09-17 更正：给药改掉了 —— 原来这里的处方是一条裸 `curl`。**
   这个端点的响应**每一条都带 `fields`**（那里面有 cookie / passkey）。
@@ -1339,13 +1339,13 @@ NAS 上还跑着**别人的**容器（IYUU Plus、另一套 qB、opencd），它
   · 它只挡住「裸跑」，挡不住「为了看一眼结构」而 `| head` / `| jq` / `| less`；
   · 更根本的是**没有替代品** ⇒ 规矩和处方在同一个文件里打架（本文件开头就写着
     「绝不打印 `indexer.fields`」，而处方逐字打出来）。
-  ⇒ 现在改成 `scripts/prowlarr-indexers.py`：**同一个端点，但只取
+  ⇒ 现在改成 `scripts/diag/prowlarr-indexers.py`：**同一个端点，但只取
     `id` / `name` / `enable`** 三个白名单字段，`fields` 从不进内存、更不进 stdout。
   它的输出**可以安全粘贴**。★ 这是「**规矩要有工具守着**」那条的又一次落地：
   光有规矩、没有能用的工具，处方就会被抄成违规的样子。
   ★ 同族：**key 不进命令行**（会留在 shell 历史与进程列表里）。新脚本从 `.env`
-  读 key、只走 `X-Api-Key` header（同 `scripts/prowlarr-indexerstatus.py`、
-  `scripts/check-indexer-timestamps.py`）。
+  读 key、只走 `X-Api-Key` header（同 `scripts/diag/prowlarr-indexerstatus.py`、
+  `scripts/diag/check-indexer-timestamps.py`）。
 - **怎么发现的**：SUMMARY §6.6。
 - **边界**：★ 还要区分：**「只在 Prowlarr 里禁用索引器」≠「cross-seed 不搜它」** ——
   cross-seed 只认自己的 `TORZNAB_URLS`，会继续请求已禁用的站，每搜一次吃一个 `HTTP 410` 并 snooze。
@@ -1574,8 +1574,8 @@ NAS 上还跑着**别人的**容器（IYUU Plus、另一套 qB、opencd），它
   FlareSolverr 字样）。
 - **规避做法 / 判据**：★ **别继续看 `retry_after`** —— 它分不开这三种。**换读数**：
   ```bash
-  python scripts/prowlarr-indexerstatus.py          # ② Prowlarr 本地禁用（本条的判据）
-  python scripts/check-indexer-timestamps.py        # ③ cross-seed 侧：status + retry_after + 还剩多久
+  python scripts/diag/prowlarr-indexerstatus.py          # ② Prowlarr 本地禁用（本条的判据）
+  python scripts/diag/check-indexer-timestamps.py        # ③ cross-seed 侧：status + retry_after + 还剩多久
   ```
   · 数组里**有**该站、带 `disabledTill` ⇒ **②**（Prowlarr 本地禁用，与站点无关）
   · 数组为空 / 没有该站 ⇒ **①**（站点真发，Prowlarr 只是转发）
@@ -1627,7 +1627,7 @@ NAS 上还跑着**别人的**容器（IYUU Plus、另一套 qB、opencd），它
   要问"还要等多久"就查它，不必去对 Prowlarr 的时刻。
   （原任务 `#60` 就是卡在这个待验上；2026-09-17 结案，`ERR-SVC-17` 按本段更正。）
 - **怎么发现的**：2026-09-14，HDtime 的 `retry_after` 从「剩 34 分钟」跳成「剩 1439 分钟」
-  之后，`04_probes.py` 只报出这个数、报不出是哪种机制 ⇒ 换 `indexerstatus` 才定下来。
+  之后，`tools/doc-audit/04_probes.py` 只报出这个数、报不出是哪种机制 ⇒ 换 `indexerstatus` 才定下来。
   **三个数据点**（09-13 那次空转 + 09-14 这次跳变 + 09-14 冲进 `prowlarr/logs/` 才看到的
   `IndexerFactory` 那行「ignoring … till 09/15」）。
 - **边界**：★★ **三条，都是"实测推翻先前读法"，别按老读法处置**（第 3 条 2026-09-14 补，
@@ -1679,10 +1679,63 @@ NAS 上还跑着**别人的**容器（IYUU Plus、另一套 qB、opencd），它
   ⇒ 所以"清了试试"**不是中性的**：它把"明天 11:36 恢复"变成"**后天** 11:36 恢复"
   （实测 09-13→09-14 就是这么过去的）。**这一条的代价是 +24 小时，不是一次请求。**
   ★ 判据换成一句**可执行**的：要问"还要等多久"，只查
-  `python scripts/check-indexer-timestamps.py`（`retry_after` 剩多久），
-  **别去 04_probes / indexerstatus 对 Prowlarr 的时刻** —— 那个数不构成"恢复时刻"。
+  `python scripts/diag/check-indexer-timestamps.py`（`retry_after` 剩多久），
+  **别去 `tools/doc-audit/04_probes.py` / indexerstatus 对 Prowlarr 的时刻** —— 那个数不构成"恢复时刻"。
 
 **◆ 本小节未实例 / 未验证**：`searchCadence` / `excludeRecentSearch` 的具体键名与取值（本项目走的是自建状态机的周期，未直接用它们）。
+
+---
+
+### ERR-SVC-18 ★★ qB 缺文件时**不报错**，而是去"补"——**没有 peer ⇒ 永远补不上**
+- **症状**：`:3060` 里挂着一批未完成单种，`state=stalledDL`、`progress ≈ 0.999x`、
+  **永远不动**。用户报的说法是「连校验过后、**一点都不相符**的文件都开始直接下载了」
+  ⇒ 听起来像"校验失败 ⇒ 重下"。
+- **环境前提**：cross-seed 只匹配「**名称 + 大小**」；农场（`reseed_farm/`）里
+  **只有载荷**（我们自己的建场规则）；qB 只认 **piece**、**没有文件级校验**（README「原理 C」）。
+- **根因**：★★ **不是校验失败**。实测（2026-09-18，全只读）是：
+  该 release 的**发布组把附件（`.nfo` / `.jpg`）也写进了种子内容**，而农场里没有这些附件
+  ⇒ qB 发现「有几个文件我这儿没有」⇒ **去补** ⇒ 那几个文件**没有任何 peer 有**
+  ⇒ `num_seeds == 0` / `availability ≈ 0.999` ⇒ **永远补不上**。
+  ★ **四个位置的读数**（缺一不可）：
+  | 判据 | 读数 |
+  |---|---|
+  | 逐文件 progress | `.mkv` ≈ **99.98%**，而 `.jpg`/`.nfo` **恰好 `0.00000%`** |
+  | 那个 0% 的文件在 `reseed_singles/` | **不存在**（`ls` 只有 `.mkv`） |
+  | 同一个文件在农场里 | **存在**（`reseed_farm/<片名>/cover.jpg`） |
+  | 载荷（`.mkv`）两侧大小 | 逐字节**相同**（`9658005448`）⇒ 载荷**没被改过** ⇒ 没有校验失败 |
+  | `amount_left` vs（农场 size − 物理 size） | `2097152` **≠** `254167` ⇒ ★ **对不上账** |
+  ★★ 最后那条是这里唯一"反直觉但有信息量"的：它说明 **qB 的进度是「按 piece 全局
+  推导」的** ⇒ **不能跨文件对账** ⇒ 「逐文件 progress == 0」**不是**可靠判据
+  （要判就用 `amount_left / size` 这个**相对缺口**）。
+- **触发条件**：cross-seed 匹配到"附件型"release（附件在种子内容里、而农场里没有）。
+  ★★ **互锁已生效 ⇒ 不再新增**：`cross-seed/config.js` 的 `resolveMatchMode` 在
+  `linkType` 为 `hardlink`/`symlink` 时**无论 `MATCH_MODE` 是什么都强制 `strict`**。
+  实测：`LINK_TYPE=hardlink` + `MATCH_MODE=partial` ⇒ 生效为 **strict**。
+  ⇒ 现存那 3 条是**存量**。★ **绝不能**为让"新建的链接也能 partial"去动
+  `LINK_TYPE` / `MATCH_MODE` —— 那会**打开**新的写穿（正是 `ERR-SVC-16` / linkguard 要防的）。
+- **规避做法 / 判据**：★★ **qB 只重下它缺的 piece，已经有的那块数据不会重下
+  ⇒ 源文件目前还没被写穿**（那是 linkguard 在盯的事）。真危害是两条：
+  **①永久占位 ②踩 HnR**。
+  ★★ **处置第一原则：别去动那几个数据文件** —— 一旦那个 `.mkv` 被碰过/删过/移动过，
+  qB 就会真的去"补"整块载荷，**那时才会真写穿源**（硬链接同一个 inode）。
+  ★ **不必限速**：这些种子**没有任何 peer** ⇒ 下载速率**本来就是 0** ——
+  限速限的是恒为 0 的量，还会**误伤**同一 qB 里正常下载中的种子。
+  判据（只读，不碰 qB）：
+  ```bash
+  python scripts/diag/reseed-freeze-report.py                 # 默认只打聚合
+  python scripts/diag/reseed-freeze-report.py --show-hashes   # 12 位短 hash + 站点目录名
+  ```
+  ★ **阈值 `1e-3` 的依据是实测断层**（全量 1999 条：`(0,1e-3]` **3** 条、
+  `(1e-3,1e-2]` **0**、`(1e-2,0.5]` **0**、`(0.5,1]` 6）⇒ **1e-3 与 0.5 之间一条都没有**。
+  ★★ **它不是普适常量**：断层成因是"附件几百 KB vs 载荷 9~11 GB"，
+  换个量级（小载荷）位置会移 —— **别抄走**。
+  ★ **本问题另有一条正交的形状**（`reseed_no_peer_band`）：`amount_left/size ≥ 0.999`
+  且 `num_seeds == 0` 且 `availability == 0` ⇒ **一个字节都没下到、根本没起来**。
+  与上面那条**处置方向相反**（一个"已定型"、一个"会自己活过来"）⇒ **两个数分开报，别合并**。
+  ★ 用户 2026-09-18 拍板：**只做「识别 + 通知」，一点不碰 qB**（不暂停/不打标签/不删）；
+  IYUU 来源的**只记数但必须进邮件**。详见 `SUMMARY` §27。
+- **来源（写这条时的现场）**：2026-09-18，`SUMMARY` §27；判据本体在
+  `orchestrator/state.py` 的 `reseed_unbuildable_band` / `reseed_no_peer_band`。
 
 ---
 
@@ -1826,7 +1879,7 @@ NAS 上还跑着**别人的**容器（IYUU Plus、另一套 qB、opencd），它
   · 遍历 git 给的路径**一律** `git -c core.quotepath=false …`，
     或 `git … -z` 配 `while IFS= read -r -d '' f`；
   · **别用裸 `for f in $(…)`**（本来就该避 —— 空格/换行也一样会拆坏，quotepath 只是让它更隐蔽）。
-- **★★ 已在本仓的活工具里找到实例（2026-09-17）**：`scripts/scan-secrets.py` 取文件清单时
+- **★★ 已在本仓的活工具里找到实例（2026-09-17）**：`scripts/diag/scan-secrets.py` 取文件清单时
   用的就是裸 `git ls-files` ⇒ 拿到的是**带引号转义的字符串**，而下游写的是
   `if not p.is_file(): continue` ⇒ **它们被静默跳过**。
   实测：**111 个文件里 25 个中文名全没被扫过**（全是 `summary/*.md`）。
@@ -2155,9 +2208,9 @@ NAS 上还跑着**别人的**容器（IYUU Plus、另一套 qB、opencd），它
 | 15 | ★★ **证据在场，结论没跟上** —— 报数时用了**静默兜底**（`.get() or <默认>` 之类），而**能修正它的证据就在同一份输出的另一行**（本项目新增）| `#62`：`probe-62b.py` 已经把 `total_downloaded info=(缺) prop=<有值>` **打在屏幕上**，而分桶逻辑写的是 `t.get("total_downloaded") or 0` ⇒ 100 条**全落进「0 字节」桶** —— 那个 100 是**构造出来的**，不是量到的。改用 `properties`（真带这个键的接口）重算那 22 条 error：**22/22 全部 <1%**（16 KB ~ 4.6 MB），**无一为 0**（见 `#62` 描述顶部的勘误）|
 | 16 | ★★ **工具把数据换了写法，而下游的"过滤条件"是按原始写法写的** ⇒ **一条都不匹配，且不报错**（本项目新增）| `core.quotepath` 默认 **true** ⇒ `git diff --name-only` / `git ls-tree` 对**非 ASCII 路径**输出成**带引号 + 八进制转义**（`"summary/22-matched…\346\201\222…"`）。于是 `grep '^summary/'` 或 `for f in $(git …)` **一个中文名文件都拿不到**，而 **git 和 grep 都退出 0**。★ 本仓**大量文件名是中文**（`summary/*.md`、NAS 上的目录名）⇒ 这是**会反复复发**的形状，不是一次性失误。★ 真实代价：一次凭据扫描里 24 个 `summary/*.md` **全被跳过**，而屏幕上打的是「工作区零命中」—— **差点据此判定"无凭据风险"**（见 `ERR-GIT-04`）|
 | 17 | ★★ **"我推的语法/路径/前提"当成"验过的"** —— 把一条命令**按同类命令的形态外推**出来就发给人（本项目新增）| `#58` 收口一轮里**连犯四次**，全是同一形状：① `sudo synoschedtask --disable 10` —— 照 `--get` 的形态外推，**该命令根本没有这个动词**（见 `ERR-DSM-10`）；② 断定"容器会排空 spool"⇒ **据此推荐了"停掉 DSM 排空任务"**，而 `grep` 证明它**只写不排**，**方案被自己的侦察否掉**（见 `ERR-SCHED-08`）；③ `docker exec … sh notify/notify-spool.sh` —— 用**相对路径**，而 `exec` 的 cwd 是容器 `WORKDIR`（见 `ERR-DOCKER-09`）；④ 日志路径写成 `drive-loop/log/drive-loop.log` —— 真身是 `drive-loop/scripts/drive-loop.log`；顺带还说了容器里有 `ps`、以及"每轮 43 条"（真值 **40**）。★ **代价不对称**：④ 类只是多跑一轮；**② 那类会给出一条"会堵死告警"的操作建议** —— 而它**读起来完全合理**。★ 补法：**给命令之前，先问"这条命令我自己读过它的 `--help`/源码/路径吗"**；答不出就用一条**只读侦察**换掉猜测（`--help`、`find`、`grep`、`ls -d`），**别把"侦察"和"动作"合成一步**。同族：`B.10` 第 12 条（"我觉得"≠"已证实"）、第 14 条（输出不承载判据）|
+| 18 | ★★★ **从"按某个名字搜不到"推出"这东西不存在"** —— 名字猜错，就把"有"读成了"没有"（本项目新增）| 查「今天有没有投日报」：`grep 'kind: daily'` **空**、`grep '已投递通知(daily)'` **空** ⇒ 据此连报**三条**结论「那天根本没有 `kind: daily`」「那份日报从没投过」「resident 不调 `report_daily`」—— **三条全错**。根因：★ **日报的 `kind` 是 `batch`、`key` 才是 `daily`**（`emit("batch", "每日台账", key="daily")`），所以在**所有按 `kind` 的检索里它和普通批次通知长得一样**；而日志打的动词是 **`已投递每日台账（额度 + 趋势）`**，我搜的是 `已投递通知(daily)`。★ 当天那份**一直在**（`00:37:55`），`.daily-report.state` 的 `{"last_day": "2026-09-18"}` 也一直是对的。⇒ **`grep` 空结果只能说"按这个词没有"，不能说"不存在"**；要断定"不存在"必须**从产出方倒推它该叫什么名字**（读写它的那行代码 / 反搜唯一锚 `key: daily` / 直接看产出目录 —— `archive/` 里日报的**名字不带包名**）。★ 同族两条一并记：`grep -q "$CR_CHAR"` **探测不到 CR**；`tr -cd '\r' < "$f" \| wc -c` 对**不存在**的文件给 **`0`**（`tr` 报错到 stderr、`wc` 收空 stdin）⇒ 我曾据此读成"所有备份里都是 CR=0"。⇒ 共同规避：**每步先 `[ -f ]` 判存在，且判"没有"时必须换一个独立来源复核**（见 `ERR-AI-07`）|
 
-> ★ 第 10~**17** 条是**本项目自己加的**（1.txt 只列到第 9 条）—— 它们全是"AI 在真实会话里
-> **实际犯过**、且**当场没意识到**"的那几种。**判据：能配一个真实实例的才收进来。**
+| 19 | ★★★ **把"用户说的原因"当成"待解释的现象"** —— **症状描述里那个因果词是当事人自己猜的，不是读数**（本项目新增） | 用户问「为什么**连校验过后**、一点都不相符的文件都开始直接下载了？」—— 那句里的「**校验没通过** ⇒ 重下」是**他的猜测**（他看到 `stalledDL` + 部分文件 0% 就那样解释了）。★★ 真因**完全不同**：cross-seed 匹配上了"发布组把附件（`.nfo`/`.jpg`）也写进种子"的那一版，而农场里没有这些附件 ⇒ qB 去补 ⇒ **没有 peer ⇒ 永远补不上**。★ **判据是四个位置的读数**：那个 0% 的文件在 `reseed_singles/` **不存在**、在 `reseed_farm/` **存在**；载荷（`.mkv`）两侧**逐字节同大小**（⇒ 载荷**没被改过** ⇒ 根本没有"校验失败"）；`amount_left` ≠（农场 size − 物理 size）（⇒ qB 进度按 piece 全局推导、**不能跨文件对账**）。★ **怎么发现的**：没有顺着"校验"去查（那会一路查校准/重新校验，**全都不会有结果**），而是**先问"那就说明有一个文件两边不一样，到底是哪个"**，再逐个文件比 progress —— 于是"`.jpg`/`.nfo` 恰好 0.00000%"这条**唯一的硬证据**才浮出来。⇒ 共同规避：**把症状里的因果词剥掉，只留可观测的部分**（"有文件 0%"而不是"校验没通过"），然后从一个**能被证伪**的读数（逐文件 progress）入手。同族：第 12 条（"我觉得"≠"已证实"）—— 差别在**第 12 条的错在我，这一条的错在被转述的前提上**，而**转述它的人是当事人，读起来更像事实** |
 >
 > ★★ **第 17 条与第 10、11、12 条都不同，别合并**（四条都是"发出去的指令有问题"，但病灶不同）：
 >
@@ -2304,6 +2357,36 @@ NAS 上还跑着**别人的**容器（IYUU Plus、另一套 qB、opencd），它
   ⇒ 建议**不修**：要收口就得换成"熵 / 字符集"判据，而那会**同时**把文档里的英文短语重新变成假阳性 ——
   换来的是一个"次次都红"的闸门。
 
+### ERR-AI-07 ★★★ **从 `grep` 的空结果推出"不存在"** —— 名字猜错，就把"有"读成了"没有"
+- **症状**：查「今天有没有投日报」，`grep 'kind: daily'` 空、`grep '已投递通知(daily)'` 空 ⇒
+  我据此连报**三条**结论：「那天根本没有一份 `kind: daily`」「那份日报从没投过」
+  「resident 不调 `report_daily`」。**三条全错。**
+- **环境前提**：`emit(kind, title, ..., key=...)` 把**类别**和**去重键**分成两个字段。
+  ★★ **日报投出去时 `kind` 是 `batch`，`key` 才是 `daily`** ——
+  见 `drive-loop.py` 的 `report_daily()`：
+  `emit("batch", "每日台账", body=body, key="daily", metrics={...})`。
+  ⇒ 它**在所有按 `kind` 的检索里长得和普通批次通知一模一样**（`archive/*.txt` 里
+  两者都是 `kind: batch`），**只有 `key: daily` 才能把它认出来**。
+- **根因**：**我按一个"我以为它该叫的名字"去搜，然后拿空结果当否证。**
+  `grep` 空结果 **只**能说「按这个词没有」，**不能**说「不存在」。
+- **触发条件**：任何"先猜名字、再 grep、再从空结果推结论"的链条。
+  ★ **我在同一次排查里连犯三次**（`kind: daily` / `已投递通知(daily)` / 日志动词），
+  而第三次尤其危险 —— 日志打的其实是 **`已投递每日台账（额度 + 趋势）`**，
+  我搜的是 `已投递通知(daily)`，于是"0 命中"被我读成了"从没投过"。
+- **规避做法**：★★ **要断定"不存在"，从产出方倒推它"该叫什么名字"** ——
+  ① 读**写它的那行代码**（这里是 `emit(...)` 的实参），别读文档、别读印象；
+  ② 或反过来搜**上游唯一标识**（`archive` 里日报的 `key: daily` 是唯一的锚）；
+  ③ 或直接看**产出目录**（`notify/archive/` 里那 10 份 `-x0.txt` 就是每天的日报 ——
+  批次通知的名字带包名，日报的**不带**）。
+- **怎么发现的**：2026-09-18 收口「看一份真日报」时，`grep '已投递每日台账'` 一打出来
+  才发现每天都有、当天那份是 **00:37:55**；而 `.daily-report.state` 的
+  `{"last_day": "2026-09-18"}` 一直是**对的**。
+- **边界**：★ **同族还有两条**，一起记（都是"探测某个东西在不在"本身做错了）：
+  `ERR-SH-*` 那条 `grep -q "$CR_CHAR"` **探测不到 CR**（grep 的行式匹配会吃掉裸 CR）；
+  以及 `tr -cd '\r' < "$f" | wc -c` 对**不存在**的文件给 **`0`**
+  （`tr` 报错到 stderr、`wc` 收到空 stdin）—— 我一度据此读成"所有备份里都是 CR=0"。
+  ⇒ 共同规避：**每步先 `[ -f ]` 判存在**，且**判"没有"时必须换一个独立来源复核**。
+
 ---
 
 ## 附录 1 · 文档自身的边界（**别把这份读成"全知"**）
@@ -2366,6 +2449,8 @@ NAS 上还跑着**别人的**容器（IYUU Plus、另一套 qB、opencd），它
 | #18 嵌套目录当搜索名 | **`ERR-SVC-14`**（新）| 新建条目 |
 | #19 IYUU 流量定性错误 | **`A.4`** ★ 注 + `B.10` 表第 12 条 | **不建 ERR 条目**（它是前提层的一个假设订正 + 一个元层形状）|
 | #20 `ENOENT` 误判为丢种 | **`ERR-SVC-15`**（新）+ `B.10` 表第 13 条 | 新建条目 + 元层登记（两层都留）|
+| #21 数 `grep` 空结果推断「不存在」 | **`ERR-AI-07`**（新）+ `B.10` 表第 18 条 | 新建条目 + 元层登记（两层都留）；★ 同族两条：`grep -q` 探不到裸 CR、``tr`` 数 CR 对不存在的文件给 ``0`` |
+' \| wc -c` 对不存在的文件给 `0` |
 
 > ★ **为什么有的条目进两张表**：1.txt 的成文规则 ——「同一条错误可能在多层出现，
 > **两层都登记、互相指路，不要合并**」。#20 就是实例：`B.5.2` 记**事实**（那是竞态不是损坏），

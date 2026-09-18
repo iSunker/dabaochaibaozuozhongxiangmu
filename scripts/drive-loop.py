@@ -919,6 +919,245 @@ def qb_999_watch(args) -> tuple[str, dict]:
 
 
 # --------------------------------------------------------------------------- #
+# qB「装不出来」—— 缺的那一点点永远补不上的单种（**只识别 + 通知，不碰 qB**）
+# --------------------------------------------------------------------------- #
+# 判据本体在 `orchestrator/state.py`（`reseed_unbuildable_band` / `reseed_no_peer_band`），
+# 理由同上面几条：**本进程跑在 NAS 宿主机上**，判据只有一份才谈得上两侧一致。
+# 现场与因果链写在 `orchestrator/state.py` 那两段的注释里（真因**不是**「校验不通过」，
+# 而是「发布组把 `.nfo`/`.jpg` 附件也写进了种子，而农场里没有这些附件」）。
+#
+# ★★ 用户 2026-09-18 拍板：**只做「识别 + 通知」，一点不碰 qB**
+#    （不 pause / 不打 tag / 不删）。他目前靠**手动限速**把这些种子临时隔离，
+#    要的是先「冻结」在观测里，处置办法后面再定。
+#    ⇒ 本函数**只读** qB（`qbit_all_torrents` 一个 GET），写只写自己的状态文件。
+#    ★ 将来若有人想在这里补一句 `pause`：先回去读上面那行 —— 那是**否决过**的方案，
+#      不是漏掉的 TODO。
+#
+# ★ 分两格报，不并成一个数：两格的**处置方向相反**
+#    （「装不出来」= 存量、已定型；「没 peer」= 会变，可能自己活过来）。
+#    并起来就再也分不开了（同 `qb_999_band` 不并进主账的理由）。
+#
+# ★ IYUU 来源的**只记数、不处理，但必须出现在邮件里**（用户原话：「有的是 iyuu
+#   推过来的种子，这先不管，但也要添加到邮件通知里」）⇒ 正文里**显式**分层列出，
+#   绝不因为它"不是我们造成的"就从通知里静默滤掉。
+#
+# ★ 基线**单独一个文件**（`.reseed-freeze.state`），与 `qb_999_watch` 走
+#   `.reconcile.state` 不同：那边那条「读→改→写必须紧挨着、别夹在
+#   `reconcile_watch` 的读与写之间」的约束是对 `.reconcile.state` 成立的，
+#   这里用自己的文件就**没有**那个约束（照 `linkguard_watch` 的做法）。
+#   同理，本函数**不需要**被摆在 `report_daily` 的某个特定位置。
+#
+# ★ 只报**数量与来源**，绝不报种子名 / tracker / content_path（同 `qb_999_watch`
+#   的口径：日报是要发出去的）。要知道具体是哪几条，跑**只读**的
+#   `scripts/diag/reseed-freeze-report.py`（人主动跑，且也要显式 `--show-hashes`）。
+RESEED_FREEZE_FILE = HERE / ".reseed-freeze.state"
+RESEED_FREEZE_KEY = "_reseed_freeze"
+RESEED_FREEZE_SRC_OURS = "cross-seed"
+RESEED_FREEZE_SRC_IYUU = IYUU_TAG
+#: 两个分组的**规范组名**（顺序也是正文里的顺序）。★ 单独抽出来是因为它被三处
+#: 引用（`_reseed_freeze_norm` / `_reseed_freeze_flat` / `reseed_freeze_watch`）——
+#: 把字面量抄三遍，改一处漏两处是迟早的事，而那类错**不报错**、只是某一格悄悄空掉。
+RESEED_FREEZE_GROUPS = ("unbuildable", "no_peer")
+#: 告警冷却的 key。★ 必须是**固定字面量** —— 绝不把条数写进去（那会每天生成一个
+#: 新桶、等于没有冷却，同 `alert_blocked_indexers` 的 `indexer-blocked:{name}`）。
+RESEED_FREEZE_ALERT_KEY = "reseed-freeze"
+
+
+def _reseed_freeze_read() -> dict:
+    try:
+        d = json.loads(RESEED_FREEZE_FILE.read_text(encoding="utf-8"))
+        return d if isinstance(d, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except Exception as e:                  # noqa: BLE001
+        # ★ 坏掉的基线**不能当空**处理 —— 那会把现存每一条都算成「新增」，
+        #   当晚就发一封假告警。异常路径与 `qb_999_watch` 的 `raw is None`
+        #   殊途同归：返回 {} ⇒ 下面走 `first=True` ⇒ **静默重新起锚**
+        #   （代价是这一轮失去检测能力，可接受；假警报比漏报更消耗信任）。
+        LOG.warning("装不出来基线读不出（本轮按「无基线」重新起锚）: %s", e)
+        return {}
+
+
+def _reseed_freeze_write(d: dict) -> None:
+    try:
+        RESEED_FREEZE_FILE.write_text(json.dumps(d, ensure_ascii=False),
+                                     encoding="utf-8")
+    except OSError as e:
+        LOG.warning("装不出来基线写不进去: %s", e)
+
+
+def _reseed_freeze_norm(d) -> dict:
+    """把基线归一成 `{组: {来源: [hash...]}}`（老版本 / 坏形状一律当空）。
+
+    ★ 归一在**读**这一侧做（同 `_qb_999_norm` / `_unclaimed_norm`）：老版本写下的
+      文件可能没有某个键，读的时候不补就会 KeyError。
+    ★ 形状是**两层字典**而不是平铺的 hash 集合 —— 因为正文要按「组 × 来源」分层，
+      而这个分层的依据（tag）**只有 qB 那侧才有**，基线里不带上就永远补不回来。
+    """
+    out: dict[str, dict[str, list]] = {}
+    d = d if isinstance(d, dict) else {}
+    for grp in RESEED_FREEZE_GROUPS:
+        g = d.get(grp)
+        g = g if isinstance(g, dict) else {}
+        out[grp] = {}
+        for src in (RESEED_FREEZE_SRC_OURS, RESEED_FREEZE_SRC_IYUU):
+            v = g.get(src)
+            out[grp][src] = sorted(x for x in (v if isinstance(v, list) else []) if x)
+    return out
+
+
+def _reseed_freeze_flat(groups: dict) -> set:
+    """把两层形状拍平成「组:hash」的集合 —— 基线的**比较**按这个做。
+
+    ★ 为什么带上组名前缀：同一条种子若从「没 peer」变成「装不出来」（或反过来），
+      那是**真的变了**，该报一次。拍平时丢掉组名就看不见这种迁移。
+
+    ★★ 只遍历 `RESEED_FREEZE_GROUPS` 这两个**组名**，绝不 `for k, v in groups.items()`
+      —— 本函数的入参**有两个来源**：`_reseed_freeze_norm()`（只含两组）和
+      `_reseed_freeze_split()`（**多一个标量 `total`**）。2026-09-18 实测踩到：
+      用 `.items()` 会把 `total=1999` 那个整数当成分组字典去 `.items()` ⇒
+      `AttributeError: 'int' object has no attribute 'items'`。
+      ⇒ 形状的**边界由这里钉死**，不依赖调用方传得干净。
+    """
+    s = set()
+    for grp in RESEED_FREEZE_GROUPS:
+        by_src = (groups or {}).get(grp)
+        if not isinstance(by_src, dict):
+            continue
+        for src, hashes in by_src.items():
+            for h in hashes or []:
+                s.add(f"{grp}:{h}")
+    return s
+
+
+def _reseed_freeze_split(torrents: list, url: str) -> dict:
+    """把两条判据的结果各自**按来源 tag 分桶**。
+
+    来源只看 tag（`cross-seed` / `IYUU自动辅种`）—— ★ 绝不看 `tracker` /
+    `content_path`（README 安全约定：绝不打印它们；这里连"读进来分桶"都不做）。
+    两个 tag 都没挂的（理论上不该有）落进 `others`：只计数、**不进告警正文**
+    （不知道是谁的不该冒充"我们搜来的"）。
+    """
+    by_hash = {t.get("hash"): t for t in torrents or [] if t.get("hash")}
+
+    def bucket(band: dict) -> dict:
+        out = {RESEED_FREEZE_SRC_OURS: [], RESEED_FREEZE_SRC_IYUU: [], "others": []}
+        for h in band["hashes"]:
+            tags = [x.strip() for x in ((by_hash.get(h) or {}).get("tags") or "").split(",")]
+            if RESEED_FREEZE_SRC_OURS in tags:
+                out[RESEED_FREEZE_SRC_OURS].append(h)
+            elif RESEED_FREEZE_SRC_IYUU in tags:
+                out[RESEED_FREEZE_SRC_IYUU].append(h)
+            else:
+                out["others"].append(h)
+        return out
+
+    return {"unbuildable": bucket(S.reseed_unbuildable_band(torrents)),
+            "no_peer": bucket(S.reseed_no_peer_band(torrents)),
+            "total": len(torrents or [])}
+
+
+def reseed_freeze_watch(args) -> tuple[str, dict]:
+    """认「装不出来」与「没 peer」两类停滞单种 → (给日报正文的一段, 给 metrics 的字典)。
+
+    ★ **绝不抛**：挂在每天一次的日报里，而日报挂在每 15 分钟一批的生产循环里
+      （同 `iyuu_watch` / `qb_999_watch`）。
+    ★ 读不到时 metrics 给 `n/a` —— **必须给**，否则 TSV 里「这次读失败了」和
+      「那天根本没跑」长得一模一样，事后分不开（同 `iyuu_watch`）。
+    ★ 首次读数**只记基线、不告警**；与基线一致**不告警**；缩回**静默采纳但要印在
+      正文里**（否则「清掉了」与「判据没读到」从外面看一模一样）；只有**真新增**
+      才 `emit("alert")`。五条理由逐条同 `qb_999_watch`，不再重复。
+    """
+    url = getattr(args, "qbit_url", None)
+    na = {"fz": "n/a", "fz_new": "n/a", "fz_ours": "n/a", "fz_iyuu": "n/a",
+          "fz_np": "n/a", "fz_np_iyuu": "n/a", "fz_total": "n/a"}
+    if not url:
+        return "装不出来的单种：跳过（没有 --qbit-url）", dict(na, fz="no-url")
+    try:
+        torrents = S.qbit_all_torrents(url)
+        cur_by = _reseed_freeze_split(torrents, url)
+    except Exception as e:              # noqa: BLE001 —— 附属观测，绝不拖垮日报
+        LOG.debug("读装不出来的单种失败", exc_info=True)
+        return (f"装不出来的单种：读不到（{type(e).__name__}: {e}）", dict(na))
+
+    live = _reseed_freeze_read()
+    raw = live.get(RESEED_FREEZE_KEY)
+    first = raw is None                 # ★ 与「基线记过一个空集」是两回事
+    base_by = _reseed_freeze_norm(raw)
+    cur = _reseed_freeze_flat(cur_by)
+    base = _reseed_freeze_flat(base_by)
+    new = sorted(cur - base)
+    # ★ 写 == cur，**不是** base ∪ cur（缩回要被采纳，否则会永远挂着旧条目）
+    live[RESEED_FREEZE_KEY] = {
+        "unbuildable": {k: sorted(v) for k, v in cur_by["unbuildable"].items()},
+        "no_peer": {k: sorted(v) for k, v in cur_by["no_peer"].items()},
+    }
+    _reseed_freeze_write(live)
+
+    ub, np_ = cur_by["unbuildable"], cur_by["no_peer"]
+    n_ub = sum(len(v) for v in ub.values())
+    n_np = sum(len(v) for v in np_.values())
+    n_our = len(ub.get(RESEED_FREEZE_SRC_OURS) or []) + len(np_.get(RESEED_FREEZE_SRC_OURS) or [])
+    n_iyuu = len(ub.get(RESEED_FREEZE_SRC_IYUU) or []) + len(np_.get(RESEED_FREEZE_SRC_IYUU) or [])
+    n_oth = (len(ub.get("others") or []) + len(np_.get("others") or []))
+
+    if first:
+        verdict = f"首次读数，记基线（{len(cur)} 条）—— 不告警"
+    elif new:
+        verdict = f"★ 新增 {len(new)} 条（基线 {len(base)} 条）"
+    elif cur == base:
+        verdict = "与基线一致 —— 不告警"
+    else:
+        # 缩回（含清空）：静默采纳，但**必须在正文里写出来** —— 否则「清掉了」
+        # 和「判据没读到」从外面看一模一样（#47 的教训，别省这一句）。
+        # ★ 这里**不许**打印「与基线一致」：基线刚刚被改写成 cur，那句是假话。
+        gone = len(base) - len(cur)
+        verdict = (f"比基线少 {gone} 条（已采纳）"
+                   + ("—— 已清空" if not cur else ""))
+
+    note = (f"未完成且停滞的单种（分母 {cur_by['total']}）\n"
+            f"  ① 装不出来（缺口 ≤ 0.1%，永远补不上）： {n_ub} 条\n"
+            f"     来源：本项目 {len(ub.get(RESEED_FREEZE_SRC_OURS) or [])}"
+            f" / IYUU {len(ub.get(RESEED_FREEZE_SRC_IYUU) or [])}（IYUU 只记数、不处理）\n"
+            f"  ② 没 peer（一个字节都没下到、源也看不见）： {n_np} 条\n"
+            f"     来源：本项目 {len(np_.get(RESEED_FREEZE_SRC_OURS) or [])}"
+            f" / IYUU {len(np_.get(RESEED_FREEZE_SRC_IYUU) or [])}（IYUU 只记数、不处理）\n"
+            f"  共 {len(cur)} 条 —— {verdict}")
+    if n_oth:
+        # ★ 挂了别的 tag 的（理论上不该有）：**只报数量**，不塞进上面两行里去
+        #   冒充「本项目」或「IYUU」。要让来源永远可追溯。
+        note += f"\n  （另有 {n_oth} 条挂了别的 tag，未计入上面任一行）"
+    if not first and new:
+        # ★ 只在**真新增**时发即时告警，且 key 是固定字面量（见常量处的说明）。
+        #   正文里**绝不**带 hash / 种子名 / tracker / content_path。
+        emit("alert", f"装不出来的单种新增 {len(new)} 条",
+             body=(f"qB（分母 {cur_by['total']}）里出现 {len(new)} 条新的"
+                   "「未完成且停滞」单种：\n"
+                   f"  ① 装不出来（缺口 ≤ 0.1%，永远补不上）： {n_ub} 条\n"
+                   f"  ② 没 peer（一个字节都没下到）： {n_np} 条\n"
+                   "这两类都**不会自己好**：前者缺的是发布组写进种子、而农场里"
+                   "根本没有的附件（`.nfo`/`.jpg`），没有 peer 就永远补不上；"
+                   "后者连源碎片都没见过。\n"
+                   "★ **本工具不做任何处置**（不暂停、不打标签、不删）—— 按你的"
+                   "要求这一步只负责认出来并告诉你。定位具体是哪几条："
+                   "跑 `scripts/diag/reseed-freeze-report.py --show-hashes`。\n"
+                   "★ 真危害是**永久占位 + 踩 HnR**；qB 只重下缺的 piece，"
+                   "所以**源文件目前还没被写穿**（那是 linkguard 在盯的事）。"),
+             key=RESEED_FREEZE_ALERT_KEY,
+             metrics={"fz_new": len(new), "fz": len(cur),
+                      "fz_total": cur_by["total"]})
+
+    # ★ 键名一律 `fz_` 前缀，且**绝不**恰好叫 `pack`、**绝不**含空格 ——
+    #   `notify.py:_render` 会把 key 里的空格换成 `_`，`fz x=1` 这种写法
+    #   能裂出一个 key 恰好是 `pack` 的段，从而**静默污染**
+    #   `notify-spool.sh:721` 的批次计数（`tests/test_reseed_freeze.py` 里钉住了）。
+    return note, {"fz": len(cur), "fz_new": 0 if first else len(new),
+                  "fz_ours": n_our, "fz_iyuu": n_iyuu,
+                  "fz_np": n_np, "fz_np_iyuu": len(np_.get(RESEED_FREEZE_SRC_IYUU) or []),
+                  "fz_total": cur_by["total"]}
+
+
+# --------------------------------------------------------------------------- #
 # 链接守护：既有 628 条硬链接有没有被**写穿**
 # --------------------------------------------------------------------------- #
 # 判据本体在 `orchestrator/state.py`（`linkguard_snapshot` / `linkguard_diff` /
@@ -944,7 +1183,7 @@ def qb_999_watch(args) -> tuple[str, dict]:
 #   「读→改→写必须紧挨着、别夹在别人中间」的约束。
 #
 # ★ 只报**数量**，不报路径 / 不报种子名（同 `qb_999_watch` 的口径）：
-#   日报是要发出去的。要知道具体是哪些，跑 `scripts/crossseed-linkguard.py`
+#   日报是要发出去的。要知道具体是哪些，跑 `scripts/diag/crossseed-linkguard.py`
 #   —— 那是人主动跑，且默认也只出 hash。
 LINKGUARD_FILE = HERE / ".linkguard.state"
 LINKGUARD_TAG = "cross-seed"
@@ -1070,7 +1309,7 @@ def linkguard_watch(args) -> tuple[str, dict]:
         # 但仍然只说数量与去哪里看 —— 名字不进日报。
         note += ("\n  ⚠ 被改写 = 内容被就地覆写（写穿的直接证据）。"
                  "定位与重建清单：看 //iSunker-DS423/.../drive-loop/scripts/.linkguard.state 的"
-                 " _linkguard_detail，或跑 scripts/crossseed-linkguard.py --rebuild-plan")
+                 " _linkguard_detail，或跑 scripts/diag/crossseed-linkguard.py --rebuild-plan")
     return note, {"lg_changed": 0 if first else n_ch,
                   "lg_added": 0 if first else n_ad,
                   "lg_removed": 0 if first else n_rm,
@@ -1237,7 +1476,7 @@ def reconcile_watch(args) -> tuple[str, dict]:
       （实测 09-12 当天 6.2 MB，旁边躺着 `info.2026-09-11.log` 3.5 MB），
       所以这三个数天然是「**从今天 00:00 到现在**」，会随一天推进而涨。
       ★ 这不是缺陷，但必须先说清楚 —— 否则"昨天 1011、今天日报说 400"
-      会被当成判据坏了。手工核总数用 `scripts/audit-found-lines.py`
+      会被当成判据坏了。手工核总数用 `scripts/diag/audit-found-lines.py`
       （它读的就是同一个当日文件，两者应当对得上）。
       ★ 顺带：正因为按天轮转，这里**可以**整读全文 —— 不会涨到几百 MB。
       （对比 `STALE_ENV_TAIL_BYTES` 那边只读尾部：那是**每批都跑**的热路径。）
@@ -1320,7 +1559,7 @@ def reconcile_watch(args) -> tuple[str, dict]:
                 if prev.controls_ok:
                     ev += ("   ⇒ 那个**数得到** ⇒ 判据没坏。本日的 0 只是"
                            "「当日口径」的 0（今天还没搜出去）。\n"
-                           "     手工复核用 scripts/audit-found-lines.py"
+                           "     手工复核用 scripts/diag/audit-found-lines.py"
                            "（读的是同一个函数）。\n")
                 else:
                     ev += ("   ★ 那个**也数不到** ⇒ 这才可能是**匹配逻辑真的坏了**"
@@ -1636,7 +1875,7 @@ def reconcile_watch(args) -> tuple[str, dict]:
 
 
 def pack_progress_watch(st) -> tuple[str, dict]:
-    """各包「做种 / 总数」→ (给日报正文的一段, 给 metrics 的字典)。
+    """各包「做种 / 总数 + **② 口径完成度**」→ (给日报正文的一段, 给 metrics 的字典)。
 
     ★★ **必须在这个 `with S.StateStore(args.db) as st:` 里被调用**（`#96`）——
       本函数**不自己开库**。理由不是风格：`report_daily` 里读库那段是
@@ -1650,28 +1889,82 @@ def pack_progress_watch(st) -> tuple[str, dict]:
       「当天第一批」上，`stage` 却是**逐包**更新的，所以当天还没跑过的包，
       那两数停在上次 sync。一个全局「截至 HH:MM」说不清这件事，
       每包自己的时刻才说得清（`#94`）。
+
+    ★★ **② 口径的定义不在这里** —— 真源在 `orchestrator/state.py` 的
+      `CENSUS_DENOM_STAGES` 上方（`A.11`：同一事实只在一处）。本函数只负责
+      **措辞**。两件必须照抄的东西：`denom == 0` 是 **`n/a` 不是 `0%`**；
+      百分比**非单调**（会因加站而回落），所以正文里有那句预先堵漏。
+
+    ★★ **总计 = 各包分子之和 ÷ 各包分母之和**，**不是**各包百分比的平均。
+      实测这两者能差 **32 个百分点**（`mbf` 的 4 行会与 `frds` 的 486 行同权）。
+      行尾那句「各包之和，非平均值」就是防这个读法，**别删**。
+
+    ★★ **绝不许写**「下降 / 退化 / 变差 / 做种率」这类**替读者下的结论**
+      （`B.10` 第 14 条第三个方向）：日报是**发出去的**，读者没有上下文去判断
+      这句话有没有根据。正文只许说**读数撑得起的话**。
     """
     rows = S.pack_progress(st)
     if not rows:
         # 空 ⇒ 真的一个包都没登记。**这与「读不到」不同**，所以不是 n/a。
         return "各包进度：（库里一个包都没登记）", {}
 
-    lines = ["各包进度（做种 / 总数，截至该包上次扫描）："]
+    lines = ["各包进度（做种 / 总数，② 口径完成度 = 做种 ÷（做种+待搜+跳过+错误+已匹配），"
+             "截至该包上次扫描）："]
     m: dict = {}
+    # 总计用**分子之和 / 分母之和**（见 docstring 里那 32 个百分点的实测）。
+    sum_num = 0
+    sum_den = 0
     for r in rows:
         name = r["name"]
         fin = r["scanned_at"] or "从未"
-        lines.append(f"  {name}：{r['seeding']} / {r['total']}（{fin}）")
-        # ★ 2N 个 kv，进 **metrics 这一个字段**（不是 TSV 的列，见 `#93`）。
+        cen = r["census"]
+        sum_num += cen["numerator"]
+        sum_den += cen["denom"]
+        pct = r["pct"]
+        if pct == "n/a":
+            # ★ 分母为 0 ⇒ 只写 n/a，**不写 %** —— 写成 "n/a%" 是把两件事缝在一起。
+            lines.append(f"  {name}：{r['seeding']} / {r['total']}（n/a）  {fin}")
+        else:
+            # 既印百分比、又印**未约简的分数**：百分比四舍五入过，
+            # 而下面那句「可能回落」要靠读者看得见两个原数才判得了。
+            lines.append(f"  {name}：{r['seeding']} / {r['total']}"
+                         f"（{pct}%，{cen['numerator']}/{cen['denom']}）  {fin}")
+        # ★ 3N 个 kv，进 **metrics 这一个字段**（不是 TSV 的列，见 `#93`）。
         #   ★ 键里的空格由 notify 侧规范化（`#95`），这里不预加工 —— 一处负责。
+        #   ★★ 前缀选 `packpct:` 而**不是** `pct:`，是为了让任何键都不可能
+        #      拼出 `pack=`（摘要数批次靠它**整键相等**）。★ `packnum:` /
+        #      `packden:` 字面含子串 `pack` 但**安全** —— 只因那条 awk 按 `=`
+        #      切开后比**整段**。这条是**险过**，测试里专门钉了它。
+        m[f"packpct:{name}"] = pct
+        m[f"packnum:{name}"] = cen["numerator"]
+        m[f"packden:{name}"] = cen["denom"]
+        # ★ 原有的两个键**保留**：`notify-spool.sh` 会把整段 metrics 原样打进
+        #   摘要的批次明细 ⇒ 摘要里并排出现 seeding/total/packpct/packnum/packden，
+        #   读者能**自己验算**。没有任何程序解析它们（已 grep 证实）。
         m[f"seeding:{name}"] = r["seeding"]
         m[f"total:{name}"] = r["total"]
+
+    if sum_den > 0:
+        lines.append(f"总计：{sum_num} / {sum_den}"
+                     f"（{round(100 * sum_num / sum_den)}%，{sum_num}/{sum_den}）"
+                     f"  ← 各包之和，非平均值")
+    else:
+        lines.append("总计：n/a  ← 各包分母皆为 0")
+    # ★ 那句「可能回落」：说的是**机理**不是判定（它不说"这没事"，它说**什么在动**），
+    #   只预先堵**一个**误读，且是括号里的一句 —— 不会被读成一条状态行。
+    lines.append("（② 口径分母 = 做种+待搜+跳过+错误+已匹配，**不含未匹配** ⇒ 新站接入或\n"
+                 "  片子转入未匹配时，分母会缩、百分比**可能回落**，回落不代表做种丢了。）")
+
+    m["pct"] = round(100 * sum_num / sum_den) if sum_den > 0 else "n/a"
+    m["pct_num"] = sum_num
+    m["pct_den"] = sum_den
     return "\n".join(lines), m
 
 
 def report_daily(args, *, force: bool = False, farm_note: str = "") -> bool:
     """每天最多投一次的台账：额度（来源 A+C）+ 新增做种趋势 + IYUU 辅种条数
-    + qB 卡 999（停滞的未完成种子）+ 观测对账（a−b / b−c〔全量口径〕/
+    + qB 卡 999（停滞的未完成种子）+ **装不出来 / 没 peer**（未完成且停滞的单种，
+    只识别 + 通知、不碰 qB）+ 观测对账（a−b / b−c〔全量口径〕/
     全场无人认领 / 声明点〔--packs〕）。
 
     ★ 为什么必须自己记「今天发过没有」：notify 的**冷却只对 alert 生效**
@@ -1738,6 +2031,13 @@ def report_daily(args, *, force: bool = False, farm_note: str = "") -> bool:
     qb_note, qb_metrics = qb_999_watch(args)
     parts.append(qb_note)
 
+    # 「装不出来」/「没 peer」（见本节函数上方的说明；★ 只识别 + 通知，**不碰 qB**）。
+    # ★ 用自己的状态文件 `.reseed-freeze.state`，所以**不**受 `reconcile_watch`
+    #   那条「读→改→写」的约束 —— 但**仍然摆在它外面**：缘由与 `qb_999_watch`
+    #   一样，两条 watch 的顺序与位置都别去动（动了只有到次日才发现，见那里的说明）。
+    fz_note, fz_metrics = reseed_freeze_watch(args)
+    parts.append(fz_note)
+
     # 链接守护：既有那 628 条硬链接有没有被就地改写（=写穿）。
     # ★ 用**自己的状态文件** `.linkguard.state`，与 `reconcile_watch` 那条
     #   「读→改→写」的约束无关（那个约束只对 `.reconcile.state` 成立）。
@@ -1749,7 +2049,7 @@ def report_daily(args, *, force: bool = False, farm_note: str = "") -> bool:
     #   **不记正文**）—— 详见 iyuu_watch 的说明。
     if emit("batch", "每日台账", body=body, key="daily",
             metrics={"day": today, **iyuu_metrics, **rec_metrics, **qb_metrics,
-                     **lg_metrics, **pp_metrics}):
+                     **fz_metrics, **lg_metrics, **pp_metrics}):
         _daily_set(today)
         LOG.info("已投递每日台账（额度 + 趋势）")
         return True
@@ -2052,22 +2352,83 @@ def read_state() -> dict:
         return {}
 
 
+#: 原子写用的临时后缀。★★ 这个字符串**不是随便选的**，见 `write_state` 的注释。
+STATE_TMP_SUFFIX = ".tmp"
+
+
 def write_state(d: dict) -> None:
+    """整体覆盖 `.drive-loop.state`（**原子**：先写同目录临时文件，再 `os.replace`）。
+
+    ★★ 为什么要原子（2026-09-18 加；原先是裸 `write_text`）：
+      读者是 **容器外** 的 `compose.yaml` healthcheck —— `json.load(open(...))`。
+      裸写在 truncate 与写完之间若被读走，读到的是**半截 JSON** ⇒ 解析抛异常
+      ⇒ 判 **unhealthy** ⇒ autoheal 杀容器 ⇒ 又是一封「意外停止」邮件。
+      ★ 这个窗口**本来就在**，但 `#27` 把心跳改成「睡眠期也刷」之后，
+      写频率从「跑批期」扩到「**全时**」⇒ 暴露面变大，所以现在补。
+    ★ 同形先例有三处：`.daily-report` / `.reconcile` / `.farm-check`
+      （都 `tmp.write_text` → `os.replace`），以及 `notify.py` 的 spool。
+
+    ★★ 临时名**只能**是 `<原名>.tmp`，**不能**是 `.drive-loop.tmp.state` 之类。
+      两个守卫对这个名字的判据**方向相反**（都实测跑过）：
+        · 哨兵 `check-deploy-drift` 的 `KNOWN_NAS` 有一条
+          「`drive-loop/scripts/` 下以 `.state` 结尾的隐藏文件」。
+          临时名以 `.tmp` 结尾 ⇒ **不匹配** ⇒ 窗口内被扫到会报「未知文件」
+          ⇒ 所以哨兵里**显式加了一条 `.tmp` 豁免**（不是靠通配糊过去）。
+        · `chk58.sh` `[3]` 的反向那条要求「`.state` 结尾」——
+          临时名不满足 ⇒ **自动逃过**，不必改。
+      ⇒ 两个方向**只有这一个名字能同时满足**，别改。
+      ★ 临时文件只在 `os.replace` 之前存在**微秒级**，且只在同一个目录里。
+    """
+    tmp = STATE_FILE.with_name(STATE_FILE.name + STATE_TMP_SUFFIX)
     try:
-        STATE_FILE.write_text(json.dumps(d, ensure_ascii=False), encoding="utf-8")
+        tmp.write_text(json.dumps(d, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, STATE_FILE)     # 同目录 rename ⇒ 原子；读者永远看到完整的一版
     except OSError as e:
         LOG.warning("写状态文件失败（忽略）: %s", e)
+        # ★ 失败时清掉临时文件 —— 否则它会**留在目录里**，被哨兵/chk58 当成新文件。
+        #   清理失败本身也吞掉：这个函数的契约是「写状态失败绝不拖垮批次」。
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 # 心跳多久没刷新就认为上一批已经死了。批次里每 60s 刷一次，10 分钟足够宽裕
 # （等于容忍 10 次丢拍），又能让被 kill 的残留批次在 10 分钟内被识别、不再挡住后续唤醒。
 HEARTBEAT_STALE_SEC = 600
 
+# ★★ `phase`：这个常驻进程**此刻在干什么**（`PHASE_IDLE` / `PHASE_RUNNING`）。
+#
+#   为什么需要它 —— `heartbeat_ts` **一职两用，而两个消费者对它的要求正好相反**：
+#     · `compose.yaml` 的 healthcheck 问「**容器死了没有**」
+#       ⇒ 睡眠期**也必须刷**，否则健康的容器被判 unhealthy、被 autoheal 杀掉。
+#       （2026-09-18 实测：睡眠 45 分钟 ≫ 阈值 900s ⇒ **每 41 分钟一封「意外停止」邮件**。）
+#     · `batch_alive()` 问「**上一批还在跑吗**」
+#       ⇒ 睡眠期**绝不能刷**，否则永远判「在跑」⇒ 每轮跳过 ⇒ **静默永久停工**。
+#   ⇒ 同一个字段不可能同时满足两边。**加上 `phase` 把两职拆开**：
+#     healthcheck 继续看心跳（现在全时刷），`batch_alive()` 改看 `phase`。
+#
+#   ★ `phase` **不是 `mode` 的同义词**（见 `_resident_state` 的注释「不新造同义词」）：
+#     `mode`   = **上次是哪条路**（身份，跨轮不变，只有常驻分支写）
+#     `phase`  = **现在在干什么**（状态，每轮翻转，每次心跳都写）
+#     两个维度正交，所以是两个字段而不是一个。
+#
+#   ★ 缺失时**必须**走原逻辑：升级窗口里旧版本写的状态文件没有这个键，
+#     那时「只信心跳」是对的（与 `batch_alive()` 里那个「旧版格式」分支同理）。
+PHASE_IDLE = "idle"        # 在睡觉 / 等下一批 —— 让位，别的容器可以接管
+PHASE_RUNNING = "running"  # 正在跑批 —— 别抢
 
-def write_heartbeat() -> None:
-    """刷新心跳（合并进现有状态，不动 running_pid / last_pack_idx）。"""
+
+def write_heartbeat(phase: str | None = None) -> None:
+    """刷新心跳（合并进现有状态，不动 running_pid / last_pack_idx）。
+
+    `phase` 为 None 时**不动**已有的 `phase` 键（保持向后兼容：
+    老的调用点一个参数都不传，行为与加这个参数之前**逐字相同**）。
+    """
     st = read_state()
     st["heartbeat_ts"] = time.time()
+    if phase is not None:
+        st["phase"] = phase
     write_state(st)
 
 
@@ -2090,14 +2451,25 @@ class Heartbeat:
       心跳会假死、被误判成残留。独立线程与批次同生共死，最省心。
 
     用法：`with Heartbeat(): stats = run_round(...)`
+    ★★ 2026-09-18：新增 `phase` —— **跑批时用默认 `PHASE_RUNNING`；
+      睡眠期另开一个 `Heartbeat(phase=PHASE_IDLE)` 把 `time.sleep()` 包起来。**
+      这样心跳**全时新鲜**（healthcheck 不再误杀），而 `batch_alive()` 靠 `phase`
+      仍能分辨「在跑」与「在睡」—— 详见 `PHASE_IDLE` 上方那段注释。
     """
 
-    def __init__(self, period: float = 60.0):
+    def __init__(self, period: float = 60.0, phase: str = PHASE_RUNNING):
         self.period = period
+        self._phase = phase
         self._stop = threading.Event()
         self._th: threading.Thread | None = None
 
     def __enter__(self) -> "Heartbeat":
+        # ★ 进 `with` 立刻刷一拍 —— 不刷的话第一拍要等 `period`（默认 60s），
+        #   而「刚进睡眠」到「第一拍心跳」之间正好是 healthcheck 最该看到新鲜心跳的窗口。
+        try:
+            write_heartbeat(self._phase)
+        except Exception:  # noqa: BLE001 —— 心跳失败绝不能拖垮批次
+            pass
         self._th = threading.Thread(target=self._loop, daemon=True, name="drive-loop-hb")
         self._th.start()
         return self
@@ -2105,7 +2477,7 @@ class Heartbeat:
     def _loop(self) -> None:
         while not self._stop.wait(self.period):
             try:
-                write_heartbeat()
+                write_heartbeat(self._phase)
             except Exception:  # noqa: BLE001 —— 心跳失败绝不能拖垮批次
                 pass
 
@@ -2187,6 +2559,29 @@ def batch_alive(st: dict) -> bool:
 
     # ★★ 容器写的 pid 不可比 —— 只信心跳（见 docstring）。
     if st.get("running_pid_pidns") == "container":
+        # ★★ 2026-09-18：容器分支**先看 `phase`**，心跳降级为「卡死兜底」。
+        #   起因：healthcheck 要心跳「睡觉也刷」，而这里要「睡觉别刷」——
+        #   一职两用必然有一边被牺牲。加了 `phase` 之后两边各取所需。
+        #   ★ 顺序很重要：`phase` 是**主判据**，心跳只用来确认
+        #     「说在跑的那位**真的**在刷」——否则「卡死」（进程活着、不干活）
+        #     就会变回检测不到，而卡死**正是当初加 autoheal 的理由**。
+        phase = st.get("phase")
+        if phase == PHASE_IDLE:
+            return False            # 明确空闲 ⇒ 上一批早跑完了，放心接管
+        if phase == PHASE_RUNNING:
+            hb = st.get("heartbeat_ts")
+            if hb is None:
+                LOG.warning("phase=running 但缺 heartbeat_ts（文件被截断？）—— 保守跳过本轮。")
+                return True
+            stale = time.time() - float(hb or 0)
+            if stale <= HEARTBEAT_STALE_SEC:
+                return True
+            LOG.warning("phase=running 但心跳已停 %.0f 分钟 —— 判定卡死，接管本轮。",
+                        stale / 60)
+            return False
+        # ★ 旧格式（没有 `phase`）⇒ **原逻辑逐字保留**。
+        #   升级窗口里状态文件还是旧版本写的，那时「只信心跳」是对的；
+        #   下一批用新代码写状态后就带上 `phase` 了，此分支自然不再走到。
         hb = st.get("heartbeat_ts")
         if hb is None:
             # 容器版**一定**会带心跳（同一个 write_state 写进去的）⇒ 这里只可能是
@@ -2294,8 +2689,13 @@ def once_round(packs: list[str], args, api_key: str, min_sleep: float) -> int:
     #   ★ 判据用**文件系统**（`/.dockerenv`）而不是环境变量：环境变量可能是人传进来的、
     #     也可能是 compose 特意设的，而 `/.dockerenv` 是**运行时自己长出来的**。
     _in_container = os.path.exists("/.dockerenv")
+    # ★★ 2026-09-18：显式写 `phase`。这里原本是 `{**st, ...}`（合并）⇒ 若 `st` 里
+    #   恰好有上一轮残留的 `phase`，就会被**继承**下来 —— 而「继承一个不属于本进程的
+    #   阶段」正是 `phase` 最危险的坏法（残留 `running` ⇒ 下一个容器永远判「在跑」）。
+    #   ⇒ 一律**显式声明**，不靠合并。
     write_state({**st, "running_pid": os.getpid(),
                  "running_pid_pidns": "container" if _in_container else "host",
+                 "phase": PHASE_RUNNING,
                  "heartbeat_ts": time.time()})
     if _in_container:
         LOG.info("[容器] running_pid=%d（容器内 PID，**不参与存活判据**；只信心跳）",
@@ -2308,7 +2708,12 @@ def once_round(packs: list[str], args, api_key: str, min_sleep: float) -> int:
     failed = False
     try:
         # 心跳线程只包住跑批阶段：跑完就停，免得和下面 finally 写状态打架
-        with Heartbeat():
+        # ★★ 2026-09-18：显式 `PHASE_RUNNING`。`once_round` 写的是**宿主**语义
+        #   （`running_pid_pidns="host"`），所以 `batch_alive()` 的容器分支**读不到**
+        #   它；但 `write_heartbeat` 是**合并写**——万一那份状态被**容器**读到
+        #   （例如宿主任务与常驻容器交接的窗口），写一个准确的 `running` 是对的。
+        #   ★ 也**不能**在这里写 `idle`：这一批**确实在跑**。
+        with Heartbeat(phase=PHASE_RUNNING):
             stats = run_round(pack, args, api_key)
         sleep_sec = log_result(pack, stats)
         if stats is None:
@@ -2344,9 +2749,13 @@ def once_round(packs: list[str], args, api_key: str, min_sleep: float) -> int:
         #   闸门退回 min_sleep 下限。
         #   注意这个 write_state 是**整体覆盖**、不合并 st（这是刻意的：顺便把
         #   heartbeat_ts 清掉，否则残留的心跳会让下一轮误判「上一批还在跑」）。
+        # ★★ 2026-09-18：这里同样**显式写 `phase`**。这是整体覆盖（不是 `{**st}`），
+        #   所以不写就等于**删掉** `phase` ⇒ 下一个读者走「旧格式」分支（只信心跳）
+        #   ⇒ 「说在跑的那位其实早收工了」检测不到。写 `idle` = 「我不在了」。
         write_state({"running_pid": None, "last_end_ts": time.time(),
                      "last_pack_idx": idx, "consec_abort": streak,
                      "consec_backoff": backoff_streak,
+                     "phase": PHASE_IDLE,
                      "last_sleep_sec": clamp(sleep_sec) if sleep_sec else 0.0})
     LOG.info("--once 完成。")
     return rc
@@ -2531,18 +2940,25 @@ def main() -> int:
     _resident_started = time.time()
     #: 常驻模式的状态快照。**写在一个地方**（而不是在每个 `continue` 前各写一遍）——
     #: 循环里有三处 `continue`、一处正常返回，抄四遍必然会漂。
-    def _resident_state(round_n: int, pack_idx: int, streak, note: str) -> None:
+    def _resident_state(round_n: int, pack_idx: int, streak, note: str,
+                        phase: str = PHASE_IDLE) -> None:
         """刷新常驻状态：心跳 + round + 包下标 + 连续失败计数。
 
         ★ 字段名**沿用 `once_round()` 已有的**（`last_pack_idx` / `consec_abort` /
           `consec_backoff`），不新造同义词 —— 否则 `batch_alive()` 与文档都要认两套。
         ★ `running_pid` 在容器里语义不同（恒为 1）⇒ 照 `once_round` 的做法带
           `running_pid_pidns` 标记，让 `batch_alive()` 跳过 pid 那一半。
+        ★★ 2026-09-18：新增 `phase`，**默认 `PHASE_IDLE`** —— 这个函数在四处的调用里
+          有三处（启动 / dry-run / 无动作 / 正常收工）都是「**我现在要让位**」，
+          只有跑批期间该是 `running`，而跑批期间由 `Heartbeat` 负责刷。
+          ⇒ 默认写 `idle` 是**保守且正确**的：万一某一处漏了传参，
+            后果是「别的容器可能来接管」，**不会**是「永远判在跑 ⇒ 静默停工」。
         """
         write_state({"running_pid": os.getpid(),
                      "running_pid_pidns": "container" if _in_container else "host",
                      "heartbeat_ts": time.time(),
                      "mode": "resident",
+                     "phase": phase,
                      "round": round_n,
                      "last_pack_idx": pack_idx,
                      "consec_abort": int(streak[0]),
@@ -2574,7 +2990,8 @@ def main() -> int:
             cur_pack_idx += 1
             if not args.once:
                 _resident_state(round_no, cur_pack_idx - 1, consec, "dry-run")
-                time.sleep(min_sleep)
+                with Heartbeat(phase=PHASE_IDLE):
+                    time.sleep(min_sleep)
             continue
 
         t0 = time.time()
@@ -2584,7 +3001,9 @@ def main() -> int:
             #   免得和循环尾部写状态打架。批次里有长时间不发请求的阶段
             #   （等日志静默最多 --drain-max-wait、回灌），所以必须**独立线程**，
             #   不能靠"每发一条 webhook 刷一次"（见 Heartbeat docstring）。
-            with Heartbeat():
+            # ★★ 2026-09-18：显式给 `phase=PHASE_RUNNING` —— 这是**唯一的**跑批态，
+            #   其它三处（启动 / dry-run / 无动作 / 收工）都该是 `idle`。
+            with Heartbeat(phase=PHASE_RUNNING):
                 stats = run_round(pack, args, api_key)
         except Exception as e:  # noqa: BLE001 —— 循环不能因单批异常而死
             LOG.exception("[%s] 本批异常（继续循环）", pack)
@@ -2598,7 +3017,8 @@ def main() -> int:
             if args.once:
                 return 1
             _resident_state(round_no, cur_pack_idx, consec, "本批异常")
-            time.sleep(BACKOFF_SLEEP)
+            with Heartbeat(phase=PHASE_IDLE):
+                time.sleep(BACKOFF_SLEEP)
             cur_pack_idx += 1
             continue
 
@@ -2613,7 +3033,8 @@ def main() -> int:
             if args.once:
                 return 0
             _resident_state(round_no, cur_pack_idx - 1, consec, "本批无动作")
-            time.sleep(min_sleep)
+            with Heartbeat(phase=PHASE_IDLE):
+                time.sleep(min_sleep)
             continue
 
         sleep_sec, reason = next_sleep(stats)
@@ -2635,17 +3056,26 @@ def main() -> int:
         sleep_sec = max(sleep_sec, min_sleep)
         _resident_state(round_no, cur_pack_idx - 1, consec, "正常收工")
         LOG.info("等待 %.1f 分钟后跑下一批（%s）", sleep_sec / 60, packs[cur_pack_idx % len(packs)])
-        time.sleep(sleep_sec)
+        # ★★ 2026-09-18：**这就是那 45 分钟的睡眠** —— autoheal 误杀就发生在这里。
+        #   包一层 `PHASE_IDLE` 心跳之后，心跳**全时新鲜** ⇒ healthcheck 不再判死；
+        #   而 `batch_alive()` 看到 `phase=idle` ⇒ 知道该让位（而不是「永远在跑」）。
+        with Heartbeat(phase=PHASE_IDLE):
+            time.sleep(sleep_sec)
 
     # ★ 循环正常结束（`--max-rounds` 到了）—— 收尾与 `once_round` 的 finally 同形：
     #   把 running_pid 置空，免得下一次唤醒看到残留 pid。
     #   ★ 这里**同时清掉 heartbeat_ts**（整体覆盖、不合并）——理由与 `once_round`
     #     的注释写的一样：残留的心跳会让下一轮误判「上一批还在跑」。
+    #   ★★ 2026-09-18：**必须同时写 `phase`**。残留 `PHASE_IDLE` 是安全的
+    #     （它就说「我让位」）；但残留 `PHASE_RUNNING` 会让下一个容器
+    #     一直判「在跑」——而「永远判在跑 ⇒ 静默永久停工」正是本仓最怕的形状。
+    #     ⇒ 收尾**一律写 `idle`**，与上面清心跳同一个目的：把「我不在了」说清楚。
     write_state({"running_pid": None, "last_end_ts": time.time(),
                  "last_pack_idx": (cur_pack_idx - 1) % len(packs),
                  "consec_abort": int(consec[0]),
                  "consec_backoff": int(consec[1]),
                  "mode": "resident",
+                 "phase": PHASE_IDLE,
                  "round": round_no})
     LOG.info("常驻模式：已到 --max-rounds=%d，正常收尾。", args.max_rounds)
     return 0

@@ -308,6 +308,24 @@ docker compose run --rm reseed-orchestrator status                          # �
      两行 **md5 不同** ⇒ 镜像旧，**必须重建镜像并 `docker load`**（`deploy.sh --apply` 治不了）。
      `run-resident.sh` 已在启动时自检：读到不含 `PHASE_IDLE` 的旧代码会**退 3** 并在 `attempts.log` 留一行。
 
+5. **「装不出来的单种」那一段有没有真进日报**（`SUMMARY §27`）——
+   ★ 同样是**可执行命令**，不是「看一眼」。
+   ```bash
+   tsv="//iSunker-DS423/docker_ssd/prowlarr_cross-seed_autohardlink/notify/log/$(date +%F).tsv"
+   grep -c 未完成且停滞 "$tsv"     # 应 > 0
+   grep -o 'fz_total=[0-9]*' "$tsv" # 应出现，且 == 当时的 :3060 总数
+   ```
+   * 两条**都**成立 ⇒ 生效。★ **只看第一条会把「还没发」误判成「没生效」**
+     （日报按**日历日**去重，`--force-recreate` 不影响它 —— 详见 `§26.15`）。
+   * 要**当场**看是哪几条（只读，不碰 qB）：
+     ```bash
+     python scripts/diag/reseed-freeze-report.py            # 默认只打聚合
+     python scripts/diag/reseed-freeze-report.py --show-hashes  # 12 位短 hash + 站点目录名
+     ```
+   * ⚠ 这三条种子**不要手动隔离**（不必限速 —— 它们本来就没有 peer，速率恒为 0）。
+     ★★ **别去动它们的数据文件**：qB 只重下缺的 piece，所以源**目前还没被写穿**；
+     一动才会真写穿源（`§27.2` / `§27.6`）。
+
 ---
 
 ## 常见问题

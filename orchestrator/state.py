@@ -1883,7 +1883,7 @@ class FoundLineCount:
 
 
 def count_found_lines(text: str) -> FoundLineCount:
-    """日志全文 → a/b 对账。`scripts/audit-found-lines.py` 核的就是这一个函数。"""
+    """日志全文 → a/b 对账。`scripts/diag/audit-found-lines.py` 核的就是这一个函数。"""
     r = FoundLineCount()
     for raw in text.splitlines():
         r.total_lines += 1
@@ -2345,8 +2345,74 @@ def pack_seeding_total(store: StateStore, pack: str) -> tuple[int, int]:
     return (sum(1 for r in rows if r["stage"] == STAGE_SEEDING), len(rows))
 
 
+# --------------------------------------------------------------------------- #
+# ② 口径「待办完成率」—— 分母的定义**只在这一处**（`A.11`）
+# --------------------------------------------------------------------------- #
+#: ★★ 「待办完成率」的**分母** = 除 `UNMATCHED` 之外的**全部**阶段。
+#:
+#:   公式：  分子 = `SEEDING`
+#:           分母 = `SEEDING + PENDING + SKIPPED + ERROR + MATCHED`
+#:           完成度 = round(100 × 分子 ÷ 分母)        （分母 > 0）
+#:                  = `n/a`                          （分母 == 0）
+#:
+#:   等价写法：分母 == `summary()["TOTAL"] − summary()[UNMATCHED]`
+#:   （`summary()["TOTAL"]` 是 `movie` 表的**行数**；`pack_seeding_total` 的
+#:   docstring 解释了为什么这个数"只涨不缩"）。**两条式子必须恒等** ——
+#:   测试里有一条断言直接把两者比一遍（④a），因为一旦有人改了 `ALL_STAGES`，
+#:   这里和 `summary()` 会**各漂一半而对不上**。
+#:
+#:   ★★ **为什么排除 `UNMATCHED`**：它是**回收态，不是终态**。
+#:   `todo()` 只排除 `DONE_STAGES`（`SEEDING`/`MATCHED`），所以 `UNMATCHED`
+#:   会在**任一站点到期**（默认 14 天）或**新增索引器**时重新入队。
+#:   ⇒ 这带来一个**必须告知用户的指标性质**：
+#:     `TOTAL` 永不缩，但 **`TOTAL − UNMATCHED` 会缩也会涨** ⇒
+#:     **本口径是非单调的**，百分比**可能回落**。
+#:     最常见的触发是**加站**（一批片子转 `PENDING`/`UNMATCHED`）。
+#:   ★ 正文里那句「回落不代表做种丢了」就是在堵这个误读；**别删它**。
+#:
+#:   ★★ **绝不能把 `STAGE_SEARCHED` 写进这个元组**：它与 `STAGE_UNMATCHED`
+#:   **语义相同、值不同**（`"SEARCHED"` vs `"UNMATCHED"`）。
+#:   `summary()` 的 `d` 是按 `ALL_STAGES`（含 `UNMATCHED`、**不含** `SEARCHED`）
+#:   建的 ⇒ 把 `SEARCHED` 放进来会让 `d[STAGE_SEARCHED]` **永远是 0**，
+#:   而 `d[STAGE_UNMATCHED]` 里的数**被漏减** ⇒ 分母偏大、百分比偏小，
+#:   而且**不报任何错**。`STAGE_SEARCHED` 只该出现在 `ALL_STAGES` 之外
+#:   那几处"阅读友好"的别名说明里。
+#:
+#:   ★ 用**显式减法**（而不是手写一份阶段列表）：将来 `ALL_STAGES` 新增阶段时，
+#:   它会**自动进分母**，而不是被静默漏掉 —— 漏一个阶段 = 一个永远偏大的
+#:   百分比，而那个误差**没有任何东西会报出来**。
+CENSUS_DENOM_STAGES = tuple(s for s in ALL_STAGES if s != STAGE_UNMATCHED)
+
+
+def pack_stage_census(store: StateStore, pack: str) -> dict[str, int]:
+    """每包的逐阶段普查 + ② 口径的 `numerator` / `denom`。
+
+    ★ **复用 `store.summary(pack)`**，不另写一份 `GROUP BY` —— 那一份已经是
+      本仓唯一的逐阶段普查（`idx_movie_stage` 撑着），再写一份就是
+      「两个声明点迟早漂开」的典型形状。★ 开销还是**负的**：`pack_progress`
+      原先每包调 `pack_seeding_total` → `store.movies(pack)`（**全行扫**），
+      而这是一条**索引** `GROUP BY`。
+
+    ★ 返回的 dict **不只有阶段键**：`summary()` 里还有一个 `"TOTAL"`，
+      本函数又加 `"denom"` / `"numerator"` ⇒ 调用方别做「键都是阶段」的假设。
+
+    ★★ `denom == 0` 有**两种**成因，处置相同：① 整包 `UNMATCHED`；
+      ② 包登记过但 **0 行**。两种都 ⇒ 调用方写 `n/a`，**绝不写 `0%`** ——
+      `0%` 是在断言「查了、没有在做种的」，而这两个读数**撑不起这句话**
+      （`ERR-AI-03`：`n/a` / `0` / 「没事」是三件事）。
+      ★ 反例最清楚：`mbf` 的 `0/4` **分母是 4** ⇒ 它的 `0%` **是合法的**，
+      与「除零产生的 0%」含义**完全不同**，**别把两者合并**。
+    """
+    d = store.summary(pack)
+    return {
+        **d,
+        "denom": sum(d[s] for s in CENSUS_DENOM_STAGES),
+        "numerator": d[STAGE_SEEDING],
+    }
+
+
 def pack_progress(store: StateStore) -> list[dict]:
-    """每个包的进度 → `[{name, seeding, total, scanned_at}, ...]`（按包名排序）。
+    """每个包的进度 → `[{name, seeding, total, pct, census, scanned_at}, ...]`（按包名排序）。
 
     ★ **返回结构化数据，不在这里渲染** —— 渲染归 `drive-loop.py`：
       现有各 watch（`iyuu_watch` / `reconcile_watch` / `qb_999_watch` /
@@ -2361,14 +2427,28 @@ def pack_progress(store: StateStore) -> list[dict]:
       写入）—— 比正文里一个全局「截至 HH:MM」精确：日报挂在「当天第一批」上，
       而 `stage` 是**逐包**在各自批次里更新的，所以当天还没跑过的包，
       它的两个数停在上次 sync（见 SUMMARY §23.5 订正④）。
+
+    ★★ `seeding` / `total` **仍然**来自 `pack_seeding_total`，
+      **不许**改从 `census["numerator"]` 取 —— 今天两者相等，但
+      「一个数两个来源」正是 `pack_seeding_total` 被抽出来要防的那件事；
+      而且 `pack_seeding_total` 的 2 元组返回**被测试逐字钉住**（`#97`）。
+
+    `pct` 的取值：`int` 百分比，或字符串 `"n/a"`（`denom == 0` 时）。
+      ★ 它**故意不是** `float` —— 渲染层要把它和 `n/a` 分开写，
+      浮点会诱导人写 `f"{pct}%"` 而把 `n/a` 印成 `n/a%`。
     """
     out: list[dict] = []
     for p in store.packs():
         seeding, total = pack_seeding_total(store, p["name"])
+        census = pack_stage_census(store, p["name"])
+        denom = census["denom"]
         out.append({
             "name": p["name"],
             "seeding": seeding,
             "total": total,
+            # 分母为 0 ⇒ "n/a"（**不是** 0）。理由见 pack_stage_census 的说明。
+            "pct": round(100 * census["numerator"] / denom) if denom > 0 else "n/a",
+            "census": census,
             "scanned_at": p["scan_finished_at"],
         })
     return out
@@ -2873,6 +2953,135 @@ def qb_999_band(torrents: list[dict], now: float) -> dict:
         if h:
             hits.append(h)
     hits.sort()                                         # 定序：让基线与断言都稳定
+    return {"n": len(hits), "hashes": hits, "total": len(torrents or [])}
+
+
+# --------------------------------------------------------------------------- #
+# qB「装不出来」—— 缺的那一点点**永远补不上**的单种
+# --------------------------------------------------------------------------- #
+# 立这个判据的现场（2026-09-18）：用户报「校验没通过的文件开始下载了」。
+# 实测三条 cross-seed 单种，`stalledDL` / `num_seeds=0` / `availability=0.999`：
+#
+#   · 逐文件 progress 是 `.mkv` ≈ 99.98%、而 `.jpg`/`.nfo` **恰好 0.00000%**；
+#   · 那个 0% 的文件在 `reseed_singles/` 里**根本不存在**；
+#   · 同一个文件在**农场**里**存在**（`cover.jpg` / `.nfo`）；
+#   · 载荷（`.mkv`）两侧**大小逐字节相同**（9658005448）。
+#
+# ⇒ **真机制不是「校验不通过就重下」**，而是：cross-seed 按「名称+大小」匹配上了
+#   发布组把附件（`.nfo`/`.jpg`）也写进种子的那一版，而农场里没有这些附件
+#   ⇒ qB 去补那几个缺文件 ⇒ 没有 peer ⇒ **永远补不上**。
+#
+# ★★ qB 只认 piece（README「原理 C」）：**它已经有的那块数据不会重下**
+#   ⇒ **源文件目前还没被写穿** —— 那是 `linkguard` 该盯的事，不是这里。
+#   真危害是**永久占位 + 踩 HnR**，且**一旦那个 `.mkv` 被动过/删过就会真重下**。
+#
+# ★ 为什么不并进 `qb_999_band`：那条是「**停滞时长**」这个维度、且**依赖
+#   `progress >= 0.99`**；本条是「**缺口的相对大小**」这个维度。两个维度正交，
+#   并起来会同时改掉两边的语义与各自的测试（`tests/test_qb_999_band.py` 钉的是
+#   24h 那个**阈值位置**，不是算式）。
+#
+# ★ 判据为什么取 `amount_left / size` 而**不是**「逐文件 progress == 0」：
+#   逐文件 progress 也是**按 piece 全局算**的（qB 没有文件级校验，见「原理 C」），
+#   所以「缺文件」未必显示成 0% —— 拿它当判据会漏。而 `amount_left / size`
+#   是分母归一过的**相对缺口**，不依赖 piece 怎么分摊到文件上。
+#
+# ★★ 阈值 `1e-3` 的依据是**实测的断层**（2026-09-18，全量 1999 条）：
+#       ==0（已完成）  1990
+#       (0, 1e-3]         3   ← 全是上面那三条
+#       (1e-3, 1e-2]      0
+#       (1e-2, 0.5]       0
+#       (0.5, 1]          6   ← 真在下、进度正常
+#   ⇒ **`1e-3` 与 `0.5` 之间一条都没有**，取哪都行。取 `1e-3` 是取**靠缺口那一侧**：
+#     将来出现「比 0.1% 稍大但仍够不着」的，会落在 `(1e-3, 0.5]` 这个
+#     **今天还是空的**区间里 —— 那正是需要有人看一眼的地方，不该被静默放过。
+#     ★ 这个断层的成因是「附件只有几百 KB，而载荷是 9~11 GB」⇒ 比值落在 1e-4 档。
+#       换个量级（比如小载荷）断层位置会移 —— 所以**别把这个数当普适常量**，
+#       它只在本项目的「大包拆包 + 附件型发布」这个形状下被实测支撑。
+#
+# ★★ 有一类**不命中但不是没问题**的，必须由调用方另立一格（见 drive-loop 的
+#   `reseed_freeze_watch`）：四条 IYUU 种子 `amount_left/size == 1.0`（**一个字节
+#   都没下到**）、`availability == 0.0`、`num_seeds == 0`，停滞 19~140 小时。
+#   那是**另一种**毛病（没 peer ⇒ 没起来），**不是**本条要抓的「装不出来」。
+#   ⇒ 本条**故意不兜它**（判据要能被证伪，别把两件事塞进一个数）。
+RESEED_GAP_MAX_RATIO = 1e-3       # 相对缺口上界；依据是上表那条**实测断层**
+RESEED_EXCLUDE_STATES = frozenset({"error", "missingFiles"})
+
+
+def reseed_unbuildable_band(torrents: list[dict], now: float | None = None) -> dict:
+    """从 `torrents/info` 的原始列表里挑出「装载缺口极小、却永远补不上」的那些。
+
+    返回 `{"n": 条数, "hashes": [升序 hash], "total": 分母}` —— 与 `qb_999_band`
+    **刻意同形**：`hashes` 给基线比对用，**只出 hash 不出 name**（名字不该有机会
+    流进正文或日志）；`total` 是传进来的**全部**种子数（单说「3 条」没有量纲，
+    判不了是 3/1999 还是 3/5）。
+
+    判据（三条，**没有**停滞闸 —— 见下面「为什么不设」）：
+      ① `amount_left > 0`            —— 已完成的不算
+      ② `amount_left / size <= 1e-3` —— 缺口小到「只差发布组的附件」
+      ③ `state` 不在 `error`/`missingFiles` —— 那两种有各自的口径，不重复记
+
+    ★ `now` **收下但不用**：签名与 `qb_999_band` 对齐是为了调用方**不必分叉**
+      （两个 watcher 一个循环里调）。**故意不设停滞闸**：判据 ② 本身已经足够尖
+      （实测断层到 `0.5` 之间一条都没有），再加时间闸只会**推迟发现**。
+      ⇒ 传 `None` 也合法；留着参数是为了将来若要加时间维度，改这里就够。
+
+    **不抛异常**：字段缺失 / 为 None 一律当「不命中」（同 `qb_999_band` 的失败
+    语义 —— 它挂在每天一次的日报里，一次字段变动不该让整份日报消失）。
+
+    ★ `size` 缺失或 `<= 0` 时**不命中**（不是当 0 算）：算不出比值就**不声称**，
+      与 `B.10`「『读不出来』不是『没问题』」同一条原则的反面应用 ——
+      判不了的时候，**宁可不报**（因为这里的误报会把一条正常大种子说成坏了）。
+    """
+    hits: list[str] = []
+    for t in torrents or []:
+        left = t.get("amount_left")
+        if not left or left <= 0:
+            continue                                    # 下完了 / 字段缺失
+        if t.get("state") in RESEED_EXCLUDE_STATES:
+            continue                                    # 有独立口径，不重复记
+        size = t.get("size")
+        if not size or size <= 0:
+            continue                                    # 算不出比值 ⇒ 不声称
+        if left / size > RESEED_GAP_MAX_RATIO:
+            continue                                    # 缺口太大 ⇒ 不是这一类
+        h = t.get("hash")
+        if h:
+            hits.append(h)
+    hits.sort()                                         # 定序：让基线与断言都稳定
+    return {"n": len(hits), "hashes": hits, "total": len(torrents or [])}
+
+
+def reseed_no_peer_band(torrents: list[dict]) -> dict:
+    """挑出「**一个字节都没下到、且没有 peer**」的 —— 与上面那条**正交**。
+
+    实测那四条 IYUU 种子：`amount_left/size == 1.0`（0%）、`availability == 0.0`、
+    `num_seeds == 0`、停滞 19~140 小时。★ 它们**不是**「装不出来」（缺口不是「小」，
+    而是「全缺」），是**另一种**毛病：**没 peer ⇒ 根本没跑起来**。
+
+    ★ 为什么单独一条而不是并进上面：两者的**处置方向相反** ——
+      「装不出来」是**存量、已定型**（互锁已生效，不再新增），
+      而「没 peer」**会变**（出种/加 trackers 就可能活过来）。
+      塞进一个数里就再也分不开了（同 `qb_999_band` 不并进主账的理由）。
+
+    判据：`amount_left/size >= 0.999` 且 `num_seeds == 0` 且 `availability == 0`。
+    ★ 三个都用 `or 0` 兜底 ⇒ 字段缺失时**按最坏情况算**（同 `qb_999_band` 对
+      `last_activity` 的处理：宁可吵不可静默）。返回形状同上。
+    """
+    hits: list[str] = []
+    for t in torrents or []:
+        size = t.get("size")
+        if not size or size <= 0:
+            continue
+        if (t.get("amount_left") or 0) / size < 0.999:
+            continue
+        if (t.get("num_seeds") or 0) != 0:
+            continue                                    # 有 peer ⇒ 是在下，不是没起来
+        if (t.get("availability") or 0.0) != 0.0:
+            continue                                    # 见过源碎片 ⇒ 另算
+        h = t.get("hash")
+        if h:
+            hits.append(h)
+    hits.sort()
     return {"n": len(hits), "hashes": hits, "total": len(torrents or [])}
 
 

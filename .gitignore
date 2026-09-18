@@ -51,6 +51,14 @@ scripts/.daily-report.state
 scripts/.farm-check.state
 # 对账读数台账：每一格**最后一次真的读到数**是什么时候（运行时产物；#34）
 scripts/.reconcile.state
+# 链接守护的锚：几千~几万条 (路径 → [size, mtime])（运行时产物；§27）
+# ★★ 2026-09-18 补：它自 2026-09-13 上线起**一直不在任何 ignore 规则里**（实测
+#   `git check-ignore -v` 无命中）⇒ 一个 `git add -A` 就能把**带真实路径**的
+#   那份快照提交进仓库。与 `.env*` / `_tmp-*/` 同族：**别让"会不会进仓库"
+#   取决于我们猜没猜对文件名** —— 当时是按"我记得加了"来想的，而并没有加。
+scripts/.linkguard.state
+# 「装不出来 / 没 peer」的基线（运行时产物；§27）
+scripts/.reseed-freeze.state
 # 计划任务那一层的起跑/退出码留痕 + stderr 捕获（诊断「批次凭空消失」用）
 scripts/drive-loop.attempts.log
 scripts/drive-loop.task.err
