@@ -38,7 +38,9 @@ REPO = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
 from orchestrator.state import (            # noqa: E402
+    ALL_STAGES, CENSUS_DENOM_STAGES, STAGE_SEARCHED, STAGE_UNMATCHED,
     STAGE_SEEDING, STAGE_PENDING, StateStore, pack_progress, pack_seeding_total,
+    pack_stage_census,
 )
 
 # ★ 输出强制 UTF-8：GBK 控制台下会在中途炸掉，而**已经过的断点看着全是 ok**
@@ -200,6 +202,245 @@ with StateStore(db) as st:
     rows = pack_progress(st)
     b = (rows[0]["seeding"], rows[0]["total"])
     ck("★ 两条路给出同一个数", a, b)
+
+# --------------------------------------------------------------------------- #
+# ④ ② 口径「待办完成率」：分子/分母/百分比 + **阴性对照**
+# --------------------------------------------------------------------------- #
+
+print()
+print("== ④ ② 口径待办完成率（分母不含 UNMATCHED）==")
+
+_READ_KEYS = {"name", "seeding", "total", "pct", "census", "scanned_at"}
+
+# 夹具 `beta`：**六个目录、六个不同阶段** —— 目的是让分子(1)与分母(5)
+# 与 total(6) **三个数互不相等**，这样一条算错的实现没法靠巧合过掉。
+#   ★ 为什么不能只放两三个阶段：若分子==分母或分母==total，
+#     「把 UNMATCHED 算进分母」和「按 total 算」这两条错法**都会给出正确答案**。
+_beta = _tmp / "beta.db"
+with StateStore(_beta, create=True) as st:
+    st.upsert_pack("beta", "/volume1/video/b", max_depth=2)
+    st.register_dirs("beta", [(f"b{i}", f"/volume1/video/b/b{i}") for i in range(1, 7)])
+    for _d, _s in (("b1", STAGE_SEEDING), ("b2", "MATCHED"), ("b3", STAGE_PENDING),
+                   ("b4", "SKIPPED"), ("b5", "ERROR"), ("b6", "UNMATCHED")):
+        st.con.execute("UPDATE movie SET stage=? WHERE pack=? AND dir_name=?",
+                       (_s, "beta", _d))
+    st.con.commit()
+# 全 UNMATCHED 的包（分母必然为 0）
+_allun = _tmp / "allun.db"
+with StateStore(_allun, create=True) as st:
+    st.upsert_pack("allun", "/volume1/video/u", max_depth=2)
+    st.register_dirs("allun", [("u1", "/volume1/video/u/u1")])
+    st.con.execute("UPDATE movie SET stage='UNMATCHED' WHERE pack=?", ("allun",))
+    st.con.commit()
+# 登记过、但 **0 行** 的包（分母也是 0，成因不同、处置相同）
+_zero = _tmp / "zero.db"
+with StateStore(_zero, create=True) as st:
+    st.upsert_pack("zero", "/volume1/video/z", max_depth=2)
+
+# ---- ④a 算术 + 两种定义的等价形 ----
+with StateStore(_beta) as st:
+    cen = pack_stage_census(st, "beta")
+    row = pack_progress(st)[0]
+ck("总行数 TOTAL", cen["TOTAL"], 6)
+ck("分子 = SEEDING", cen["numerator"], 1)
+ck("分母 = 除 UNMATCHED 外全部", cen["denom"], 5)
+ck("百分比", row["pct"], 20)
+ck("★ 两种定义恒等：TOTAL − UNMATCHED == denom", cen["TOTAL"] - cen["UNMATCHED"], cen["denom"])
+ck("★ seeding/total 仍来自 pack_seeding_total（不受 census 影响）",
+   (row["seeding"], row["total"]), (1, 6))
+ck_true("★ census 被带出来了（渲染层要用来印原始分数）",
+        row["census"] is not None and row["census"]["denom"] == 5, f"got {row['census']!r}")
+ck("★ 返回的键集合稳定（渲染层只许取这些）", set(row), _READ_KEYS)
+
+# ★ 特异性：把 b6 从 UNMATCHED 改成 PENDING ⇒ 它**进**分母
+with StateStore(_beta) as st:
+    st.con.execute("UPDATE movie SET stage=? WHERE pack=? AND dir_name=?",
+                   (STAGE_PENDING, "beta", "b6"))
+    st.con.commit()
+with StateStore(_beta) as st:
+    cen2 = pack_stage_census(st, "beta")
+ck("★ 把那条 UNMATCHED 改成 PENDING ⇒ 分母 5→6（排除的是 UNMATCHED，不是「还没做种的」）",
+   cen2["denom"], 6)
+with StateStore(_beta) as st:                    # 还原，后面的组还要用
+    st.con.execute("UPDATE movie SET stage='UNMATCHED' WHERE pack=? AND dir_name=?",
+                   ("beta", "b6"))
+    st.con.commit()
+
+# ---- ④b SEARCHED 别名 + 无重复 ----
+ck("★ `STAGE_SEARCHED` **不在**分母元组里（语义同 UNMATCHED、值不同）",
+   STAGE_SEARCHED in CENSUS_DENOM_STAGES, False)
+ck("UNMATCHED 不在分母元组里", STAGE_UNMATCHED in CENSUS_DENOM_STAGES, False)
+ck("分母元组无重复（按身份比较，不按值）", len(dict.fromkeys(CENSUS_DENOM_STAGES)),
+   len(CENSUS_DENOM_STAGES))
+ck("分母元组的元素集 == ALL_STAGES 去掉 UNMATCHED",
+   set(CENSUS_DENOM_STAGES), set(ALL_STAGES) - {STAGE_UNMATCHED})
+with StateStore(_beta) as st:
+    cen3 = pack_stage_census(st, "beta")
+ck("★ 逐阶段相加 == denom（普查与分母同源）",
+   sum(cen3[s] for s in CENSUS_DENOM_STAGES), cen3["denom"])
+
+# ---- ④c 分母为 0 的两种成因 ⇒ 都是 "n/a"，**不是** 0 ----
+with StateStore(_allun) as st:
+    r_un = pack_progress(st)[0]
+ck("★ 整包 UNMATCHED ⇒ denom", r_un["census"]["denom"], 0)
+ck('★ 整包 UNMATCHED ⇒ pct == "n/a"（不是 0）', r_un["pct"], "n/a")
+ck_true("★ `n/a` 既不是 int 0、也不是字符串 \"0%\"",
+        r_un["pct"] != 0 and r_un["pct"] != "0%", f"got {r_un['pct']!r}")
+with StateStore(_zero) as st:
+    r_z = pack_progress(st)[0]
+ck("★ 包登记过但 0 行 ⇒ 同样的 n/a（成因不同、处置相同）", r_z["pct"], "n/a")
+ck("★ 0 行的包 total 也是 0（这是「空」，不是「算不出」）", r_z["total"], 0)
+# ★★ 与上面成对的那一半：**真的 0/N** ⇒ pct 就是 0，且是 int
+with StateStore(_beta) as st:
+    st.con.execute("UPDATE movie SET stage='MATCHED' WHERE pack=? AND dir_name=?",
+                   ("beta", "b1"))
+    st.con.commit()
+with StateStore(_beta) as st:
+    r_true0 = pack_progress(st)[0]
+ck('★★ 真的 `0/N`（分母 > 0）⇒ pct == 0，**是合法读数**，与 n/a 是两个不同输出',
+   r_true0["pct"], 0)
+ck_true("★ 那个 0 是 int，不是字符串", isinstance(r_true0["pct"], int), f"got {type(r_true0['pct'])}")
+with StateStore(_beta) as st:                    # 还原
+    st.con.execute("UPDATE movie SET stage=? WHERE pack=? AND dir_name=?",
+                   (STAGE_SEEDING, "beta", "b1"))
+    st.con.commit()
+
+# ---- ④d ★★ 阴性对照：①口径 / 算进 UNMATCHED / 除零给 0 —— 三条错法各给不同答案 ----
+#   ★ 这是**本节最重要的一条**：没有它，一个把分母写成 `total` 的错实现
+#     能过掉上面**所有**断言（因为 1/6 与 1/5 只在某些夹具上才不同）。
+_真 = 20                                                    # 100 × 1/5
+_按total = round(100 * 1 / 6)                               # ① 口径 = 17
+ck("★ 阴性对照：① 口径（100×1/total）确实**不同**于 ② 口径",
+   _按total != _真, True)
+ck("  （① 口径的值，写下来免得下次重算）", _按total, 17)
+ck("★ 阴性对照：把 UNMATCHED **算进**分母也得到 17 ⇒ 与 20 不同",
+   round(100 * 1 / 6), 17)
+ck_true("★ 阴性对照：除零给 0 与真值 \"n/a\" **不同** ⇒ ④c 不是恒真",
+        "n/a" != 0, True)
+
+# ---- ④e metrics 键：#95 合规 + 绝不拼出 `pack=` ----
+# 走**真** notify.py 的渲染（与 ① 段同一套切法），验证端到端而不是猜键名。
+_wm = {"packpct:my pack": 64, "packnum:my pack": 72, "packden:my pack": 115,
+       "seeding:my pack": 74, "total:my pack": 115, "ok": 50}
+_line = _metrics_line(_wm)
+_keys = _keys_of(_line)
+ck("★ 新键里的空格被规范化（写入端一处负责）", "packpct:my_pack=64" in _line, True)
+ck_true("★★ **不许**出现键恰好等于 `pack` 的碎片（否则该行被误计为一批）",
+        "pack" not in _keys, f"切出的键={_keys!r}")
+ck("★ 被消费的另三个键也不在（ok 在，另两个不在）",
+   [k for k in _keys if k in ("ok", "newly_seeding", "backoff_hits")], ["ok"])
+ck_true("★ `packnum:`/`packden:` **字面含 `pack` 子串**，靠整键比较才安全",
+        any("pack" in k for k in _keys) and "pack" not in _keys, f"切出的键={_keys!r}")
+
+# ---- ④f 渲染层：② 口径那份正文 + 总计行 ----
+print()
+print()
+print("== ④f 渲染（pack_progress_watch）==")
+# ★★ 接法：**不动真 `S.pack_progress`**，只在渲染前把它换成喂数据的桩。
+#   （第一版我伪造了一个 `StateStore`，而渲染层会一路走到 `store.movies()` ⇒
+#    `AttributeError` —— 桩要打在**渲染层唯一那个入口**上，不是它下面。）
+DL = _load(REPO / "scripts" / "drive-loop.py", "drive_loop_pack_progress")
+_REAL_PP = DL.S.pack_progress
+
+# 两个包、分母**不等** ⇒ 「总计取和」与「总计取平均」给出**不同**的数：
+#   big 1/4（25%）+ small 1/2（50%） ⇒ 和 = 2/6 = 33%，平均 = 37.5% ⇒ 38%
+_two = [
+    {"name": "big", "seeding": 1, "total": 4, "pct": 25,
+     "census": {"denom": 4, "numerator": 1, "TOTAL": 4, "UNMATCHED": 0},
+     "scanned_at": "2026-09-18 01:00:00"},
+    {"name": "small", "seeding": 1, "total": 2, "pct": 50,
+     "census": {"denom": 2, "numerator": 1, "TOTAL": 2, "UNMATCHED": 0},
+     "scanned_at": "2026-09-18 00:30:00"},
+]
+
+
+def _render(rows):
+    """把 `S.pack_progress` 换成桩，跑一次渲染，**无论成败都还原**。
+    ★ 必须还原：这个桩是**模块级**赋值，漏还原会让后面的组拿到假数据。"""
+    DL.S.pack_progress = lambda _st: rows
+    try:
+        return DL.pack_progress_watch(object())
+    finally:
+        pass
+
+
+_note, _mets = _render(_two)
+ck_true("每包行同时含「做种 / 总数」与百分比：`1 / 2` + `50%` 在",
+        "1 / 2" in _note and "50%" in _note, f"正文={_note!r}")
+ck_true("同上，第二个包：`1 / 4` + `25%` 在",
+        "1 / 4" in _note and "25%" in _note, f"正文={_note!r}")
+ck_true("每包行还印了**未约简的分数**（百分比四舍五入过，回落那句要靠它判）",
+        "1/4" in _note and "1/2" in _note, f"正文={_note!r}")
+ck_true("每包带**它自己**的时刻（#94 回归）",
+        "2026-09-18 01:00:00" in _note and "2026-09-18 00:30:00" in _note,
+        f"正文={_note!r}")
+ck_true("有 `总计` 行", "总计" in _note, f"正文={_note!r}")
+# ★★★ 本节第二条最重要的断言：总计必须是**和**，不是平均
+# ★ 为什么上面那个夹具（1/4 + 1/2）**故意**选得让平均落在 `.5` 上：
+#   2026-09-18 拿生产库冷副本冒烟时实测，真库的「平均」写法算出来是
+#   `(95+100)/2 = 97.5` ⇒ `round` ⇒ **98**，而正确的「和」写法是 99。
+#   ⇒ 两个错/对答案**都**是两位数、都"看起来合理"；平均那一支还正好压在
+#   银行家舍入的中点。这条断言要挡的**就是**这种"静默偏 1"的坏法 ——
+#   所以夹具必须也踩在中点上（`37.5`），否则它只证明了"两个数不同"，
+#   证明不了"不同会被 `round` 吃掉"。详见计划 Part F.2。
+ck_true("★★ 总计用**和**（2/6 ⇒ 33%），不是各包百分比的平均（37.5% ⇒ 38%）",
+        "2 / 6" in _note and "33%" in _note and "38%" not in _note, f"正文={_note!r}")
+ck_true("★ 行尾写明「各包之和，非平均值」", "非平均" in _note, f"正文={_note!r}")
+ck_true("★ 含「回落」那句（② 非单调性的预先堵漏）", "回落" in _note, f"正文={_note!r}")
+ck_true("★★ 且**不含**替读者下的结论（下降 / 退化 / 变差 / 做种率）",
+        not any(w in _note for w in ("下降", "退化", "变差", "做种率")), f"正文={_note!r}")
+ck_true("★ metrics 里有事件级 pct / pct_num / pct_den",
+        {"pct", "pct_num", "pct_den"} <= set(_mets), f"keys={sorted(_mets)}")
+ck("★ 事件级总计分子（和）", _mets["pct_num"], 2)
+ck("★ 事件级总计分母（和）", _mets["pct_den"], 6)
+ck("★ 事件级百分比", _mets["pct"], 33)
+ck_true("★ 每包三个新键都在（字面含 pack 但不等于 pack）",
+        {"packpct:big", "packnum:big", "packden:big",
+         "packpct:small", "packnum:small", "packden:small"} <= set(_mets),
+        f"keys={sorted(_mets)}")
+ck_true("★ 原有的 seeding:/total: 键**保留**（摘要里能自己验算）",
+        {"seeding:big", "total:big", "seeding:small", "total:small"} <= set(_mets),
+        f"keys={sorted(_mets)}")
+ck_true("★ 渲染层的 metrics 里**没有**裸 `pack` 键",
+        "pack" not in _mets, f"keys={sorted(_mets)}")
+
+# 分母为 0（整包 UNMATCHED）⇒ 正文写 n/a，且那一行**不出现 %**
+_zero_rows = [{"name": "allun", "seeding": 0, "total": 1, "pct": "n/a",
+               "census": {"denom": 0, "numerator": 0, "TOTAL": 1, "UNMATCHED": 1},
+               "scanned_at": "2026-09-18 02:00:00"}]
+_noteN, _metsN = _render(_zero_rows)
+ck_true("★ 分母为 0 的包在正文里写 n/a", "n/a" in _noteN, f"正文={_noteN!r}")
+ck_true("★★ 且那一行**不出现 `%`**（别把 n/a 印成 n/a%）", "%" not in _noteN,
+        f"正文={_noteN!r}")
+ck("★ 分母为 0 时事件级 pct 也是 n/a（不是 0）", _metsN["pct"], "n/a")
+ck("★ 分母为 0 时事件级 pct_den 是 0（先把分母说清）", _metsN["pct_den"], 0)
+ck_true("★ 分母为 0 时不该出现 `0%`（那是另一句话）", "0%" not in _noteN, f"正文={_noteN!r}")
+
+# 空集：一个包都没登记 ⇒ 与「库读不到」不是同一句话
+_noteE, _metsE = _render([])
+ck_true("★ 空集说的话与「算不出」不同（两种 n/a 别统一）",
+        "一个包都没登记" in _noteE and "算不出" not in _noteE, f"正文={_noteE!r}")
+ck("★ 空集的 metrics 为空", _metsE, {})
+DL.S.pack_progress = _REAL_PP          # ★ 还原，别让桩漏到后面的组
+
+# ---- ④g #96 回归：渲染层炸了不许带走整份日报 ----
+print()
+print("== ④g #96 回归：新节失败的口径 ==")
+_src = (REPO / "scripts" / "drive-loop.py").read_text(encoding="utf-8")
+_rd = _src[_src.find("def report_daily"):]
+_rd = _rd[:_rd.find(chr(10) + "def ")]
+ck_true("★ `pack_progress_watch(st)` 在 report_daily 的 try 里被调用",
+        "pack_progress_watch(st)" in _rd, "没找到调用点 —— 新节可能被放到了 try 之外")
+ck_true("★ 那一节的失败出口写的是「各包进度：算不出」",
+        "各包进度：算不出" in _rd, "读库失败时正文没有那句话")
+ck_true("★ 读不到时给 `n/a` 而不是 0（`ERR-AI-03`）",
+        'pp_metrics = {"pp": "n/a"}' in _rd, "没找到 n/a 那条兜底")
+
+# ---- ④h ⑥ 那条已知弱点的**正向**补充：渲染层只许取它有的键 ----
+#   （计划 C.1.1：这条链原先没有任何断言钉住这件事）
+_pk = [k for k in ("name", "seeding", "total", "pct", "census", "scanned_at")
+       if k not in _two[0]]
+ck("★ 夹具的两个 dict 键齐（渲染层不会撞 KeyError）", _pk, [])
 
 # --------------------------------------------------------------------------- #
 print()

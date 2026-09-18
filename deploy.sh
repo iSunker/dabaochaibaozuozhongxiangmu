@@ -165,6 +165,9 @@ if [[ "$MODE" == "--rollback" ]]; then
   exit 0
 fi
 
+# ★ 不写字面量 —— 写字面量会被编辑器当成真 CR，把这个文件自己弄污了。
+CR_CHAR=$(printf '\r')
+
 # ---------- 算差异 ----------
 CHANGED=()
 for p in "${FILES[@]}"; do
@@ -251,6 +254,20 @@ for p in "${CHANGED[@]}"; do
   s="${p%%::*}"; d="${p##*::}"
   mkdir -p "$DST/$(dirname "$d")"
   cp -p "$SRC/$s" "$DST/$d.new.$$"
+  # ★★ 部署前剥掉 CR（2026-09-18 实测）：工作树在 Windows 上可能带 CRLF
+  #   （Edit/Write 工具与 python 文本模式写入都会把 LF 变成 CRLF），而 NAS 是 Linux
+  #   ⇒ 原样传过去会让 .sh 的行尾变成 CRLF，撞 ERR-SH-02 / ERR-SH-03。
+  #   ★ 排除 .cmd/.bat：那两个必须是 CRLF（见 .gitattributes，删了会静默失败）。
+  #   ★ 必须 tr 到另一个临时文件再 mv —— 不能在 SMB 上就地改写（同 §17.2 的理由）。
+  case "$s" in
+    *.cmd|*.bat) : ;;
+    *) LC_ALL=C tr -d "$CR_CHAR" < "$DST/$d.new.$$" > "$DST/$d.new.$$.lf"
+       if ! cmp -s "$DST/$d.new.$$" "$DST/$d.new.$$.lf"; then
+         mv -f "$DST/$d.new.$$.lf" "$DST/$d.new.$$"
+       else
+         rm -f "$DST/$d.new.$$.lf"
+       fi ;;
+  esac
   mv -f "$DST/$d.new.$$" "$DST/$d"
   echo "  ✓ $d"
 done

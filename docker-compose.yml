@@ -246,13 +246,24 @@ services:
     #   ★★ 阈值 900s **故意比 `batch_alive()` 的 `HEARTBEAT_STALE_SEC`(600s) 松**：
     #     healthcheck ⇒ 要不要**重启容器**（重动作，宁晚不误杀）；
     #     `batch_alive` ⇒ 要不要**跳过本轮**（轻动作）。两者权衡方向不同。
+    #   ★★★ 2026-09-18 **实测踩坑并改正**：900s 这个值**会误杀健康的容器**。
+    #     机理：`Heartbeat` 原本只包住**跑批**，睡眠期（日志「等待 45.0 分钟后
+    #     跑下一批」）心跳**冻结** ⇒ 45 分钟 ≫ 15 分钟 ⇒ **每一轮**都判 unhealthy
+    #     ⇒ autoheal 杀容器 ⇒ `restart: unless-stopped` 拉起 ⇒ 群晖按退出码报
+    #     「**drive-loop 意外停止**」，**每 41 分钟一封邮件**。
+    #     ⇒ 两条一起改（缺一不可，见 SUMMARY）：
+    #       ① `drive-loop.py` 的睡眠期也刷心跳（新增 `phase` 字段区分「在睡/在跑」）；
+    #       ② 这里把阈值抬到 **1800s**，给「单批跑得比预期久」留余量。
+    #     ★ 判据要能被证伪：改完若**仍**每 41 分钟一封，说明诊断错了 ⇒ 回滚重查。
     #   ★★ `start_period: 120s` **必须有**：容器刚起来时状态文件还没写，
     #     判据会失败 ⇒ 没有它则开局即判 unhealthy ⇒ 被 autoheal **反复重启**。
+    #     ★ 注意这条注释当初只想到了「**开局**」那个窗口 —— 2026-09-18 才发现
+    #       「**每轮睡眠**」是**另一个**窗口，而且它比开局长得多（45 分钟）。
     #   ★ 这条判据**查不出**「容器从没起来过」：那种情形 `docker ps` 的 STATUS
     #     会说话（见 README 15.d 的收尾核对），不由 healthcheck 负责。
     healthcheck:
       test: ["CMD", "python", "-c",
-             "import json,sys,time;st=json.load(open(sys.argv[1],encoding='utf-8'));hb=float(st.get('heartbeat_ts') or 0);sys.exit(0 if hb and time.time()-hb<=900 else 1)",
+             "import json,sys,time;st=json.load(open(sys.argv[1],encoding='utf-8'));hb=float(st.get('heartbeat_ts') or 0);sys.exit(0 if hb and time.time()-hb<=1800 else 1)",
              "/volume2/docker_ssd/prowlarr_cross-seed_autohardlink/drive-loop/scripts/.drive-loop.state"]
       interval: 60s
       timeout: 10s

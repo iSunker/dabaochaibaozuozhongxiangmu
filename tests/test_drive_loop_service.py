@@ -214,10 +214,20 @@ if YML and isinstance(svcs.get("drive-loop"), dict):
     if isinstance(_hc, dict):
         _t = _hc.get("test")
         _t_s = " ".join(_t) if isinstance(_t, list) else str(_t)
-        #   ★ 判据本体：读 `.drive-loop.state` 的 heartbeat_ts，阈值 900s
-        ck("★★ ①p healthcheck 判的是**心跳新鲜度**（900s 阈值 + 读 .drive-loop.state）",
-           "heartbeat_ts" in _t_s and "900" in _t_s and ".drive-loop.state" in _t_s,
+        #   ★★★ 判据本体：读 `.drive-loop.state` 的 heartbeat_ts。
+        #   ★★ 2026-09-18 改正：原先这里**写死 `"900" in _t_s`** —— 那是在钉一个
+        #      **具体的数**，而真正该钉的是**性质**：「阈值必须 > 一轮睡眠」。
+        #      写死那个数让这条断言在 900→1800 的修复里**红了**，而那次改动
+        #      **恰恰是这条断言该支持的**（它是"阈值太短会误杀"的解药）。
+        #      ⇒ 钉性质而不是钉字面量：读出来，再比下界。
+        ck("★★ ①p healthcheck 判的是**心跳新鲜度**（读 .drive-loop.state 的 heartbeat_ts）",
+           "heartbeat_ts" in _t_s and ".drive-loop.state" in _t_s,
            _t_s[:160])
+        _hm = re.search(r"time\.time\(\)-hb<=(\d+)", _t_s)
+        ck("★★ ①p′ 阈值存在且 **≥ 1800s**（> 一轮睡眠 45 分钟的那一档，留余量）"
+           "—— 太短 ⇒ 健康的容器在睡眠期被判 unhealthy ⇒ 每轮一封「意外停止」邮件",
+           bool(_hm) and int(_hm.group(1)) >= 1800,
+           f"抠到 {_hm.group(1) if _hm else None!r}；正文={_t_s[:120]}")
         #   ★★ `start_period` 必须有 —— 没有它，容器刚起来（状态文件还没写）
         #      就会判 unhealthy ⇒ 被 autoheal **反复重启**。这是**必须**的一条。
         ck("★★ ①q healthcheck 有 start_period（没有它：刚起来就判 unhealthy ⇒ 反复重启）",
@@ -480,6 +490,189 @@ if _main is not None:
                             _none_writes += 1
     ck("★★ ⑤d 收尾把 running_pid 置 None（残留心跳会让下一轮误判「上一批还在跑」）",
        _none_writes >= 1, f"找到 {_none_writes} 处")
+
+# --------------------------------------------------------------------------
+#   ⑤e~⑤h ★★★ 2026-09-18：`phase` —— healthcheck 误杀那次的回归
+#
+#   背景（实测，不是推理）：`Heartbeat` 原本**只包住跑批**，睡眠期（日志
+#   「等待 45.0 分钟后跑下一批」）心跳**冻结** ⇒ 45 分钟 ≫ healthcheck 阈值 900s
+#   ⇒ **每一轮**判 unhealthy ⇒ autoheal 杀容器 ⇒ 群晖每 41 分钟一封
+#   「drive-loop 意外停止」邮件。
+#
+#   ⇒ 修法：**睡眠期也刷心跳**（`Heartbeat(phase=PHASE_IDLE)` 包住 `time.sleep`），
+#     同时给 `batch_alive()` 一个**新主判据 `phase`** —— 因为心跳一旦全时新鲜，
+#     「心跳新鲜」就**不再能**区分「在跑」与「在睡」了：
+#     `batch_alive()` 若继续只信心跳，会**永远返回 True** ⇒ 每轮跳过
+#     ⇒ **静默永久停工**（正是 `Heartbeat` docstring 最怕的那个失败模式）。
+#
+#   ★★ 这一组**必须 import 真 `batch_alive()` 喂数据**，不能只看源码字符串 ——
+#     因为要钉的是**四种输入下的行为**（含"旧格式仍走原逻辑"），
+#     而 AST/字符串判据证不了行为。
+# --------------------------------------------------------------------------
+print("\n=== ⑤e `batch_alive()` 的 `phase` 四输入（2026-09-18 回归）===")
+#   ★ 载真的那份：照 `tests/README.md` 的规矩，**先**登记 `sys.modules` 再 exec
+#     （不登记的话 `@dataclass` 会炸一个看着毫不相干的 AttributeError）。
+import importlib.util                             # noqa: E402
+import time as _time                              # noqa: E402
+
+_DL = None
+try:
+    _spec = importlib.util.spec_from_file_location("drive_loop_for_batch_alive", DOCKER_PY)
+    _DL = importlib.util.module_from_spec(_spec)
+    sys.modules["drive_loop_for_batch_alive"] = _DL      # ★ 必须在 exec_module 之前
+    import contextlib as _ctx
+    import io as _io
+    with _ctx.redirect_stdout(_io.StringIO()), _ctx.redirect_stderr(_io.StringIO()):
+        try:
+            _spec.loader.exec_module(_DL)
+        except SystemExit:
+            pass
+except Exception as e:                             # noqa: BLE001
+    ck("前提：能载入 scripts/drive-loop.py 的 batch_alive", False, repr(e))
+
+if _DL is not None:
+    _ba = _DL.batch_alive
+    _now = _time.time()
+
+    def _st(**kw):
+        """容器版状态的最小形状：**必须带 `running_pid_pidns="container"`**，
+        否则会走宿主分支（那条路 `pid_alive` 一掺进来就测不准了）。"""
+        base = {"running_pid": 1, "running_pid_pidns": "container",
+                "heartbeat_ts": _now}
+        base.update(kw)
+        return base
+
+    # ⑤e-1 在跑 + 心跳新鲜 ⇒ True（守卫：别把正常在跑的判成可接管）
+    ck("★ ⑤e 相位 running + 心跳新鲜 ⇒ True（在跑，不许抢）",
+       _ba(_st(phase="running")) is True, "被判成可接管了")
+
+    # ⑤e-2 ★★ 空闲 + 心跳**新鲜** ⇒ False —— 这是**阴性对照**：
+    #   若返回 True，说明 `phase` 压根没被读，心跳仍是唯一判据
+    #   ⇒ 「睡眠期心跳全时刷」一上线就会**永远判在跑** ⇒ **静默永久停工**。
+    ck("★★ ⑤f 相位 idle + 心跳**新鲜** ⇒ False（★ 阴性对照：证明 `phase` 真的被读了）",
+       _ba(_st(phase="idle")) is False,
+       "返回 True ⇒ `phase` 没接上，睡眠期刷心跳会让它**永远判在跑**")
+
+    # ⑤e-3 ★ 在跑但**心跳陈旧** ⇒ False —— 「卡死」必须仍可检测
+    #   （卡死正是当初加 autoheal 的理由；若这里返回 True，等于把自愈能力关掉了）
+    ck("★ ⑤g 相位 running + 心跳**陈旧**(>600s) ⇒ False（卡死仍可检测）",
+       _ba(_st(phase="running", heartbeat_ts=_now - 9999)) is False,
+       "返回 True ⇒ 卡死检测被关掉了，autoheal 从此救不了卡死的容器")
+
+    # ⑤e-4 ★★ 旧格式（**没有** `phase`）⇒ 原逻辑**逐字保留**：只信心跳
+    #   升级窗口里状态文件是旧版本写的，那时「只信心跳」是对的
+    ck("★★ ⑤h 无 `phase`（旧格式）+ 心跳新鲜 ⇒ True（升级窗口行为不变）",
+       _ba(_st()) is True, "旧格式行为被改动 ⇒ 升级窗口会误接管")
+    ck("★ ⑤h 无 `phase`（旧格式）+ 心跳陈旧 ⇒ False（原逻辑保留）",
+       _ba(_st(heartbeat_ts=_now - 9999)) is False, "旧格式的残留判定丢了")
+
+# ⑤i ★ 两个常量的**相对关系**必须对：healthcheck 阈值 > 一轮睡眠
+#   （阈值写在 compose 的 python 一行式里，这里用字符串抠出来比）
+_HE_TXT = COMPOSE.read_text(encoding="utf-8") if COMPOSE.is_file() else ""
+_m = re.search(r"time\.time\(\)-hb<=(\d+)", _HE_TXT)
+_he_thresh = int(_m.group(1)) if _m else 0
+ck("★ ⑤i compose 的 healthcheck 阈值已从 900 抬到 1800（不再是 15 分钟）",
+   _he_thresh == 1800, f"读到 {_he_thresh!r}")
+ck("★★ ⑤i 阈值 > 睡眠上限（45 分钟 = 2700s 那一档要留余量 ⇒ 至少 1800）",
+   _he_thresh >= 1800, f"阈值 {_he_thresh}s 太短，睡眠期仍会被误杀")
+# ⑤j ★ 睡眠点**真的**被 `Heartbeat(phase=PHASE_IDLE)` 包住了
+#   （否则"改了常量没改代码"——治标那半没做）
+ck("★★ ⑤j 常驻主循环的睡眠点被 `Heartbeat(phase=PHASE_IDLE)` 包住（治本那半）",
+   "with Heartbeat(phase=PHASE_IDLE):" in _SRC,
+   "睡眠期没包心跳 ⇒ 阈值抬再高也只是治标")
+
+# --------------------------------------------------------------------------
+print("\n=== ⑤k `write_state()` 原子写（2026-09-18 加；#27 把它的暴露面放大了）===")
+#   ★ 为什么单列一段：裸 `write_text` 的那个窗口**本来就在**，但 `#27` 把心跳改成
+#     「睡眠期也刷」之后，写频率从「跑批期」扩到「**全时**」⇒ 暴露面变大。
+#     读者是**容器外**的 healthcheck（`json.load(open(...))`）⇒ 读到半截 JSON
+#     ⇒ 解析抛 ⇒ 判 unhealthy ⇒ autoheal 杀 ⇒ 又是一封「意外停止」邮件。
+#   ★★ 判据落到**源码**上（不是行为上）：因为原子性是 "truncate 与写完之间" 的
+#     性质，**离线测不出时序** —— 能测的是「写法是不是那条唯一原子的写法」。
+if _DL is not None:
+    import tempfile as _tf                            # noqa: E402
+    import json as _json                              # noqa: E402
+
+    # ⑤k ★ 源码里 `STATE_FILE.write_text` **一个字都不许剩**
+    #   （留一处 = 那条路仍然裸写；而它正好是最常走的那条）
+    ck("★★ ⑤k 源码里没有 `STATE_FILE.write_text`（裸写已彻底换掉）",
+       "STATE_FILE.write_text" not in _SRC,
+       "还有裸写落点 ⇒ 那条路仍能写出半截文件")
+
+    # ⑤l ★★ 行为判据：**同目录** 且 临时名是 `<原名>.tmp`
+    #   ★ 为什么"同目录"是硬要求：`os.replace` **跨文件系统**不是原子 rename，
+    #     会退化成"拷贝+删" —— 那就把原子性丢了，而**代码看着一模一样**。
+    _ws = getattr(_DL, "write_state", None)
+    _suffix = getattr(_DL, "STATE_TMP_SUFFIX", None)
+    ck("★ ⑤l 有 `STATE_TMP_SUFFIX` 且值为 `.tmp`",
+       _suffix == ".tmp", f"读到 {_suffix!r}")
+
+    if callable(_ws):
+        with _tf.TemporaryDirectory() as _td:
+            _sf = pathlib.Path(_td) / ".drive-loop.state"
+            _orig = _DL.STATE_FILE
+            _DL.STATE_FILE = _sf
+            try:
+                _ws({"round": 7, "phase": "idle"})
+                # ⑤m ★ 内容真的落盘了、且是**完整 JSON**
+                _got = _json.loads(_sf.read_text(encoding="utf-8")) if _sf.is_file() else {}
+                ck("★ ⑤m `write_state` 落盘的内容可被 `json.load` 完整读回",
+                   _got == {"round": 7, "phase": "idle"}, f"读到 {_got!r}")
+                # ⑤n ★★ 目录里**没有**残留临时文件
+                _left = sorted(p.name for p in pathlib.Path(_td).iterdir()
+                               if p.name != ".drive-loop.state")
+                ck("★★ ⑤n 写成功后目录里**没有**残留临时文件（否则哨兵会报未知文件）",
+                   _left == [], f"残留 {_left!r}")
+                # ⑤o ★★ 临时名是 `<原名>.tmp` —— 这是**两个守卫唯一同时满足**的写法
+                #   （哨兵要求不匹配 `.state$`，chk58 的反向判据也要求不匹配）
+                #   ★★ 判据**必须是"真去写一次、看目录里实际出现什么名字"** ——
+                #     第一版只比对了字符串常量，于是把实现改成 `with_suffix(".tmp.state")`
+                #     它**照样过**（实测：一条恒真的假断言）。教训同 ERR-AI 那一族：
+                #     **断言要落在被测对象的行为上，不落在它自己声明的常量上。**
+                _seen = []
+                _sf2 = pathlib.Path(_td) / ".drive-loop.state"
+                _orig2 = _DL.STATE_FILE
+                _real_replace = _DL.os.replace
+
+                def _spy(a, b):
+                    _seen.append(pathlib.Path(a).name)
+                    return _real_replace(a, b)
+
+                _DL.STATE_FILE = _sf2
+                _DL.os.replace = _spy
+                try:
+                    _ws({"round": 8})
+                finally:
+                    _DL.os.replace = _real_replace
+                    _DL.STATE_FILE = _orig2
+                ck("★★ ⑤o 真写一次：`os.replace` 的源名是 `.drive-loop.state.tmp`",
+                   _seen == [".drive-loop.state.tmp"],
+                   f"实际源名 {_seen!r}")
+            finally:
+                _DL.STATE_FILE = _orig
+
+            # ⑤p ★ 失败路径：写临时文件就抛 ⇒ **不许**抛出去（契约：不拖垮批次）
+            #     且不许留下垃圾
+            _orig_ws = _DL.STATE_FILE
+            _DL.STATE_FILE = pathlib.Path(_td) / "sub" / "nonexistent" / ".drive-loop.state"
+            try:
+                _raised = None
+                try:
+                    _ws({"round": 1})
+                except Exception as e:                 # noqa: BLE001
+                    _raised = e
+                ck("★ ⑤p 写失败时**不抛**（通知/状态是附属功能，绝不能拖垮跑批）",
+                   _raised is None, repr(_raised))
+            finally:
+                _DL.STATE_FILE = _orig_ws
+
+# ⑤q ★★ 哨兵对临时名**显式登记**（不是靠通配糊过去）
+_DRIFT = REPO / "scripts" / "diag" / "check-deploy-drift.py"
+_DRIFT_SRC = _DRIFT.read_text(encoding="utf-8") if _DRIFT.is_file() else ""
+ck("★★ ⑤q 哨兵的 KNOWN_NAS 显式登记了 `.state.tmp` 临时名",
+   r"\.[^/]+\.state\.tmp$" in _DRIFT_SRC,
+   "临时名没登记 ⇒ 哨兵若正好扫在 os.replace 之前会误报未知文件")
+
 
 # ==========================================================================
 print("\n=== ⑥ deploy.sh：新脚本收进白名单 ===")
