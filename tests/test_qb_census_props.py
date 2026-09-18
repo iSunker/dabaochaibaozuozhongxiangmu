@@ -37,7 +37,7 @@ import sys
 import tempfile
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
-SUBJECT = REPO / "scripts" / "qb-census-savepath.py"
+SUBJECT = REPO / "scripts" / "diag" / "qb-census-savepath.py"
 
 try:
     sys.stdout.reconfigure(encoding="utf-8")   # GBK 控制台会炸（tests/README.md）

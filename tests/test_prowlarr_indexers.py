@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""`scripts/prowlarr-indexers.py` —— 「只取白名单」这条硬口径的守卫。
+"""`scripts/diag/prowlarr-indexers.py` —— 「只取白名单」这条硬口径的守卫。
 
 为什么值得单独立一个测试文件
 ----------------------------
@@ -32,7 +32,7 @@ except Exception:  # noqa: BLE001
     pass
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
-TARGET = REPO / "scripts" / "prowlarr-indexers.py"
+TARGET = REPO / "scripts" / "diag" / "prowlarr-indexers.py"
 
 
 def _load():

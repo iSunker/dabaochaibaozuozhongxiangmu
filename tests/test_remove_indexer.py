@@ -15,7 +15,7 @@ except Exception:
     pass
 
 REPO = pathlib.Path(__file__).resolve().parent.parent  # 仓库根
-SCRIPT = str(REPO / "scripts" / "add-torznab-indexer.py")
+SCRIPT = str(REPO / "scripts" / "diag" / "add-torznab-indexer.py")
 # ★ 落在系统临时目录、每轮一个全新的（原先钉死 D:/tmp/envtest，
 #   上一轮遗留的样本会串味到下一轮）。
 TMP = pathlib.Path(tempfile.mkdtemp(prefix="reseed-envtest-"))

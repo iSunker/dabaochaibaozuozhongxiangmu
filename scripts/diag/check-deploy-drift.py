@@ -68,7 +68,11 @@ for _s in (sys.stdout, sys.stderr):
     except Exception:
         pass
 
-REPO = pathlib.Path(__file__).resolve().parent.parent
+# ★ 2026-09-18：本脚本从 `scripts/` 搬进 `scripts/diag/` ⇒ 多一层，`parent.parent`
+#   会指到 `scripts/` 而不是仓库根，于是 `deploy.sh` 找不到、整个哨兵 rc=2。
+#   ★ 判据是**它自己的输出**（「找不到 …/scripts/deploy.sh」）—— 这件事**没有测试守**，
+#     而它坏起来的样子是"哨兵直接罢工"，比它该报的漂移更响。
+REPO = pathlib.Path(__file__).resolve().parent.parent.parent
 DEPLOY = REPO / "deploy.sh"
 
 # ★ 严重度：杂物里有一类**不是噪音**，是「形似凭据泄漏」—— NAS 上躺着一份 `.env`
@@ -103,6 +107,18 @@ KNOWN_NAS = [
     (r"^drive-loop/attempts\.log$",               "批次台账（NAS 上追加写）"),
     (r"^drive-loop/scripts/drive-loop\.log$",     "驱动日志"),
     (r"^drive-loop/scripts/\.[^/]+\.state$",      "心跳 / --once 闸门 / 巡检状态"),
+    # ★★ 2026-09-18 加：`write_state()` 的**原子写临时文件**。
+    #   写成 `<原名>.tmp`（`.drive-loop.state.tmp`）⇒ 上面那条（要求 `.state` 结尾）
+    #   **匹配不到**，于是「扫的那一刻正赶上 os.replace 之前」就会被报成未知文件。
+    #   ★ 这个窗口是**微秒级**，但哨兵是**手工跑**的 —— 撞上会有噪音，而噪音会教人
+    #     忽略哨兵（这个文件自己的注释里已经吃过一次同形的亏，见下面 `notify/spool/`）。
+    #   ★ 为什么**不**把临时名改成 `.drive-loop.tmp.state`（那样上一行就匹配了）：
+    #     `chk58.sh` 的 `[3]` 段有条**反向**判据 —— 要求「`.state` 结尾」且**不在**
+    #     六件白名单里就报「清单该更新了」。改成 `.tmp.state` 会**从那边**被报出来。
+    #     ⇒ 两个守卫方向相反，**只有 `<原名>.tmp` 同时满足**（实测跑过两边）。
+    #   ★ 不写成通配（如 `\.state\.tmp$` 之外的宽规则）：宽规则会把将来**任何**
+    #     叫 `*.tmp` 的东西都放行，那等于在哨兵上开一个静默口。
+    (r"^drive-loop/scripts/\.[^/]+\.state\.tmp$", "★ 状态文件的原子写临时文件（微秒级存活）"),
     (r"^hlink/\.reseed_farm\.manifest\.tsv.*",    "农场清单及其名字侧写"),
     (r"^notify/notify\.conf$",                    "含收件人邮箱"),
     (r"^notify/archive/",                         "已发出的通知归档"),
@@ -162,41 +178,54 @@ LOCAL_ONLY = [
     #   往那里写东西会触发 ERR-FS-03 的 ENOSPC 级联。
     #   ★ 它读的是 NAS **原生路径**（/volume1），所以**只能在 NAS 上跑**；
     #   从 Windows 跑只会得到"路径不存在"（正是 §26.7 那条"SMB 视图 ≠ NAS 视图"）。
-    (r"^scripts/chk-volume1-free\.sh$",           "卷水位判据（在 **NAS** 上跑；只读 df/btrfs，零写操作、不落盘、不碰凭据；一次性诊断件）"),
-    (r"^scripts/check-deploy-drift\.py$",         "本哨兵（在 Windows 上跑）"),
-    (r"^scripts/scan-secrets\.py$",               "推前凭据扫描（在 Windows 上跑；读本地 .env，但绝不打印命中到的值）"),
-    (r"^scripts/audit-found-lines\.py$",          "对账 a−b（在 Windows 上跑；只读 NAS 的 info.current.log，不碰库）"),
-    (r"^scripts/audit-found-resolve\.py$",        "对账 b−c（在 Windows 上跑；UNC 直读 state.db，query_only 硬闸，绝不写）"),
-    (r"^scripts/torznab-probe\.py$",              "手搜探针（在 Windows 上跑；读 NAS .env 的 TORZNAB_URLS 但**绝不回显**，只发一次 Torznab 查询）"),
+    (r"^scripts/diag/chk-volume1-free\.sh$",           "卷水位判据（在 **NAS** 上跑；只读 df/btrfs，零写操作、不落盘、不碰凭据；一次性诊断件）"),
+    (r"^scripts/diag/check-deploy-drift\.py$",         "本哨兵（在 Windows 上跑）"),
+    (r"^scripts/diag/scan-secrets\.py$",               "推前凭据扫描（在 Windows 上跑；读本地 .env，但绝不打印命中到的值）"),
+    (r"^scripts/diag/audit-found-lines\.py$",          "对账 a−b（在 Windows 上跑；只读 NAS 的 info.current.log，不碰库）"),
+    (r"^scripts/diag/audit-found-resolve\.py$",        "对账 b−c（在 Windows 上跑；UNC 直读 state.db，query_only 硬闸，绝不写）"),
+    (r"^scripts/diag/torznab-probe\.py$",              "手搜探针（在 Windows 上跑；读 NAS .env 的 TORZNAB_URLS 但**绝不回显**，只发一次 Torznab 查询）"),
     # ★ 2026-09-13：qB 落点普查。它和上面那条是**同一形状** —— 都读本地 .env 的凭据
     #   去连 NAS 上的服务，且都**只打聚合**（这条打的是 count / tag 名 / 路径前 4 段，
     #   绝不打 torrent 名、tracker、content_path）。
     #   ⇒ 判据是「**只读 + 不回显凭据 + 不打印可识别内容**」这三条同时成立，
     #     不是「它碰没碰凭据」—— 后者会把所有有用的诊断工具都挡在门外。
-    (r"^scripts/qb-census-savepath\.py$",         "qB 落点普查（在 Windows 上跑；读本地 .env 的账号口令登录，只打聚合计数与路径前 N 段）"),
+    (r"^scripts/diag/qb-census-savepath\.py$",         "qB 落点普查（在 Windows 上跑；读本地 .env 的账号口令登录，只打聚合计数与路径前 N 段）"),
     # ★ 2026-09-13：链接守护的诊断端。与上面 qb-census 那条是**同一形状**
     #   （只读 + 不回显凭据 + 只打聚合），判据也一样。它比那条更严一点：
     #   默**只出 hash 前 12 位**，发布名要 `--show-names` 才出（名字里有站点与
     #   发布名，不该随随便便进日志）。它读的是 NAS 上 drive-loop 写的
     #   `.linkguard.state`，**只读不写**。
-    (r"^scripts/crossseed-linkguard\.py$",        "链接守护诊断（在 Windows 上跑；读 NAS 的 .linkguard.state + 只读问一次 qB，默认只出 hash）"),
+    (r"^scripts/diag/crossseed-linkguard\.py$",        "链接守护诊断（在 Windows 上跑；读 NAS 的 .linkguard.state + 只读问一次 qB，默认只出 hash）"),
+    # ★ 2026-09-18：「装不出来 / 没 peer」的诊断端。与上面 `crossseed-linkguard.py`
+    #   是**同一形状**（只读 + 不回显凭据 + 只打聚合），判据也一样。几点更严/不同：
+    #   · **无凭据**：只发 `Referer` 头、不发 cookie/口令（同 `wait-for-checks.py`），
+    #     比 linkguard 那条（会登录）还窄一档；
+    #   · 它不读状态文件的内容（除了那一个**计数**），判据是**现算**的 ——
+    #     因为要回答的问题是"此刻到底是哪几条"，而不是"昨天记了什么"；
+    #   · 默认**只打聚合**；要具体条目必须显式 `--show-hashes`，且只出 12 位短
+    #     hash + save_path 末段（照 linkguard 的 `release_of`），**不打** torrent
+    #     名 / tracker / content_path；
+    #   · ★ **零写操作**（不写文件、不动 qB），且**故意不提供**任何 `--pause` /
+    #     `--tag` / `--delete` —— 用户 2026-09-18 拍板只做「识别 + 通知」，
+    #     少一个开关就少一次将来被顺手用上的机会。
+    (r"^scripts/diag/reseed-freeze-report\.py$",       "「装不出来/没 peer」诊断（在 Windows 上跑；无凭据只发 Referer、只读 GET、默认只打聚合、零写操作、无任何处置开关）"),
     # ★ 2026-09-14：`ERR-SVC-17` 的 ② 机制探针。与上面两条是**同一形状**
     #   （只读 + 不回显凭据 + 只打白名单字段），判据也一样。它替换掉的是
     #   `ENVIRONMENT.md` 早先那条**把 key 摆在命令行上**的裸 curl ——
     #   那条除了漏凭据，返回的裸 JSON 还得人肉把 indexerId 对到站名。
     #   key 从生产 .env 读；**不调 `/api/v1/indexer`**（那个响应带 fields：cookie/passkey）；
     #   站名只从 cross-seed.db 取 id/name 两列（url/apikey 那两列带凭据）。
-    (r"^scripts/prowlarr-indexerstatus\.py$",     "Prowlarr 本地禁用探针（在 Windows 上跑；读 NAS .env 的 key 但绝不打印、只打白名单字段）"),
+    (r"^scripts/diag/prowlarr-indexerstatus\.py$",     "Prowlarr 本地禁用探针（在 Windows 上跑；读 NAS .env 的 key 但绝不打印、只打白名单字段）"),
     # ★ 2026-09-15：#109（Prowlarr key 轮换）的前置探针。与上面那条是**同一形状**
     #   （只读 + 不回显凭据 + 只打白名单字段）。
     #   它多守一条**阴性对照**：验 key 时同时发「假 key」与「不带 key」两组，
     #   否则端点要是压根不校验，那个 200 什么也证明不了。
     #   只用 `t=caps`（Prowlarr 本地定义回答，**不打 PT 站**）—— 所以站点退避时也能跑。
-    (r"^scripts/torznab-keycheck\.py$",           "Torznab key 有效性探针（在 Windows 上跑；读 NAS .env 的 key 但绝不打印，带阴性对照，只发 t=caps）"),
+    (r"^scripts/diag/torznab-keycheck\.py$",           "Torznab key 有效性探针（在 Windows 上跑；读 NAS .env 的 key 但绝不打印，带阴性对照，只发 t=caps）"),
     # ★ 2026-09-14：群晖 Storage Analyzer 报告的只读读者。只读、无凭据（走 SMB 读报告目录），
     #   而且 zip 是**内存里**解、不落盘。它存在的理由是**留一句否定结论的证据**：
     #   「报告里没有可用空间」这个结论决定了一条待办（见 README 的 #77）。
-    (r"^scripts/sa-volume-usage\.py$",            "只读群晖 Storage Analyzer 报告（在 Windows 上跑；内存解 zip、不落盘、无凭据）"),
+    (r"^scripts/diag/sa-volume-usage\.py$",            "只读群晖 Storage Analyzer 报告（在 Windows 上跑；内存解 zip、不落盘、无凭据）"),
     # ★ 2026-09-13：#58「drive-loop 迁容器」的草案，**故意不进白名单**。
     #   它与 scripts/drive-loop-nas.sh 是同一层的东西（NAS 侧入口），差别只在
     #   后者**已经**在生产跑、前者还没有。白名单的语义是「两边必须一致」——
@@ -206,9 +235,9 @@ LOCAL_ONLY = [
     #   **先验，后进白名单**。验通过后的正确做法不是删掉这一行、而是：
     #   把它加进 deploy.sh 的 FILES，**并从本清单里移除**（两处必须同时改，
     #   只改一处就会被 B 方向当场报出来 —— 这正是这份清单存在的意义）。
-    (r"^scripts/drive-loop-docker\.sh$",          "**已作废**（#58 的 docker run 草案）—— 取代它的是 compose.yaml 里的 drive-loop 服务；保留为推导记录（挂载清单 + 三条容器方言），**不部署**"),
+    (r"^scripts/diag/drive-loop-docker\.sh$",          "**已作废**（#58 的 docker run 草案）—— 取代它的是 compose.yaml 里的 drive-loop 服务；保留为推导记录（挂载清单 + 三条容器方言），**不部署**"),
     (r"^prowlarr/\.gitkeep$",                     "占位符；生产的 prowlarr/ 是**不许碰**的"),
-    (r"^scripts/(add-indexers|add-torznab-indexer|check-indexer-timestamps"
+    (r"^scripts/diag/(add-indexers|add-torznab-indexer|check-indexer-timestamps"
      r"|gen-datadirs|gen-nas-env-update|migrate-reseed-dirs|run-batch|wait-for-checks)"
      r"\.(py|sh)$",                               "在 Windows 上跑的工具/生成器（对着 NAS 的端口或 UNC 干活）"),
     # ==========================================================================
@@ -221,24 +250,24 @@ LOCAL_ONLY = [
     #   ★ 只取**白名单三字段**（id/name/enable）—— 那个响应每条都带 `fields`
     #     （cookie/passkey），所以「取白名单」而不是「排除 fields」才是它的全部理由：
     #     黑名单挡不住 Prowlarr 将来新加的字段。
-    (r"^scripts/prowlarr-indexers\.py$",         "只读列 Prowlarr 索引器 id/name/enable（在 Windows 上跑；只取白名单三字段）"),
+    (r"^scripts/diag/prowlarr-indexers\.py$",         "只读列 Prowlarr 索引器 id/name/enable（在 Windows 上跑；只取白名单三字段）"),
     # #109 的写工具：换 NAS .env 里那条 key（PROWLARR_API_KEY + TORZNAB_URLS）。
     #   ★ 它是**写**工具，与上面几条「只读」不同 —— 但**仍在 Windows 上对着生产干活**：
     #     NAS 没有 SSH，所以「改 NAS 文件」只能在 Windows 做（同 scan-secrets.py 的形状）。
     #   安全闸：默认 dry-run、只改那两行、其余逐字节不动、写前备份、原子写；
     #   key **从文件读**（不走命令行 —— 会进 shell 历史与进程表）。
-    (r"^scripts/rotate-prowlarr-key\.py$",       "换 .env 的 Prowlarr key（在 Windows 上跑；写工具，默认 dry-run + 备份 + 原子写）"),
+    (r"^scripts/diag/rotate-prowlarr-key\.py$",       "换 .env 的 Prowlarr key（在 Windows 上跑；写工具，默认 dry-run + 备份 + 原子写）"),
     # #109 的写工具：换 cross-seed.db 的 indexer.apikey 列（4 行）。
     #   安全闸：默认 dry-run、先 PRAGMA integrity_check、写前备份、事务写 + 回读核对；
     #   ★ 另有一道**容器闸**（container_state）—— 查 docker inspect 的 State.Status，
     #     **unknown 一律不放行**（宁可要人确认，也不在"不知道"时写生产库）。
-    (r"^scripts/rotate-crossseed-key\.py$",      "换 cross-seed.db 的 apikey 列（在 Windows 上跑；写工具，含容器闸 unknown 不放行）"),
+    (r"^scripts/diag/rotate-crossseed-key\.py$",      "换 cross-seed.db 的 apikey 列（在 Windows 上跑；写工具，含容器闸 unknown 不放行）"),
     # #58 的挂载自证：三查（硬编码目录 / state.db 里的绝对路径 / .env 前缀）。
     #   ★ **它属于 #58，沿用 `drive-loop-docker.sh` 那条先例**：迁容器的东西**故意不进白名单**。
     #     白名单的语义是「两边必须一致」，现在收进去 ⇒ 下次 deploy.sh --apply 就把它推到生产
     #     ⇒ 制造**假一致**。**先验，后进白名单**（本会话已在本机验过正例+两反例，
     #     但**还没在 NAS 的容器里真跑过** ⇒ 仍不算"验通过"）。
-    (r"^scripts/drive-loop-mount-selfcheck\.sh$","#58 挂载自证（未部署，先验后进白名单；本机验过正例+两反例）"),
+    (r"^scripts/diag/drive-loop-mount-selfcheck\.sh$","#58 挂载自证（未部署，先验后进白名单；本机验过正例+两反例）"),
     # #58 的 **NAS 侧启用前验证**（2026-09-17 重建）。★ 与 `chk-volume1-free.sh` / 挂载自证同族：
     #   在 **NAS 上**跑、只读、不进容器 ⇒ **故意不进白名单**（进白名单 = 下次
     #   `deploy.sh --apply` 就推到生产 = 假一致）。
@@ -248,14 +277,14 @@ LOCAL_ONLY = [
     #     ⇒ 这次的处置**故意反过来**：**入库为长期件**（NAS 侧手跑，与上面两条同一层），
     #       理由就是「判据必须能复原」—— 脚本可以重写，但"该验什么"不能再丢一次。
     #   ★ 本机验过：正例全绿 + 八个反例各自红（见文件头那张自测表）。
-    (r"^scripts/chk58\.sh$",                     "#58 NAS 侧启用前验证（重建；只读、在 NAS 上跑、不进容器 ⇒ 不部署）"),
+    (r"^scripts/diag/chk58\.sh$",                     "#58 NAS 侧启用前验证（重建；只读、在 NAS 上跑、不进容器 ⇒ 不部署）"),
     # #58 的镜像定义。★ 同上面那条：属于**迁容器**的东西，**故意不进白名单**
     #   （进白名单 = 下次 deploy.sh --apply 就推到生产 = 假一致）。
     #   ★ 它还有个**只有它才有的**理由：本仓的 docker build 上下文是**仓库根**，
     #     而 NAS 上的构建上下文是 **compose 目录** —— 两边的相对路径不同，
     #     直接拷过去也 build 不起来（`COPY scripts/…` 在 NAS 上找不到 orchestrator/）。
     #     ⇒ 真要上 NAS，得连构建方式一起设计，不是"加进 FILES"就完事。
-    (r"^scripts/drive-loop\.Dockerfile$",        "#58 镜像定义（未部署；且本仓/NAS 的 build 上下文不同，不能直接拷）"),
+    (r"^scripts/drive-loop\.Dockerfile$",        "#58 镜像定义（未部署；且本仓/NAS 的 build 上下文不同，不能直接拷）。★ 2026-09-18：它**留在 `scripts/` 没进 `diag/`** —— 它是镜像定义不是诊断工具，别跟着那次分区一起挪"),
     # ==========================================================================
     # ★ 2026-09-17 补登记**本来就在库里、却一直没登记**的 —— 哨兵这些天一直红着。
     #   而**「常红」等于「没有哨兵」**：天天红的东西没人看，真报出来的新漂移会被淹掉。

@@ -287,4 +287,4 @@ fi
 
 echo
 echo "OK：已删 $P"
-echo "复核（Windows 侧，只读）： python scripts/check-deploy-drift.py"
+echo "复核（Windows 侧，只读）： python scripts/diag/check-deploy-drift.py"

@@ -31,7 +31,7 @@ except Exception:
     pass
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
-SRC = REPO / "scripts" / "check-deploy-drift.py"
+SRC = REPO / "scripts" / "diag" / "check-deploy-drift.py"
 
 
 def _load():

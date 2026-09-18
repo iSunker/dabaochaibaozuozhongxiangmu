@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""推前凭据扫描器 `scripts/scan-secrets.py` 的**对照** —— 证明它会响，也证明它不乱响。
+"""推前凭据扫描器 `scripts/diag/scan-secrets.py` 的**对照** —— 证明它会响，也证明它不乱响。
 
 一个只报「✓ 0 命中」的闸门是最危险的 —— 它让人以为看过了。所以这里两头都测：
 阳性能不能拦住、假阳性会不会把闸门憋成"次次都红"（那样等于没有闸门）。
@@ -30,7 +30,7 @@ except Exception:
 
 HERE = pathlib.Path(__file__).resolve().parent          # 路径按 __file__ 解析，任一 cwd 都行
 REPO = HERE.parent
-SCANNER = REPO / "scripts" / "scan-secrets.py"
+SCANNER = REPO / "scripts" / "diag" / "scan-secrets.py"
 
 # ---- 合成样本：值全部拼出来，不在源码里留字面量（见文件头 ★②）----
 CRED = "Zq7mNv3Kd9Rt2Wp5Xy8Lb4Jh6Gc1Fs0A"     # 随机形状，**不是 FAKE 开头**（FAKE 会被白名单跳过）

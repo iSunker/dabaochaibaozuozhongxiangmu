@@ -129,7 +129,7 @@ echo "[$(date '+%F %T')] start  py=$PY" >> "$ATTEMPTS"
 #        —— 容器不重建，env_file 的改动不会生效
 #     ③ 确认 cross-seed.db 的 timestamp 表里开始出现该站的行。那是「真的搜
 #        出去了」的硬证据，比翻日志靠谱（失败的搜索不会留下 timestamp 行）
-#        —— 这一步别手敲 SQL：python scripts/check-indexer-timestamps.py \
+#        —— 这一步别手敲 SQL：python scripts/diag/check-indexer-timestamps.py \
 #             --expect <新名单>   （只读；退出 0 = 闸门开。--wait 可等下一批跑完）
 #     ④ 最后才改这一行
 #   ★ 顺序颠倒的代价：站还没通就把名字写进来 → 状态机把片子记成"在那站搜过
@@ -141,7 +141,7 @@ echo "[$(date '+%F %T')] start  py=$PY" >> "$ATTEMPTS"
 # ★ HDtime（Prowlarr id=1）已**于 2026-09-12 17:00 加进名单**。四步全部走完：
 #     ① ✅ 已在 Prowlarr 换新 cookie；`POST /api/v1/indexer/test` 返回 `{}`（= 通过，
 #        失败会回 400 带 errorMessage）。
-#     ② ✅ 已在生产 .env 的 TORZNAB_URLS 加回 `/1/api`（用 scripts/add-torznab-indexer.py
+#     ② ✅ 已在生产 .env 的 TORZNAB_URLS 加回 `/1/api`（用 scripts/diag/add-torznab-indexer.py
 #        —— apikey 从同文件现有条目**原样抄来**，与 PROWLARR_API_KEY 同一个值，
 #        全程没有经过人眼；写回已做字节级校验），并于 16:29 `--force-recreate` 重建容器
 #        —— 启动日志里 `http://prowlarr:9696/1/api failed to respond` 那一条**反而是**
@@ -149,7 +149,7 @@ echo "[$(date '+%F %T')] start  py=$PY" >> "$ATTEMPTS"
 #     ③ ✅ `cross-seed.db` 的 `timestamp` 表里 HDtime **已有 60 行**（本行改动前实测）。
 #        `timestamp` 主键是 (searchee_id, indexer_id) 且**失败的搜索不记行** ——
 #        有行 = 真的发出去并被应答了。复核命令（只读、只打计数与站名）：
-#            python scripts/check-indexer-timestamps.py \
+#            python scripts/diag/check-indexer-timestamps.py \
 #              --expect HDtime,HDFans,NanyangPT,BTSCHOOL
 #        它顺带回答另一个常被问的问题：`indexer.status == RATE_LIMITED` **不代表**
 #        还在被限流 —— 那个字段限流窗口过去后不会被擦掉。真判据是 `retry_after`

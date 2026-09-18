@@ -9,7 +9,7 @@
 所以本文件**不测"数为 0"**，只测"换个输入，数跟着变、且变的方向可预期"。
 
 ★ 三条各自的对账基准（都取自判据之外的**真实记录**，不是照着实现抄的）：
-  ① `count_found_lines`：照 `scripts/audit-found-lines.py` 手工跑出来的口径 ——
+  ① `count_found_lines`：照 `scripts/diag/audit-found-lines.py` 手工跑出来的口径 ——
      L1 那一个字面量会把 `Found 0 torrents for {` 与 `Found N torrent file(s)
      to inject` 一起吃进来（历史实测 2200 vs 靶心 1011），所以**必须**是合取。
   ② `resolve_found_lines`：三包**共用一个 farm_root**（`fix-statedb-farm-root.py`：

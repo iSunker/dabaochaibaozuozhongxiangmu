@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""`scripts/rotate-crossseed-key.py` 的容器闸 —— 钉住它**真的在查**、且**查不出时不放行**。
+"""`scripts/diag/rotate-crossseed-key.py` 的容器闸 —— 钉住它**真的在查**、且**查不出时不放行**。
 
 为什么值得单独钉（2026-09-17 的事故）
 ------------------------------------
@@ -27,7 +27,7 @@ except Exception:  # noqa: BLE001
     pass
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
-TARGET = REPO / "scripts" / "rotate-crossseed-key.py"
+TARGET = REPO / "scripts" / "diag" / "rotate-crossseed-key.py"
 
 
 def _load():

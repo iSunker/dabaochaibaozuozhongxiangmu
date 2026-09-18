@@ -469,7 +469,7 @@ else
     say "下一步（人工确认无误后）——把 cross-seed 的 dataDirs 从 49 条切成农场这一条："
     say "  1) 本地 .env 里把 DATA_DIRS 改成：$FARM"
     say "  2) ★ 同一次改动里把原来那份 49 条清单另存成 FARM_SOURCES=（否则 --verify 从此永远通过）"
-    say "  3) python scripts/gen-nas-env-update.py   （生成新的 nas-update-env.sh）"
+    say "  3) python scripts/diag/gen-nas-env-update.py   （生成新的 nas-update-env.sh）"
     say "  4) 在 NAS 上跑 sh nas-update-env.sh       （改 .env + --force-recreate 容器）"
     say "  5) 验证：drive-loop 日志里「索引器自检」与 searchee 数应与切换前一致"
   fi
