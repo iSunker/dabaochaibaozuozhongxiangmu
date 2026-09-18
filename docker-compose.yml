@@ -343,6 +343,15 @@ services:
   #       确认标存在，再把**实测到的 tag 与 digest 写回这里**。
   #    ★ NAS 能拉镜像（`ghcr.io/flaresolverr/flaresolverr:latest` 成功拉过 12 层，
   #      见 README），所以走 `docker compose` 时它会自动拉，不需要手工 `docker load`。
+  #
+  # ★★★ 2026-09-18 夜：这条链**已在同架构本机替身上端到端验通**（三轮可重复）
+  #   —— 见 SUMMARY §26.16。两个读数留下来给下次用：
+  #     ① 「卡死 → 被接管」的**最坏时延 ≈ 30.7 分钟**
+  #        = 1800s（判 unhealthy，含 interval×retries）+ 30s（AUTOHEAL_INTERVAL）
+  #          + 10s（stop timeout）。★ 这个数此前没人算过 ⇒ 判"够快吗"时有据可依。
+  #     ② ★★ **要复现，别用 `docker pause`**：它会把 healthcheck 的 `exec`
+  #        一起冻住 ⇒ 测的是"healthcheck 也卡了"，**验不出**这条链。
+  #        正确造法：让**应用自己停心跳**（心跳年龄越过阈值即可）。
   # ------------------------------------------------------------------ #
   autoheal:
     image: willfarrell/autoheal:latest
