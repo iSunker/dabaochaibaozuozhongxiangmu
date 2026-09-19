@@ -1273,10 +1273,38 @@ NAS 上还跑着**别人的**容器（IYUU Plus、另一套 qB、opencd），它
   - ❌ **peer 连接**：`transfer/info` 的 `up_speed=0`，且 **2060/2070 条是 `stalledUP`**（无 peer）；
   - ❌ **位图/种子体积**：套件数据多 8.8 倍却更省 ⇒ 体积不是主因；
   - ❌ **缓存参数设大了**：**容器 512 < 套件 4096**（方向相反）。
-- **★★ 一条必须记住的读数陷阱**：**这台机器上 `docker stats` 的 MemUsage 对 qB 低报 2.2 倍**
-  （报 3.984 GiB，真值 8.82 GiB）。⇒ 判内存**一律用 `/proc/<pid>/status` 的 VmRSS 或
-  cgroup v1 的 `memory/memory.usage_in_bytes`**，**不要用 `docker stats`**。
-  ★ 与 `B.3`（`stat -c %d` 只在 NAS 侧成立）**同族**：**探针有分辨力问题**。
+- **★★ 一条必须记住的读数陷阱（2026-09-19 深夜**勘误**：原先记的"低报 2.2 倍"是**口径错**，不是探针缺陷）**：
+  ★★★ **"`docker stats` 低报 2.2 倍"与"`9250040 kB` 到底是多少 GiB"是同一个数字问题的两面，而当初当成了两件事。**
+  实测算术：`9250040 kB ÷ 3.984 GiB = **2.2142**` —— 那个"2.2 倍"**恰好**是一次 `/1024` 归一化的因子。
+  ⇒ 真相是：**两者量的是同一份 RSS，只是单位不同**，不是"一个探针缺了分辨力"。
+  ★★ **本仓的换算先例是自洽的**（`tools/doc-audit/04_probes.py`：`u.free / 2**30` 标成 GiB）
+  ⇒ **GiB = 字节 / 2³⁰**。而 **Linux `/proc/<pid>/status` 的 `VmRSS` 单位 `kB` 就是 KiB**
+  ⇒ `9250040 / 2²⁰ = **8.82 GiB**`，**路径 (A) 成立且正确**。
+  ⇒ ★ **本节"3.33 / 4.47 / 4.21 GiB"与"降 52%"这些数：`VmRSS` 路径的换算无误，可继续引用**；
+  **但"报 3.984 GiB"那一侧未经同一核对 ⇒ 在能同时复读两条命令之前，该并排对照标记为"未复验"。**
+  ⇒ ★★ **判内存仍建议直接用 `/proc/<pid>/status` 的 VmRSS 或
+  cgroup v1 的 `memory/memory.usage_in_bytes`**（理由从"`docker stats` 低报"改为
+  **"少一层单位换算、少一个出错环节"**）；★ **但"不要用 `docker stats`"这个禁令要撤回** ——
+  它**不成立**，且已**误传进 §26 / §30 / SUMMARY** 三处。
+  ★★★ **一条更要紧的、我自己亲踩的坑（与上面同族，且是本条勘误的起因）**：
+  我给出的一条"读 VmRSS"命令**本身是错的**，而它**看不出错**：
+  ```sh
+  pid=$(docker inspect -f '{{.State.Pid}}' qbittorrent-reseed)   # 上面那条失败时 pid 为空
+  awk '/VmRSS/{print $2" "$3}' /proc/$pid/status                 # 退化成 /proc/status
+  ```
+  ⇒ 当 `docker inspect` **失败**（本机实测：`docker` 不在 `iSunker` 的 PATH / 权限不够）
+  时，`pid` 为空 ⇒ `/proc//status` 被展成 **`/proc/status`** ⇒ 它**读的是内核的 `/proc/status`**，
+  实测打出 **`8 kB`** —— ★★ **正是要测的那个字段名（VmRSS），而数值荒谬 1000 倍**。
+  ⇒ **症状形态：不报错、不空输出、字段名对、数值离谱** ⇒ **最像"内存真的降了"。**
+  ★ 规避：**读之前先证明 pid 是真的**（`test -n "$pid"` + `test -d /proc/$pid`），
+  ★ **把裸 `/proc/$pid/status` 换成容器视角的 `/proc/1/status`**（见下"正确读法"）。
+- **★★ 正确读法（2026-09-19 深夜勘误后新增；容器视角，不需要宿主 pid、也不需要 `sudo`）**：
+  ```sh
+  sudo docker exec qbittorrent-reseed sh -c 'grep VmRSS /proc/1/status'
+  #   ↑ PID 1 = 容器的 init ⇒ 宿主 pid 取不到也没关系；**shell 展开在容器内**，
+  #     所以引号必须是单引号（双引号会被宿主机先展开，那正是上面那个坑的形态）。
+  ```
+  ★ **老的内核旁证 `/proc/status` 是宿主内核的**（`8 kB`）⇒ 它**不能**用来判容器内存。
   ★ 顺带：`/sys/fs/cgroup/memory.current` **不存在**（这是 **cgroup v1**）。
 - **触发条件**：把「种子多 ⇒ 内存高」当成必然，**不去做同口径对照**。
 - **规避做法**：★ **先建对照组**（同口径、同一台机器上的另一个 qB 实例），
