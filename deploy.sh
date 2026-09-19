@@ -273,13 +273,55 @@ for p in "${CHANGED[@]}"; do
 done
 trap - EXIT
 
-cat <<MSG
+# ★★★ 2026-09-19：这里原先打的是**一条写死的**"下一步"（`up -d --force-recreate cross-seed`）。
+#   实测害人一次：那次推的是 `orchestrator/crossseed_client.py`，它**归 `reseed-orchestrator`**
+#   （**一次性 CLI**，代码是 `COPY orchestrator/` 进镜像的 ⇒ 要 `build`，`--force-recreate` 不够），
+#   而 `reseed-cross-seed` 是**第三方 Node 镜像，根本不碰它** ⇒ 用户白重启了一次容器。
+#   ★ 根因：**推的是一组文件，而"哪一步让它生效"是逐文件的**（有的进镜像、有的挂载即生效、
+#     有的一次性 CLI 压根没有服务可重启）⇒ 一条**静态文本**冒充**本次的动作**，
+#     与 SUMMARY §28 发现三同形：**两个说法都对，只是量的不是同一样东西**。
+#   ⇒ 改成**按本次实际推到的文件分类**，各报各的生效方式；拿不准就明说"未归类"，别猜。
+_need_build=(); _need_recreate=(); _need_nothing=(); _unknown=()
+for p in "${CHANGED[@]}"; do
+  d="${p##*::}"
+  case "$d" in
+    orchestrator/*)                       _need_build+=("$d") ;;
+    cross-seed/*)                         _need_nothing+=("$d") ;;
+    *.env|*.env.example|compose.yml|compose.yaml) _need_recreate+=("$d") ;;
+    drive-loop/*|*.sh|hlink/*)            _need_nothing+=("$d") ;;
+    *)                                    _unknown+=("$d") ;;
+  esac
+done
 
-✓ 同步完成。备份: .deploy-backup/$STAMP  （回滚: bash deploy.sh --rollback）
-
-下一步在 NAS 上执行：
-  cd /volume2/docker_ssd/prowlarr_cross-seed_autohardlink
-  sudo docker compose config --quiet && echo 'YAML OK'
-  sudo docker compose up -d --force-recreate cross-seed
-  sudo docker compose logs --tail=60 cross-seed
-MSG
+echo
+echo "✓ 同步完成。备份: .deploy-backup/$STAMP  （回滚: bash deploy.sh --rollback）"
+echo
+echo "下一步 —— ★ 按**本次实际推到的文件**分类，别照抄（每一类生效方式不同）："
+echo
+if (( ${#_need_build[@]} )); then
+  echo "  [A] 进镜像 ⇒ **必须 build**（--force-recreate 不够）："
+  for d in "${_need_build[@]}"; do echo "        $d"; done
+  echo "        sudo docker compose build reseed-orchestrator"
+  echo
+fi
+if (( ${#_need_recreate[@]} )); then
+  echo "  [B] compose / .env ⇒ 需重建容器："
+  for d in "${_need_recreate[@]}"; do echo "        $d"; done
+  echo "        sudo docker compose config --quiet && echo 'YAML OK'"
+  echo "        sudo docker compose up -d --force-recreate <受影响的服务>"
+  echo
+fi
+if (( ${#_need_nothing[@]} )); then
+  echo "  [C] 挂载 / 脚本 / 配置 ⇒ **推完即生效**，无需重启："
+  for d in "${_need_nothing[@]}"; do echo "        $d"; done
+  echo
+fi
+if (( ${#_unknown[@]} )); then
+  echo "  [D] ⚠ **未归类**（本脚本不知道它归哪个服务生效）—— 请自行确认再动手："
+  for d in "${_unknown[@]}"; do echo "        $d"; done
+  echo "        ★ 判据：先 grep 它的 import 方 / 谁读它，再决定。**别直接照抄 A/B。**"
+  echo
+fi
+echo "  ★ 一般性复核（只读、随时可跑）："
+echo "        cd /volume2/docker_ssd/prowlarr_cross-seed_autohardlink"
+echo "        sudo docker compose ps"

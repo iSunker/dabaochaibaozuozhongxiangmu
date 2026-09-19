@@ -147,6 +147,93 @@ for _need in ("HttpClient", "HttpError", "Response"):
        _need in _imported, f"已 import: {sorted(_imported)}")
 
 print()
+print("=== ③ ★★ `ping()` 的判据：**拿到应答 = 活着**，不是「根路径返回 2xx」 ===")
+#   ★★★ 这组守的是 2026-09-19 修的一处**恒假观测**：
+#     `preflight` 长期报 `[??] cross-seed 暂不可达`，而同刻日志写着
+#     `cross-seed 返回 HTTP 404 @ http://cross-seed:2468`。
+#     ⇒ 404 与"连不上"**不是一回事**，而原实现按 `response.ok`（= 2xx）判活 ⇒ **恒判 False**。
+#     ★ 根因（读 cross-seed v6.13.7 源码）：它的 HTTP 面**只有 `/api/webhook` 一条路由**，
+#       根路径 `/` **本来就 404**，且"路由在、方法不对"回 **405**。
+#     ★ 与 `tests/README.md` 那条同族：**判据要能被证无用** ——
+#       一个永远返回 False 的探活，和"服务真的挂了"长得一模一样。
+
+class _FakeResp:
+    def __init__(self, status: int):
+        self.status = status
+        self.body = b""
+        self.headers: dict = {}
+
+    @property
+    def ok(self) -> bool:                 # ★ 与 orchestrator/http.py 同义（2xx）
+        return 200 <= self.status < 300
+
+
+def _ping_with(status: int | None):
+    """把 `_cs.http.get` 换成返回指定状态码的假实现；status=None ⇒ 抛 HttpError。"""
+    from orchestrator.http import HttpError as _HE
+
+    def _fake_get(_url, **_kw):
+        if status is None:
+            raise _HE("connection refused")
+        return _FakeResp(status)
+
+    _cs.http.get = _fake_get
+    return _cs.ping()
+
+
+def _ping_strict(status: int | None):
+    """同上，但走 `strict=True`（旧语义）。"""
+    from orchestrator.http import HttpError as _HE
+
+    def _fake_get(_url, **_kw):
+        if status is None:
+            raise _HE("connection refused")
+        return _FakeResp(status)
+
+    _cs.http.get = _fake_get
+    return _cs.ping(strict=True)
+
+
+# ---- ③a ★★ 关键判据：404 **算活着**（这就是那个恒假观测的修复）----
+ck("★ 404 ⇒ **活着**（根路径无路由是 cross-seed 的正常应答）", _ping_with(404) is True)
+# ---- ③b 405 同理（路由在、方法不对）----
+ck("★ 405 ⇒ **活着**（路由在、方法不对）", _ping_with(405) is True)
+# ---- ③c 2xx 当然活着 ----
+ck("200 ⇒ 活着", _ping_with(200) is True)
+# ---- ③d ★ 真不可达（拿不到应答）⇒ False ----
+ck("★ HttpError（连接被拒/超时/DNS 失败）⇒ 不可达", _ping_with(None) is False)
+
+# ---- ③e ★★★ 阴性对照：**旧实现**（按 2xx 判活）在 404 上会判死 ----
+#   ★ 为什么必须有这条：③a 若只是"我写了个新函数"就没有分辨力
+#     —— 它要能证明"改动前后结论不同"，否则这条判据等于没钉住任何东西。
+def _old_ping(status: int) -> bool:
+    """复刻**改动前**的实现：按 `response.ok` 判活。"""
+    return _FakeResp(status).ok
+
+ck("★★ 阴性对照：**旧实现**在 404 上判 False（⇒ preflight 恒报不可达）",
+   _old_ping(404) is False)
+ck("★★ 且旧实现在 200 上判 True（⇒ 说明差异**只在 404 这一档**，不是全错）",
+   _old_ping(200) is True)
+#   前提：上面两条对照**得分得出不同结论**，否则本段是自说自话。
+ck("前提：新实现在 404 上 True、旧实现在 404 上 False（**结论确实相反**）",
+   _ping_with(404) is True and _old_ping(404) is False)
+
+# ---- ③f ★ `strict=True` 保留旧语义（供对照/兼容，**不得用于 preflight**）----
+ck("★ `strict=True` 在 404 上判 False（旧语义仍可达，便于对照）",
+   _ping_strict(404) is False)
+
+# ---- ③g ★ 反向：`preflight` 必须**不带** strict（否则修复被绕过）----
+_main = (REPO / "orchestrator" / "main.py").read_text(encoding="utf-8")
+_tree2 = ast.parse(_main)
+_ping_calls = [n for n in ast.walk(_tree2)
+               if isinstance(n, ast.Call)
+               and isinstance(n.func, ast.Attribute) and n.func.attr == "ping"]
+ck("前提：`preflight` 里确实调了一次 `ping()`（否则下面那条恒真）",
+   len(_ping_calls) == 1, f"找到 {len(_ping_calls)} 处")
+ck("★★ 那一次调用**没有**传 `strict=True`（带上的话修复等于没做）",
+   all(not any(k.arg == "strict" for k in c.keywords) for c in _ping_calls))
+
+print()
 if _bad:
     print(f"!!! {_bad} 个失败 / {_ok + _bad} 条")
     sys.exit(1)
