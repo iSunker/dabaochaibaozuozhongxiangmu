@@ -718,8 +718,7 @@ do_digest() {
     # ★ 求和一档的判据是「**键在不在**」，不是「值等不等于 0」—— 与 #63/#64 同一
     #   形状：`ok=0` 是真读数，「这行没有 ok 键」是另一回事，当成 0 就是假读数。
     printf '最近两次运行窗口\n'
-    printf '%s\n' "$_lines" | grep '	batch	' | awk -F'\t' -v n_alert="${_alerts:-0}" '
-      function kvget(s, k,   n, i, p, a) {
+    printf '%s\n' "$_lines" | grep '	batch	' | awk -F'\t' -v n_alert="${_alerts:-0}" '      function kvget(s, k,   n, i, p, a) {
         n = split(s, a, " ")
         for (i = 1; i <= n; i++) {
           p = index(a[i], "=")
@@ -735,10 +734,10 @@ do_digest() {
         v = kvget($4, "backoff_hits");  if (v != "") bh += v
       }
       END {
-        printf "  本批运行 : %d 批（ok=0 的 %d 批 / 新增做种 %d / 退避 %d 次）\n",
+        printf "  本批运行 : %d 批（其中 %d 批零产出 / 新增做种 %d / 退避 %d 次）\n",
                n, zero, ns, bh
         if (other > 0)
-          printf "  非本批   : %d 条（kind=batch 但无 pack= 键：台账 / 无待搜，未计入上面的批次）\n",
+          printf "  未计批次 : %d 条（属台账/无待搜，不是真跑批；故未计入上面的批次数）\n",
                  other
         printf "  告警     : %s\n\n", n_alert
       }'
@@ -785,9 +784,9 @@ do_digest() {
       END {
         for (i = 1; i <= m; i++) {
           p = order[i]
-          printf "  %-18s %2d 批  ok合计 %4d", p, n[p], ok[p]
+          printf "  %-18s %2d 批  成功合计 %4d", p, n[p], ok[p]
           if (ns[p]   > 0) printf "  新增做种 %d", ns[p]
-          if (fail[p] > 0) printf "  ★failed %d",  fail[p]
+          if (fail[p] > 0) printf "  ★失败 %d",  fail[p]
           if (bh[p]   > 0) printf "  退避 %d",      bh[p]
           printf "\n"
         }
@@ -827,15 +826,31 @@ do_digest() {
           return v "%"
         }
         {
-          printf "  日期   %s\n", g("day")
-          printf "  额度   iyuu=%s fa=%s fb=%s fd=%s unclaimed=%s\n",
+          # ★★ 2026-09-20：**键名中文化**（用户报「还有能用中文代替的就用中文代替」）。
+          #   改的**只有标签**，**读数一字不动** —— 判据见 `tests/test_notify_digest.py`
+          #   ⑥ 段（同一份输入，改前改后各数字逐字相同）。
+          # ★ 术语对照（这些字母键的出处，别凭印象改）：
+          #   fa = 当天日志里**形状数**（合取字面量命中）· fb = 其中**正则解析成功**数
+          #        · fd = 两者之差（期望 0）—— 见 `orchestrator/state.py:count_found_lines`
+          #   unclaimed = 农场里**没人认领**的 searchee 数
+          #   qb_total = 该 qB 总种子数（★ 含**别人的**，见 `A.4`）
+          #   qb_999  = 「卡 999」= 进度 ≥99% 却仍未完成的停滞种子（`QB_999_MIN_PROGRESS`）
+          # ★★ `999` **是术语的一部分，不许改写成 `99%`** —— 2026-09-20 我第一版写成
+          #   「卡99%未完成」，**读数序列对照**当场发现数字 `999` 消失（`3` 还在，但**显示的数变了**）
+          #   ⇒ 那是**改标签改到了数值**。判据：**术语里的数字也算读数**，中文化不许碰它。
+          #   （这条是 `tests/test_notify_digest.py` ⑥ 段"数字逐字相同"抓出来的 —— 肉眼看不出来。）
+          #   packs_unreg/undriven = **已登记未驱动** / 未登记（声明点对账）
+          #   fz = 装不出来的单种 · lg_* = 链接守护（changed/added/removed/files/inflight）
+          printf "  日期        %s\n", g("day")
+          printf "  站点额度    IYUU=%s  ·  对账 形状=%s 解析=%s 差=%s  ·  农场无人认领=%s\n",
                  g("iyuu"), g("fa"), g("fb"), g("fd"), g("unclaimed")
-          printf "  qB     total=%s 卡999=%s(新 %s) 未登记=%s 未驱动=%s\n",
+          printf "  qB 种子     总计=%s  ·  卡999未完成=%s(新 %s)  ·  包未登记=%s 未驱动=%s\n",
                  g("qb_total"), g("qb_999"), g("qb_999_new"), g("packs_unreg"), g("packs_undriven")
-          printf "  freeze=%s(新 %s/我们 %s)  链接 changed=%s added=%s removed=%s files=%s inflight=%s\n",
-                 g("fz"), g("fz_new"), g("fz_ours"),
+          printf "  停滞单种    装不出来=%s(新 %s/我们 %s)\n",
+                 g("fz"), g("fz_new"), g("fz_ours")
+          printf "  链接守护    改动=%s 新增=%s 移除=%s 文件=%s 在途=%s\n",
                  g("lg_changed"), g("lg_added"), g("lg_removed"), g("lg_files"), g("lg_inflight")
-          printf "  总计   完成度 %s (%s/%s)\n", pctfmt(g("pct")), g("pct_num"), g("pct_den")
+          printf "  总计        完成度 %s (%s/%s)\n", pctfmt(g("pct")), g("pct_num"), g("pct_den")
           # 每个包一行：`prefix:包名=值` 的键按包归拢，值序固定
           m = split($4, a, " ")
           for (i = 1; i <= m; i++) {
@@ -892,15 +907,15 @@ do_digest() {
     _retrying=$(find "$SPOOL" -maxdepth 1 -name '*.tries' 2>/dev/null | wc -l | tr -d ' ')
     _retrying=${_retrying:-0}
     printf '\n── 通知链路 ──\n'
-    printf '发信方式  : %s\n' "${METHOD:-无}"
-    printf 'spool 积压: %s 条告警\n' "$_backlog"
+    printf '发信方式    %s\n' "${METHOD:-无}"
+    printf '待发告警    %s 条\n' "$_backlog"
     if [ "$_backlog" != "0" ]; then
-      printf '  ⚠ 有告警**发不出去**，一直堆在 spool 里 —— 那些告警你没有收到。\n'
-      printf '    跑 sh notify-spool.sh --selftest 看缺什么（多半是 MAIL_TO 没配，\n'
+      printf '  ⚠ 有告警**发不出去**，一直堆在待发队列里 —— 那些告警你没有收到。\n'
+      printf '    跑 sh notify-spool.sh --selftest 看缺什么（多半是收件人 `MAIL_TO` 没配，\n'
       printf '    或任务计划的用户不是 root —— /etc/ssmtp/ssmtp.conf 读不了）。\n'
     fi
     if [ "$_retrying" != "0" ]; then
-      printf '  ⚠ 其中 %s 条**已经在重试**（连续发失败）。到 MAX_SEND_TRIES 就会\n' "$_retrying"
+      printf '  ⚠ 其中 %s 条**已经在重试**（连续发失败）。到 `MAX_SEND_TRIES` 就会\n' "$_retrying"
       printf '    归档并记一条 `[未确认]` 告警 —— **不会无限重发**。\n'
       printf '    ★ 看到这里先去看那趟任务计划的 stdout 被重定向到了哪。\n'
     fi

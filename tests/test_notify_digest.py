@@ -141,7 +141,7 @@ try:
     check("退出码 0", r.returncode == 0, "rc=%s stderr=%s" % (r.returncode, r.stderr.strip()[:200]))
     check("★ 本批运行 : 4 批（不是 5、也不是按 kind 数的 7）", "本批运行 : 4 批" in out,
           [ln for ln in out.splitlines() if "本批运行" in ln])
-    check("   ok=0 的 2 批", "ok=0 的 2 批" in out,
+    check("   其中 2 批零产出", "其中 2 批零产出" in out,
           [ln for ln in out.splitlines() if "本批运行" in ln])
     check("   新增做种 33", "新增做种 33" in out,
           [ln for ln in out.splitlines() if "本批运行" in ln])
@@ -151,15 +151,15 @@ try:
           [ln for ln in out.splitlines() if "告警" in ln][:3])
 
     print("\n── ② ★ 台账与「无待搜」不算批次 ──")
-    check("★ 非本批 : 3 条（两条台账 + 一条无待搜）", "非本批   : 3 条" in out,
-          [ln for ln in out.splitlines() if "非本批" in ln])
+    check("★ 未计批次 : 3 条（两条台账 + 一条无待搜）", "未计批次 : 3 条" in out,
+          [ln for ln in out.splitlines() if "未计批次" in ln])
     check("★ 明细里「每日台账」仍在（#67 不动明细行）", "每日台账" in out)
     check("★ 明细里「全部包已无待搜项」仍在", "全部包已无待搜项" in out)
 
     print("\n── ③ ★★ `packs=` 不是 `pack=`（前缀匹配会多算一批）──")
     check("★ 无待搜那行**没有**被算进批次（否则这里会是 5 批）",
           "本批运行 : 5 批" not in out and "本批运行 : 4 批" in out)
-    check("★★ 也没有被算成一批 ok=0（否则会是 3 批）", "ok=0 的 3 批" not in out)
+    check("★★ 也没有被算成一批零产出（否则会是 3 批）", "其中 3 批零产出" not in out)
 
     # ── ④ ★★ 明细段改为「按包聚合」（2026-09-20，用户报「排版很难看」）──
     #   改前：每批摊 2 行、`metrics` 原样打 ⇒ 23 批 + 2 台账 ≈ 50 行，真信号被埋。
@@ -175,11 +175,11 @@ try:
 
     # ★ 本批四行：frds(22/18/2) dc0816(0/15/1) mbf(0/0/1) dc1139(9/0/2)
     #   ⇒ frds 1 批 ok合计 22；dc-collection **2 批** ok合计 9（0+9）
-    check("★ frds 聚合出 1 批（ok 合计 22）",
-          "1 批  ok合计   22" in out,
+    check("★ frds 聚合出 1 批（成功合计 22）",
+          "1 批  成功合计   22" in out,
           [ln for ln in out.splitlines() if "frds" in ln])
     check("★ dc-collection 聚合出 **2 批**（不是两行）",
-          "2 批  ok合计    9" in out,
+          "2 批  成功合计    9" in out,
           [ln for ln in out.splitlines() if "dc-collection" in ln])
     check("★ 聚合行仍带「新增做种」（按包分列：frds 18 / dc 15）",
           "新增做种 18" in out and "新增做种 15" in out,
@@ -187,8 +187,8 @@ try:
     check("★★ 退避按包合计（frds 2 / dc 1+2=3）",
           "退避 2" in out and "退避 3" in out,
           [ln for ln in out.splitlines() if "退避" in ln])
-    check("★★ 全零 ⇒ `★failed` **不**出现（省略常数项）", "★failed" not in out,
-          [ln for ln in out.splitlines() if "failed" in ln])
+    check("★★ 全零 ⇒ `★失败` **不**出现（省略常数项）", "★失败" not in out,
+          [ln for ln in out.splitlines() if "失败" in ln])
 
     # ★ 台账**仍在**（改的是呈现，不是删掉它）
     check("★ 台账仍出现（#67 那条断言的等价物，改后仍成立）", "每日台账" in out,
@@ -197,16 +197,20 @@ try:
     check("★ 「全部包已无待搜项」仍在（属非本批，不聚合但也不丢）",
           "全部包已无待搜项" in out,
           [ln for ln in out.splitlines() if "无待搜" in ln])
-    check("★ 非本批条数**只报一次**（汇总段已报，明细段不重复）",
-          out.count("非本批") == 1, "出现 %d 次" % out.count("非本批"))
+    check("★ 未计批次条数**只报一次**（汇总段已报，明细段不重复）",
+          out.count("未计批次") == 1, "出现 %d 次" % out.count("未计批次"))
 
     # ★ 旧的两行形（时间 + 缩进 6 空格的整段 metrics）**已不再出现**
     check("★ 旧的「缩进 6 空格 metrics」行形已去掉",
           "\n      pack=frds-top250-2024 ok=22 failed=0 newly_seeding=18" not in out)
     check("★ 旧的「时间 + 标题」明细行形已去掉",
           "\n  2026-09-13 00:00:00  frds-top250-2024 本批完成" not in out)
+    # ★★ 判据要**钉住那一行的形状**，不能只 grep `批次 : ` 这个子串 ——
+    #   2026-09-20 键名中文化后，新行「未计批次 : N 条」**含有**子串 `批次 : `
+    #   ⇒ 旧写法会**假红**（而它想防的"按 kind 数的那个计数"其实早就没了）。
+    #   判据：那一行的**开头**才是它的身份 ⇒ 用**行首**匹配，不用子串。
     check("★ 原来的 `批次 : N` 那行**已去掉**（它按 kind 数，会把台账算进去）",
-          "批次 : " not in out)
+          not [ln for ln in out.splitlines() if ln.startswith("批次 : ")])
 finally:
     lab.cleanup()
 
@@ -220,13 +224,13 @@ try:
         + batch("p2", ok=10, failed=0, newly_seeding=0, still_skipped=0, backoff_hits=0)
     ))
     out = lab.run().stdout
-    check("★★ p1 的 failed 合计 = 1，且**显式出现**", "★failed 1" in out,
+    check("★★ p1 的失败合计 = 1，且**显式出现**", "★失败 1" in out,
           [ln for ln in out.splitlines() if "failed" in ln])
-    check("★ 只有 p1 那行带 `★failed`（p2 干净 ⇒ 不带）",
-          sum(1 for ln in out.splitlines() if "★failed" in ln) == 1,
+    check("★ 只有 p1 那行带 `★失败`（p2 干净 ⇒ 不带）",
+          sum(1 for ln in out.splitlines() if "★失败" in ln) == 1,
           [ln for ln in out.splitlines() if "批  ok合计" in ln])
-    check("★ 异常行仍带正确的 ok 合计（39+40=79）",
-          "2 批  ok合计   79" in out,
+    check("★ 异常行仍带正确的成功合计（39+40=79）",
+          "2 批  成功合计   79" in out,
           [ln for ln in out.splitlines() if "p1" in ln])
 finally:
     lab.cleanup()
@@ -242,7 +246,7 @@ try:
     out = lab.run().stdout
     check("★ 台账段在（按 `day=` 认出来）", "每日台账（分组）" in out)
     check("★ 标量分组：额度 / qB / 链接 三段都在",
-          "额度   iyuu=1133" in out and "qB     total=2063" in out and "链接 changed" in out,
+          "站点额度" in out and "IYUU=1133" in out and "qB 种子" in out and "链接守护" in out,
           [ln for ln in out.splitlines() if "额度" in ln or "qB" in ln])
     check("★ 每包一行（`packpct:包名` 被拆出来）", "包 mbf" in out,
           [ln for ln in out.splitlines() if ln.strip().startswith("包")])
@@ -250,7 +254,7 @@ try:
           "n/a" in out and "n/a%" not in out,
           [ln for ln in out.splitlines() if "n/a" in ln])
     check("★ 缺的键印 `-`（不伪造成 0 —— 与 `ERR-AI-03` 同族）",
-          "fa=-" in out,
+          "形状=-" in out,
           [ln for ln in out.splitlines() if "额度" in ln])
 finally:
     lab.cleanup()
@@ -268,8 +272,8 @@ try:
     out = lab.run().stdout
     check("★ 两批都算进去了（缺 ok= 不影响「是不是一批」）", "本批运行 : 2 批" in out,
           [ln for ln in out.splitlines() if "本批运行" in ln])
-    check("★★ ok=0 的**只有 1 批** —— 缺键的那条不许当 0（当成 0 会是 2）",
-          "ok=0 的 1 批" in out, [ln for ln in out.splitlines() if "本批运行" in ln])
+    check("★★ 零产出的**只有 1 批** —— 缺键的那条不许当 0（当成 0 会是 2）",
+          "其中 1 批零产出" in out, [ln for ln in out.splitlines() if "本批运行" in ln])
     check("★ 缺 backoff_hits 的那条不进退避合计（合计仍是 1）", "退避 1 次" in out,
           [ln for ln in out.splitlines() if "本批运行" in ln])
 finally:
@@ -283,8 +287,8 @@ try:
                                 still_skipped=0, backoff_hits=1))
     r = lab.run()
     check("只有一天也不炸", r.returncode == 0, "rc=%s stderr=%s" % (r.returncode, r.stderr.strip()[:200]))
-    check("  数还是对的", "本批运行 : 1 批" in r.stdout and "ok=0 的 1 批" in r.stdout)
-    check("  没有台账 ⇒ 不出「非本批」那行（不刷 0）", "非本批" not in r.stdout)
+    check("  数还是对的", "本批运行 : 1 批" in r.stdout and "其中 1 批零产出" in r.stdout)
+    check("  没有台账 ⇒ 不出「未计批次」那行（不刷 0）", "未计批次" not in r.stdout)
 finally:
     lab.cleanup()
 
@@ -295,6 +299,56 @@ try:
     check("没有批次也不炸、汇总出 0", r.returncode == 0 and "本批运行 : 0 批" in r.stdout,
           r.stdout[-300:])
     check("  明细处仍打「（无）」", "（无）" in r.stdout)
+finally:
+    lab.cleanup()
+
+# =====================================================================
+print("\n── ⑥b ★★ 中文标签化：**读数逐字不变**（2026-09-20 用户报「排版难看 + 该用中文」）──")
+#   ★ 这条判据的来历：改标签最危险的不是"改错字"，是**把数值一起改了**。
+#    实测（本次）：我第一版把 `卡999` 写成 `卡99%未完成` ⇒ **读数序列对照当场发现 `999` 消失**
+#      （`3` 还在，但**显示的数变了**）—— ★ **肉眼看不出来**，是这一步机械对照抓到的。
+#   ⇒ 判据：**同一份台账输入，改前改后抽出的数字序列必须逐字相同**。
+#     ★ 期望值**写死在这里**（不是从输出反推）—— 取自改动前那版的实测序列。
+EXPECTED_NUMS = [
+    "2026", "09", "20", "1133", "2", "2", "0", "1", "2063", "999", "3", "0", "0", "0",
+    "3", "0", "3", "0", "0", "14", "3744", "3", "99", "517", "522", "95", "74", "78",
+    "74", "115", "250", "2024", "100", "443", "444", "443", "486", "0", "0", "0", "4",
+]
+LEDGER = (
+    row("2026-09-20 00:38:28", "batch", "每日台账",
+        "day=2026-09-20 iyuu=1133 fa=2 fb=2 fd=0 unclaimed=1 qb_total=2063 "
+        "qb_999=3 qb_999_new=0 packs_unreg=0 packs_undriven=0 fz=3 fz_new=0 fz_ours=3 "
+        "lg_changed=0 lg_added=0 lg_removed=14 lg_files=3744 lg_inflight=3 "
+        "pct=99 pct_num=517 pct_den=522 "
+        "packpct:dc-collection=95 packnum:dc-collection=74 packden:dc-collection=78 "
+        "seeding:dc-collection=74 total:dc-collection=115 "
+        "packpct:frds-top250-2024=100 packnum:frds-top250-2024=443 "
+        "packden:frds-top250-2024=444 seeding:frds-top250-2024=443 "
+        "total:frds-top250-2024=486 packpct:mbf=n/a packnum:mbf=0 packden:mbf=0 "
+        "seeding:mbf=0 total:mbf=4")
+)
+lab = Lab()
+try:
+    lab.tsv("2026-09-20", LEDGER)
+    r = lab.run()
+    # ★ 切片**从「日期」那一行开始**、**到「── 心跳 ──」为止**：
+    #   ① 上界不能含时间戳（`00:38:28` 不是台账读数 ⇒ 会得到 48 个而非 41 个，是**切片错**）
+    #   ② 下界**不能靠「告警明细」** —— 这份合成输入**没有告警** ⇒ 那个节不存在，
+    #      切片会一路吃进「心跳」段，把 `最近一次批次记录: …00:38:28` 的时间戳又捞回来。
+    #   ★ 教训同本文件其它几处：**切片边界要挑"必然存在"的锚**，别挑"这次刚好有"的。
+    seg = r.stdout[r.stdout.index("  日期        "):]
+    seg = seg[:seg.index("── 心跳 ──")]
+    import re as _re
+    got = _re.findall(r"\d+", seg)
+    check("★★ 台账段的**数字序列逐字不变**（改标签不许改读数）", got == EXPECTED_NUMS,
+          "期望 %d 个，得到 %d 个；差异：仅旧有 %s / 仅新有 %s"
+          % (len(EXPECTED_NUMS), len(got),
+             [x for x in EXPECTED_NUMS if x not in got],
+             [x for x in got if x not in EXPECTED_NUMS]))
+    # ★ 键名本身**不该再出现在正文里**（它们只该活在源码的 `g("fa")` 这种取值处）
+    naked = [k for k in (" fa=", " fb=", " fd=", "fz=", "lg_", "qb_total=", "unclaimed=")
+             if k in r.stdout]
+    check("★ 正文里不再出现裸术语键（fa=/fb=/fz=/lg_…）", naked == [], naked)
 finally:
     lab.cleanup()
 
