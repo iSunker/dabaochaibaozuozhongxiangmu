@@ -3,7 +3,7 @@
 > **一句话**：`drive-loop` 的调度从 Windows 计划任务搬到了 **NAS 的 DSM 任务计划**。
 > 起因是 Windows 侧批次**静默消失**；查下去发现是**两个独立的原因**，
 > 其中一个是本会话自己改出来的。代码与状态库已就位，
-> **只剩「在 DSM 上建任务」这一件人工操作**（步骤见 README「把调度挂到 NAS 上」）。
+> **只剩「在 DSM 上建任务」这一件人工操作**（步骤见 `ENVIRONMENT.md` `A.18`（原 README「把调度挂到 NAS 上」））。
 
 ### 14.1 症状：批次"跑了，但什么都没发生"
 
@@ -181,7 +181,7 @@ the:      cannot open `the' (No such file or directory)
 
 ### 14.6 下一步（人工）
 
-只剩三件必须你亲手做的事，详见 README「把调度挂到 NAS 上」：
+只剩三件必须你亲手做的事，详见 `ENVIRONMENT.md` `A.18`（原 README「把调度挂到 NAS 上」）：
 
 1. **先停用 Windows 计划任务** `reseed-drive-loop`
    （`schtasks /Change /TN "reseed-drive-loop" /DISABLE`）——
@@ -204,7 +204,7 @@ the:      cannot open `the' (No such file or directory)
 > `from __future__ import annotations` 确实是必需的（去掉会在 import 阶段静默崩）。
 >
 > 万一将来对不上（比如 DS 大版本升级换了 python），症状同样会是「静默」，
-> 按 README「NAS 侧一次性配置」里列的后备方案换解释器即可。
+> 按 `ENVIRONMENT.md` `A.18.1.4`「NAS 侧一次性配置」里列的后备方案换解释器即可。
 
 ### 14.7 ★ 电脑端退役（2026-09-12 下午）—— 从"停用"走到底
 

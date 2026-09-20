@@ -144,7 +144,7 @@ ls //iSunker-DS423/     → 同样这 5 个
 方案要加 `pack_progress(store)`：值 = `movie` 表里每包的「做种 / 总数」，进日报正文 + `metrics`。
 
 **对的部分**（先记下，免得下次重审）：口径选 **A**（`movie` 表 =「我们声明了哪些单片」）
-**选对了** —— 与 README「原理 A：没有「识别」，只有「声明」」一致；而 B（`cross-seed.db` 的 `searchee`）
+**选对了** —— 与 `ENVIRONMENT.md` `A.15.1`「原理 A」一致；而 B（`cross-seed.db` 的 `searchee`）
 跨包共享、要解析归属，贵。★ 而且它有**一条不在方案里的证据**：`register_dirs()` 在生产里
 **只有 `reseed-state.py init` 一个调用点** ⇒ `movie` 的行集确实是「声明」出来的、不漂。
 

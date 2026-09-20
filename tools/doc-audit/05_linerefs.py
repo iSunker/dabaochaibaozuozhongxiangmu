@@ -116,6 +116,29 @@ def count_lines(p: Path) -> int:
         return -1
 
 
+# ★★ **已知失效、但故意不修**的引用 —— 「过程记录不追改」（`A.11`）。
+#
+# 判据：**搬迁走的文件，其行号引用必然越界**，而**正文不该被改写**去迁就行号。
+# 2026-09-20 README 拆分（`94a3d0f`）时实测：README 1788 → 600 行 ⇒
+# 4 处 `README.md:NNNN` 全部越界。但**其中 3 处的文字早已改指符号锚**
+# （`ENVIRONMENT.md A.18.1.4` / `A.19`），**剩下的命中是"改指说明本身"里
+# 为了留证据而抄下的旧行号**，以及 `INDEX-USAGE` 明写的
+# 「过程记录里的话不追改」。⇒ 记进这张表，让它**报出来但不装作是新问题**。
+#
+# ★ 表里每一条都要写清**为什么留着** —— 不静默跳过（同 `B.10` 第 14 条）。
+KNOWN_STALE = {
+
+    ("26-跨会话任务盘面与旧会话清场.md", 806, "README.md:1385"):
+        "迁移注记：为留证据抄下的旧行号，文字已改指 ENVIRONMENT.md A.19",
+    ("26-跨会话任务盘面与旧会话清场.md", 2800, "README.md:1225"):
+        "迁移注记：同上，已改指 A.18.1.4",
+    ("26-跨会话任务盘面与旧会话清场.md", 2803, "README.md:1225"):
+        "迁移注记：同上，已改指 A.18.1.4",
+    ("30-qb内存排查是一个重复推导.md", 25, "README.md:1856"):
+        "迁移注记：同上，已改指 A.18.1.5",
+}
+
+
 def main() -> int:
     OUT.mkdir(parents=True, exist_ok=True)
     idx = build_index(DOCS_ROOT)
@@ -156,21 +179,29 @@ def main() -> int:
             fp.write("\t".join(map(str, r)) + "\n")
 
     bad = [r for r in rows if r[3] != "OK"]
+    known = [r for r in bad if (r[0], r[1], r[2]) in KNOWN_STALE]
+    fresh = [r for r in bad if (r[0], r[1], r[2]) not in KNOWN_STALE]
     print("扫描 %d 份文档，%d 条行号引用" % (len(files), total))
     print("  OK          : %d" % (total - unres - over))
     print("  NO-FILE     : %d   （目标文件不存在）" % unres)
     print("  OVER-EOF    : %d   （行号超出文件总行数）" % over)
+    print("    其中**已知且故意保留**：%d（搬迁注记 / 过程记录不追改）" % len(known))
     print()
-    if bad:
-        print("★ 铁定失效的引用（%d 条）：" % len(bad))
-        for r in bad:
+    if known:
+        print("· 已知失效（**不修**，每条都写清了理由 —— 不静默跳过）：")
+        for r in known:
+            print("    %s:%s  →  %s\n        %s" % (r[0], r[1], r[2], KNOWN_STALE[(r[0], r[1], r[2])]))
+        print()
+    if fresh:
+        print("★ **新出现**的铁定失效（%d 条）—— 这个数才是闸门：" % len(fresh))
+        for r in fresh:
             print("  %s:%s  →  %s   [%s] %s" % (r[0], r[1], r[2], r[3], r[4]))
         print()
         print("★ 修法：**换成符号引用**（按名字/章节锚，不按行号）—— 见本文件头注。")
     else:
-        print("[ok] 无铁定失效的行号引用。")
+        print("[ok] 无**新出现**的铁定失效行号引用。")
     print("→ %s" % (OUT / "linerefs.tsv"))
-    return 1 if bad else 0
+    return 1 if fresh else 0
 
 
 if __name__ == "__main__":

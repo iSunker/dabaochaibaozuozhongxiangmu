@@ -114,3 +114,7 @@ tools/doc-audit/out.baseline-*/
 # deploy.sh 覆盖生产前留下的备份
 .deploy-backup/
   
+# ★ README 拆分（2026-09-20）时 `apply-readme-pointers.py` 留下的**搬迁前快照**。
+#   它是一次性过程产物（旧 README 全文），进去就成第二份"事实源"。
+#   ★ 正文**没有丢**：`git show 94a3d0f:README.md` 随时可取回（也是撤节指针里给读者的那条）。
+.README.md.presplit
