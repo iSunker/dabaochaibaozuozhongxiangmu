@@ -96,7 +96,7 @@ qB recheck **不通过时不报错**，而是**就地重下**那几个 piece。�
 | 从零部署一台 | **部署步骤**（Phase 0→3，每步可独立验证）+ **验证清单** |
 | **动手前：这件事现在允许做吗 / 改动检查过了吗** | **开工前的两道门** ← 动作→允许条件表 + 9 格改动前自检 |
 | 跑起来 / 继续跑 | **`ENVIRONMENT.md` `A.19`** ← 最常用，先看这个 |
-| **新会话开局 / 不了解这台机器** | **`ENVIRONMENT.md`** ← 环境前提 + 按症状 grep 的 `ERR-*` 条目（含全部 20 项技术弯路）|
+| **新会话开局 / 不了解这台机器** | ★ **先读 `CLAUDE.md`（唯一入口：开局三步 + 真源表）** → 再由它引到 **`ENVIRONMENT.md`**（环境前提 + 按症状 grep 的 `ERR-*`，含全部 20 项技术弯路）与 **`summary/26`**（干到哪了）|
 | 我卡住了（报错 / 搜不到 / 不动了） | **常见问题** + **`ENVIRONMENT.md` `A.19.1.9`**（交接必读的坑）→ 该文件的 `ERR-*`（按症状检索）|
 | **想从电脑上手动跑点什么** | **`ENVIRONMENT.md` `A.19.1.8`** ← 电脑只剩诊断用途（**都在 `scripts/diag/`**）：`deploy.sh`（推代码）、`check-deploy-drift.py`（查漂移）、`scan-secrets.py`（推前扫凭据）、`audit-found-*.py`（对账 `Found` 行） |
 | **想知道 NAS 上有没有我不知道的文件** | **`ENVIRONMENT.md` `A.17.1`**（漂移哨兵）← `python scripts/diag/check-deploy-drift.py` |
