@@ -698,8 +698,14 @@ python scripts/reseed-state.py drive --pack $PACK --indexers SiteA,SiteB --limit
 | 包 | 单片单位 | 结构 |
 |---|---|---|
 | `frds-top250-2024` | 一部电影 | ✅ 根目录子目录即发布名 |
-| `my-brilliant-friend-s01-s04` | 一季（S01~S04） | ✅ 根目录子目录即发布名 |
-| DC 合集 | 一部电影 / 一季 | ⚠ 根下多一层中文标签，见下 |
+| `mbf` | 一季（S01~S04） | ✅ 根目录子目录即发布名 |
+| `dc-collection` | 一部电影 / 一季 | ⚠ 根下多一层中文标签，见下 |
+
+> ★ **包名口径（2026-09-20 实测更正）**：上表**以 `state.db` 的 `pack.name` 为准**
+> （`SQLite: SELECT name FROM pack`）—— 实测就是 `dc-collection` / `frds-top250-2024` / `mbf`
+> 三个。★ 本节**曾写 `my-brilliant-friend-s01-s04`**，那是**描述性名字、不是登记名** ⇒ 已改。
+> 与 `drive-loop.py` 的 `PACKS_DEFAULT`（**一处**声明，`= "dc-collection,mbf,frds-top250-2024"`）
+> **逐字一致** —— 两者不一致时**以 `PACKS_DEFAULT` 为准**（那是"谁会被驱动"的真源）。
 
 #### ⚠ 嵌套结构：dataDir 要指到「发布名的那一层」
 
@@ -708,6 +714,42 @@ cross-seed 用**目录名**去站点搜索。若大包根下还有一层分类/�
 
 > 这一段原文还有 `#### 生产 .env 怎么更新` 与 `#### 其它要点` 两小节（**通用做法，未搬**）——
 > 它们仍在 `README.md` 的 `## 扩展` 下。
+
+#### ★★ 怎么**再加一个大包**（2026-09-20 立，三步 + 三个必踩的坑）
+
+> ★ 用户问「怎么自动扩展别的大包呢？」⇒ **加包不能全自动**，理由见本节末。
+> ★ 先跑 **`python scripts/diag/find-packs.py`** —— 它**只读**扫 NAS、列出
+> **像大包但没登记**的目录（★ 只报信号、不替你判）。
+
+```bash
+# ① 登记：让状态机认识这个包（--roots-from-env 从 .env 派生根，不手抄路径）
+python scripts/reseed-state.py init --pack <包名> --root /volume1/video/download/...
+
+# ② ★★ 排进「哪几个包会被驱动」—— 唯一声明点，在 scripts/drive-loop.py 的 PACKS_DEFAULT
+#    改完要重新部署：deploy.sh 白名单里有 drive-loop.py（☆ 但它是容器里的脚本，见坑②）
+
+# ③ 可选：给这个包设农场根（v3；不设则沿用全局）
+python scripts/reseed-state.py farm --pack <包名> --root /volume1/video/download/reseed/reseed_farm
+```
+
+**★★★ 三个必踩的坑**（每个都有实测依据，别跳）：
+
+| # | 坑 | 依据 / 后果 |
+|---|---|---|
+| ① | **只做 ① 忘了 ②** ⇒ 包登记了但**永远不被驱动** | 会被 `reconcile_watch` 的「**登记了却没被驱动**」（`packs_undriven`）**喊出来** —— 那是判据在保护你 |
+| ② | **加包会稀释其他包的轮换频率** | `drive-loop.py:103-132` 原文：「名单 2→3 个，dc/frds 各自的**轮换频率从 1/2 掉到 1/3**」（`once_round` 取模就是它）|
+| ③ | ★★ **`PACKS_DEFAULT` 的顺序有意义，改顺序 = 偷偷改"下一批跑谁"** | `once_round` 存进 `.drive-loop.state` 的是**下标而不是名字** ⇒ **动顺序前先看 `last_pack_idx`** |
+
+**为什么不能全自动加包**（三条，全部引自 `drive-loop.py:103-132`，不是推断）：
+
+1. **那是产品决定，不是机械判断** —— 原文：「它**不是**一行等着被消除的代码债，**是一个产品决定**」
+2. **会稀释其他包**（见坑②）
+3. ★★ **"找得到" ≠ "搜得到"** —— `mbf` 在 `unclaimed`/`report`/`trend` 上**全绿**，
+   而实测 **`Found 0 torrents`** ⇒ 自动加包会把「**一个不产出放量的包伪装成正常**」
+
+> ★ **假阳性警告**（`find-packs.py` 实跑，2026-09-20）：判据是「子目录数 ≥N」，
+> 但 `The Beatles - Discography +`（**音乐**）、`StarRupture-*`（**游戏**，含 `_crack`）
+> **都满足该判据却都不是 PT 大包**。⇒ **它只报信号，人自己判。**
 
 ### A.13.3 预留位（本次不实现）
 
@@ -842,7 +884,7 @@ sh build-farm.sh --verify           # 只校验农场 vs 源
 | **`pack` 表一行** | `<compose>/drive-loop/hlink/state.db` | 名字 + `roots` + `farm_root` + `max_depth` | 农场里的片**归不到任何包** → 静默 continue（只记进 `other_pack`） |
 | **`--packs`** | `drive-loop.py` 的 **`PACKS_DEFAULT`**（`dc-collection,mbf,frds-top250-2024`；`run.sh` **没传**） | 哪个包**会被驱动** | 状态机有它、农场有它，**就是不排它** —— `mbf` 就是这么被落下很久的（2026-09-13 已排进去，见第 7 条） |
 | **`--indexers`** | `run.sh` | 哪些**站**会被搜 | 站没进名单 = 对每部片子来说「那个站从没搜过」**根本不会被表达出来** → HDtime 就是这么卡住的（§18.11） |
-| **文档里的 init 配方** | `SUMMARY §10.2` 与本节的示例 | 包名 + `--match` 关键词 | 照旧配方重跑 → 挑 0 条根；或**多建一个包行**（`mbf` 与 `my-brilliant-friend-s01-s04` 是同一包的两个名字） |
+| **文档里的 init 配方** | `SUMMARY §10.2` 与本节的示例 | 包名 + `--match` 关键词 | 照旧配方重跑 → 挑 0 条根；或**多建一个包行**。★ **登记名以 `state.db` 为准**：那个包叫 **`mbf`**（`my-brilliant-friend-s01-s04` 只是 `hlink/config.yml` 的 **job 名**，2026-09-12 已按库改正，见 `summary/10`）|
 
 **② 会响档：漏了立刻报错**（不用盯，但**别和上面混成一张表**）
 

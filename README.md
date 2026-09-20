@@ -450,6 +450,8 @@ docker compose run --rm reseed-orchestrator status                          # �
 #### 多包支持（已接入 3 个包）—— 只留锚（原文见 ENVIRONMENT.md `A.13.2`）
 
 > 原文可从 git 历史取回：`git show 94a3d0f:README.md`。
+> ★ **要再加一个大包**：`ENVIRONMENT.md` 的 **`A.13.2`** 有「**怎么再加一个大包**」三步 + 三个必踩的坑；
+> 先跑 `python scripts/diag/find-packs.py`（**只读**列出"像大包但没登记"的目录）。
 
 #### 生产 `.env` 怎么更新（本地改完要同步到 NAS）
 
