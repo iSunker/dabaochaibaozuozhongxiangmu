@@ -1874,6 +1874,12 @@ schtasks /Delete /TN "reseed-drive-loop" /F
   按值的形状找漏进仓库的凭据。★ 它**读**本地 `.env` 但**只算 sha256、从不打印命中到的值**，
   所以输出可以直接贴给人看。见「推前凭据扫描」一节。**只扫不改，也不是调度的一部分。**
 - ✅ **`scripts/diag/run-batch.sh`** —— 手动试跑工具，不是调度的一部分。
+- ✅ **`scripts/diag/find-packs.py`**（2026-09-20 新增）—— Windows Git Bash 跑的，**只读**。
+  回答「**磁盘上有没有像大包、但还没登记的目录**」（扫 `video/download/{movies,TV}` 里
+  直接子目录数 ≥N 的）。★★ **它只报信号，绝不自动加包** —— 加包是**产品决定**，
+  且会**稀释**其他包的轮换频率；而「注册了」≠「搜得到」（`mbf` 全绿却 `Found 0 torrents`）。
+  ★ 所以它**只拟命令，人自己判**；文件头列了两条实测假阳性（音乐包 / 游戏包）。
+  ★ 判据：**"读不到 NAS"必须报 `ERR`，不许报成"没有"**（阴性对照已验）。
 - ✅ **`scripts/nas-update-env.sh`** —— **2026-09-12 晚已进 `deploy.sh` 白名单**（映射到
   `<compose>/nas-update-env.sh`），跟着 `deploy.sh --apply` 走，**不用再单独拷**。
   它是**生成物**（`scripts/diag/gen-nas-env-update.py` 产出，故本地被 gitignore）——
