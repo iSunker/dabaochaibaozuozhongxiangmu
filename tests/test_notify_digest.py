@@ -161,12 +161,97 @@ try:
           "本批运行 : 5 批" not in out and "本批运行 : 4 批" in out)
     check("★★ 也没有被算成一批 ok=0（否则会是 3 批）", "ok=0 的 3 批" not in out)
 
-    print("\n── ④ 明细行一字不动（时间 / 包 + 缩进的 metrics，两行形）──")
-    check("★ metrics 行仍在（缩进 6 空格）",
-          "\n      pack=frds-top250-2024 ok=22 failed=0 newly_seeding=18" in out,
-          repr([ln for ln in out.splitlines() if "pack=frds" in ln]))
+    # ── ④ ★★ 明细段改为「按包聚合」（2026-09-20，用户报「排版很难看」）──
+    #   改前：每批摊 2 行、`metrics` 原样打 ⇒ 23 批 + 2 台账 ≈ 50 行，真信号被埋。
+    #   改后：一行一个包（批次数 + ok 合计 + **非零项**），台账单独拆成多行。
+    #
+    # ★★ 这里最重要的是**成对**判据：`failed` 平时恒 0、一旦非 0 就是最该看的，
+    #   所以既要钉「非零时**必须**出现」（见 ④b），也要钉「全零时**不**出现」（本段）。
+    #   少了任一半，「省略常数项」就会退化成「漏掉异常」（=把告警砍掉）。
+    print("\n── ④ ★★ 明细段按包聚合（全零项不出）──")
+    check("★ 段标题已换（不再是「时间 / 包 / 指标」）",
+          "批次明细（按包聚合）" in out and "批次明细（时间 / 包 / 指标）" not in out,
+          [ln for ln in out.splitlines() if "批次明细" in ln])
+
+    # ★ 本批四行：frds(22/18/2) dc0816(0/15/1) mbf(0/0/1) dc1139(9/0/2)
+    #   ⇒ frds 1 批 ok合计 22；dc-collection **2 批** ok合计 9（0+9）
+    check("★ frds 聚合出 1 批（ok 合计 22）",
+          "1 批  ok合计   22" in out,
+          [ln for ln in out.splitlines() if "frds" in ln])
+    check("★ dc-collection 聚合出 **2 批**（不是两行）",
+          "2 批  ok合计    9" in out,
+          [ln for ln in out.splitlines() if "dc-collection" in ln])
+    check("★ 聚合行仍带「新增做种」（按包分列：frds 18 / dc 15）",
+          "新增做种 18" in out and "新增做种 15" in out,
+          [ln for ln in out.splitlines() if "新增做种" in ln])
+    check("★★ 退避按包合计（frds 2 / dc 1+2=3）",
+          "退避 2" in out and "退避 3" in out,
+          [ln for ln in out.splitlines() if "退避" in ln])
+    check("★★ 全零 ⇒ `★failed` **不**出现（省略常数项）", "★failed" not in out,
+          [ln for ln in out.splitlines() if "failed" in ln])
+
+    # ★ 台账**仍在**（改的是呈现，不是删掉它）
+    check("★ 台账仍出现（#67 那条断言的等价物，改后仍成立）", "每日台账" in out,
+          [ln for ln in out.splitlines() if "台账" in ln])
+    check("★ 台账拆成「分组」段（不再是 655 字符单行）", "每日台账（分组）" in out)
+    check("★ 「全部包已无待搜项」仍在（属非本批，不聚合但也不丢）",
+          "全部包已无待搜项" in out,
+          [ln for ln in out.splitlines() if "无待搜" in ln])
+    check("★ 非本批条数**只报一次**（汇总段已报，明细段不重复）",
+          out.count("非本批") == 1, "出现 %d 次" % out.count("非本批"))
+
+    # ★ 旧的两行形（时间 + 缩进 6 空格的整段 metrics）**已不再出现**
+    check("★ 旧的「缩进 6 空格 metrics」行形已去掉",
+          "\n      pack=frds-top250-2024 ok=22 failed=0 newly_seeding=18" not in out)
+    check("★ 旧的「时间 + 标题」明细行形已去掉",
+          "\n  2026-09-13 00:00:00  frds-top250-2024 本批完成" not in out)
     check("★ 原来的 `批次 : N` 那行**已去掉**（它按 kind 数，会把台账算进去）",
           "批次 : " not in out)
+finally:
+    lab.cleanup()
+
+# =====================================================================
+print("\n── ④b ★★ `failed` 非零时**必须**浮出来（④ 的另一半，缺它=把告警砍掉）──")
+lab = Lab()
+try:
+    lab.tsv("2026-09-14", (
+        batch("p1", ok=39, failed=1, newly_seeding=0, still_skipped=0, backoff_hits=0)
+        + batch("p1", ok=40, failed=0, newly_seeding=0, still_skipped=0, backoff_hits=0)
+        + batch("p2", ok=10, failed=0, newly_seeding=0, still_skipped=0, backoff_hits=0)
+    ))
+    out = lab.run().stdout
+    check("★★ p1 的 failed 合计 = 1，且**显式出现**", "★failed 1" in out,
+          [ln for ln in out.splitlines() if "failed" in ln])
+    check("★ 只有 p1 那行带 `★failed`（p2 干净 ⇒ 不带）",
+          sum(1 for ln in out.splitlines() if "★failed" in ln) == 1,
+          [ln for ln in out.splitlines() if "批  ok合计" in ln])
+    check("★ 异常行仍带正确的 ok 合计（39+40=79）",
+          "2 批  ok合计   79" in out,
+          [ln for ln in out.splitlines() if "p1" in ln])
+finally:
+    lab.cleanup()
+
+# =====================================================================
+print("\n── ④c ★ 台账拆行 + `n/a` 不许印成 `n/a%`（`ERR-AI-03`）──")
+lab = Lab()
+try:
+    lab.tsv("2026-09-14", row(
+        "2026-09-14 01:06:06", "batch", "每日台账",
+        "day=2026-09-14 iyuu=1133 qb_total=2063 lg_removed=14 pct=99 pct_num=517 pct_den=522 "
+        "packpct:mbf=n/a packnum:mbf=0 packden:mbf=0 seeding:mbf=0 total:mbf=4"))
+    out = lab.run().stdout
+    check("★ 台账段在（按 `day=` 认出来）", "每日台账（分组）" in out)
+    check("★ 标量分组：额度 / qB / 链接 三段都在",
+          "额度   iyuu=1133" in out and "qB     total=2063" in out and "链接 changed" in out,
+          [ln for ln in out.splitlines() if "额度" in ln or "qB" in ln])
+    check("★ 每包一行（`packpct:包名` 被拆出来）", "包 mbf" in out,
+          [ln for ln in out.splitlines() if ln.strip().startswith("包")])
+    check("★★ `n/a` 特判：印 `n/a` 而**不是** `n/a%`",
+          "n/a" in out and "n/a%" not in out,
+          [ln for ln in out.splitlines() if "n/a" in ln])
+    check("★ 缺的键印 `-`（不伪造成 0 —— 与 `ERR-AI-03` 同族）",
+          "fa=-" in out,
+          [ln for ln in out.splitlines() if "额度" in ln])
 finally:
     lab.cleanup()
 

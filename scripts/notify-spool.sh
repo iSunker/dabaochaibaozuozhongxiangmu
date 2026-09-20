@@ -743,9 +743,124 @@ do_digest() {
         printf "  告警     : %s\n\n", n_alert
       }'
 
-    printf '批次明细（时间 / 包 / 指标）\n'
-    printf '%s\n' "$_lines" | grep '	batch	' | awk -F'\t' '{printf "  %s  %s\n      %s\n", $1,$3,$4}' || true
+    # ★★ 2026-09-20：明细段从「每批摊 2 行」改成「**按包聚合**」。
+    #   为什么：用户报「内容排版很难看」。真邮件里 23 批 + 2 台账 ⇒ 该段约 **50 行**，
+    #   而批次**高度重复**（`dc-collection ok=40` 出现 6 次、`mbf ok=4` 6 次），
+    #   每行的 `metrics` 长 83 字符却**几乎全是常数**（`failed=0 still_skipped=0`）。
+    #   真信号（`newly_seeding=443` 全天才 1 次、`failed=1` 出现 2 次）**被埋在 46 行里**。
+    #   ⇒ 按包聚合成一行一批次数 + 合计，行数大降、异常反而**浮出来**。
+    #
+    # ★★ 核心取舍（别把这条改没了）：**「默认值省略」不等于「异常可以省略」**。
+    #   `failed` 平时恒 0，一旦非 0 就是最该看的东西 —— 无脑砍掉等于**把告警砍掉**。
+    #   规则：`newly_seeding` / `failed` / `backoff_hits` **非零才打，但非零必打**；
+    #   `ok` 恒打（它是「这批干了多少」的主读数）。
+    # ★ `pack=` 的判据**没动**（整键相等，故 `packs=` 不命中）—— `#67` 修过的坑，见上。
+    # ★ 用 `order[]` 记**首次出现顺序**：POSIX awk 的 `for (k in arr)` 顺序**未定义**，
+    #   直接遍历会让同一份数据每次输出顺序不同 ⇒ 测试**间歇性红**。
+    printf '批次明细（按包聚合）\n'
+    printf '%s\n' "$_lines" | grep '	batch	' | awk -F'\t' '
+      function kvget(s, k,   n, i, p, a) {
+        n = split(s, a, " ")
+        for (i = 1; i <= n; i++) {
+          p = index(a[i], "=")
+          if (p > 1 && substr(a[i], 1, p - 1) == k) return substr(a[i], p + 1)
+        }
+        return ""
+      }
+      {
+        pack = kvget($4, "pack")
+        # ★ 非本批（台账 / 无待搜）**不能只丢进一个计数** —— 它们的**标题**本身是信息
+        #   （「全部包已无待搜项（3 个包）」是个结论，不是你从别处能推出来的）。
+        #   ★ 这一条是**测试抓出来的**：第一版只 `other++`，把标题丢了 ⇒
+        #     `test_notify_digest.py` ④ 段当场红（「全部包已无待搜项」不见了）。
+        #   ⇒ 保留标题，每包聚合之外单列。
+        if (pack == "") { title[++o] = $3; next }
+        if (!(pack in seen)) { seen[pack] = 1; order[++m] = pack }
+        n[pack]++
+        v = kvget($4, "ok");            if (v != "") ok[pack] += v
+        v = kvget($4, "failed");        if (v != "" && v + 0 > 0) fail[pack] += v
+        v = kvget($4, "newly_seeding"); if (v != "" && v + 0 > 0) ns[pack]   += v
+        v = kvget($4, "backoff_hits");  if (v != "" && v + 0 > 0) bh[pack]   += v
+      }
+      END {
+        for (i = 1; i <= m; i++) {
+          p = order[i]
+          printf "  %-18s %2d 批  ok合计 %4d", p, n[p], ok[p]
+          if (ns[p]   > 0) printf "  新增做种 %d", ns[p]
+          if (fail[p] > 0) printf "  ★failed %d",  fail[p]
+          if (bh[p]   > 0) printf "  退避 %d",      bh[p]
+          printf "\n"
+        }
+        # ★ 非本批（台账 / 无待搜）单列标题 —— 它们的标题是信息，不能只留个计数
+        #   （台账**不在这里**打：它上面已由「每日台账（分组）」整段渲染过，别打两遍）
+        for (i = 1; i <= o; i++)
+          if (title[i] != "每日台账") printf "  · %s\n", title[i]
+        # ★ 「非本批 N 条」的总数**不在这里打** —— 上面「最近两次运行窗口」已报同一个数。
+      }' || true
     [ "${_batches:-0}" = "0" ] && printf '  （无）\n'
+
+    # ★★ 2026-09-20：**台账行**单独渲染成多行。
+    #   为什么：它原先混在明细里原样打 `$4` ⇒ 单行 **655 字符**（实测用户 09-20 那份），
+    #   邮件客户端必然折成一坨。而它内部结构很规整：**标量键 + `prefix:包名=值`**。
+    #   ⇒ 标量按语义分 4 组、每包一行。
+    # ★ 只渲染**最近一条**台账（取 `day=` 那一行）：两窗各有一条，但旧那条只是历史，
+    #   多打一遍等于重复占屏 —— 与「按包聚合」同一个目的。
+    # ★ `n/a` 要特判，**不许**印成 `n/a%`（`ERR-AI-03`：`n/a` ≠ `0` ≠ 没事）。
+    _ledger=$(printf '%s\n' "$_lines" | grep '	batch	' | grep 'day=' | tail -1 || true)
+    if [ -n "$_ledger" ]; then
+      printf '\n每日台账（分组）\n'
+      printf '%s\n' "$_ledger" | awk -F'\t' '
+        function kvget(s, k,   n, i, p, a) {
+          n = split(s, a, " ")
+          for (i = 1; i <= n; i++) {
+            p = index(a[i], "=")
+            if (p > 1 && substr(a[i], 1, p - 1) == k) return substr(a[i], p + 1)
+          }
+          return ""
+        }
+        function g(k,   v) { v = kvget($4, k); return (v == "" ? "-" : v) }
+        # ★ 百分比格式化：`n/a`（算不出）与缺键（`-`）**都不加 `%`**
+        #   —— 加个 `%` 会让 `n/a%` / `-%` 看着像个读数（`ERR-AI-03`）。
+        function pctfmt(v) {
+          if (v == "n/a") return "n/a"
+          if (v == "-" || v == "") return "-"
+          return v "%"
+        }
+        {
+          printf "  日期   %s\n", g("day")
+          printf "  额度   iyuu=%s fa=%s fb=%s fd=%s unclaimed=%s\n",
+                 g("iyuu"), g("fa"), g("fb"), g("fd"), g("unclaimed")
+          printf "  qB     total=%s 卡999=%s(新 %s) 未登记=%s 未驱动=%s\n",
+                 g("qb_total"), g("qb_999"), g("qb_999_new"), g("packs_unreg"), g("packs_undriven")
+          printf "  freeze=%s(新 %s/我们 %s)  链接 changed=%s added=%s removed=%s files=%s inflight=%s\n",
+                 g("fz"), g("fz_new"), g("fz_ours"),
+                 g("lg_changed"), g("lg_added"), g("lg_removed"), g("lg_files"), g("lg_inflight")
+          printf "  总计   完成度 %s (%s/%s)\n", pctfmt(g("pct")), g("pct_num"), g("pct_den")
+          # 每个包一行：`prefix:包名=值` 的键按包归拢，值序固定
+          m = split($4, a, " ")
+          for (i = 1; i <= m; i++) {
+            p = index(a[i], "="); if (p <= 1) continue
+            k = substr(a[i], 1, p - 1); v = substr(a[i], p + 1)
+            j = index(k, ":"); if (j <= 0) continue
+            pre = substr(k, 1, j - 1); pk = substr(k, j + 1)
+            if (!(pk in seen)) { seen[pk] = 1; order[++mm] = pk }
+            val[pk, pre] = v
+          }
+          for (i = 1; i <= mm; i++) {
+            pk = order[i]
+            pctv = val[pk, "packpct"]
+            # ★ n/a 特判：不加 %（它表示「算不出」而不是 0）
+            if (pctv == "n/a") pcts = "n/a"
+            else if (pctv == "") pcts = "-"
+            else pcts = pctv "%"
+            printf "  包 %-18s %s (%s/%s)  做种 %s / 总 %s\n", pk, pcts,
+                   (val[pk, "packnum"] == "" ? "-" : val[pk, "packnum"]),
+                   (val[pk, "packden"] == "" ? "-" : val[pk, "packden"]),
+                   (val[pk, "seeding"]  == "" ? "-" : val[pk, "seeding"]),
+                   (val[pk, "total"]    == "" ? "-" : val[pk, "total"])
+          }
+        }' || true
+    fi
 
     if [ "${_alerts:-0}" != "0" ]; then
       printf '\n告警明细\n'
