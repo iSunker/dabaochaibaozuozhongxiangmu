@@ -784,7 +784,18 @@ do_digest() {
       END {
         for (i = 1; i <= m; i++) {
           p = order[i]
-          printf "  %-18s %2d 批  成功合计 %4d", p, n[p], ok[p]
+          # ★★ 表头用「发出请求」而**不是**「成功合计」（2026-09-21 更正）。
+          #   起因：用户读报时问「成功合计 357 是什么意思」—— 那个词**起坏了**：
+          #   它读起来像"成功了 357 次"，而 `ok` 量的是「**我们问了几次站点**」。
+          #   实测同一封信里 `mbf 8 批 成功合计 32` + `新增做种 0` ⇒
+          #   真意思是「**问了 32 次，一次都没拿到**」。
+          #   ★ 代码侧本来是对的（`state.py::pilot_verdict` 明文写：用 `ok` 会把 mbf
+          #     那种「问了 32 次、什么都没得到」的包判成「有产出」，正好判反）——
+          #     错的是**这一格的标签**。判据对了、标签错了，同样会骗人。
+          #   ★★ 本条注释里**不许出现单引号** —— awk 程序整体裹在 shell 的单引号里，
+          #     一个单引号就会把它**截断**，而症状是 awk 报 "END OF FILE"、
+          #     整段明细**静默为空**（`|| true` 把它吞了，rc 仍是 0）。实测踩过一次。
+          printf "  %-18s %2d 批  发出请求 %4d", p, n[p], ok[p]
           if (ns[p]   > 0) printf "  新增做种 %d", ns[p]
           if (fail[p] > 0) printf "  ★失败 %d",  fail[p]
           if (bh[p]   > 0) printf "  退避 %d",      bh[p]
@@ -826,6 +837,18 @@ do_digest() {
     # ★ 只渲染**最近一条**台账（取 `day=` 那一行）：两窗各有一条，但旧那条只是历史，
     #   多打一遍等于重复占屏 —— 与「按包聚合」同一个目的。
     # ★ `n/a` 要特判，**不许**印成 `n/a%`（`ERR-AI-03`：`n/a` ≠ `0` ≠ 没事）。
+    #
+    # ★★ 2026-09-21：`包 mbf  n/a (0/0)  做种 0 / 总 4` 这行**被用户当成矛盾报上来了** ——
+    #   三个数各自都对，**并排读像自相矛盾**。定性如下（别再当 bug 重查一遍）：
+    #     · `total=4` / `seeding=0` 来自 `pack_seeding_total` ⇒ 真有 4 部、一部没做成种；
+    #     · `0/0` 来自 `pack_stage_census`，它的分母**刻意排除 `UNMATCHED`**
+    #       （`state.py:CENSUS_DENOM_STAGES`）—— 完成度量的是「**已搜过、还没做成种**」
+    #       那个集合，**没搜过的片子不进分母**（进了会得出"0% 完成"，而事实是"还没开始"）。
+    #     · mbf 的 4 部**恰好全是 `UNMATCHED`** ⇒ 分母退化成 0 ⇒ `n/a`。
+    #   ⇒ ★ **这是设计在正常工作**（`state.py::pack_stage_census` 的 docstring 里
+    #     早就拿 mbf 的 `0/4` 当反例写明了）。**错的是渲染**：`0/0` 与 `n/a` 是
+    #     同一件事（分母为 0 ⇒ 算不出），印成两个形状会让人以为是两个问题。
+    #   ⇒ 判据：**分母为真数且非 0** 才印 `num/den`，否则印 `n/a`。
     _ledger=$(printf '%s\n' "$_lines" | grep '	batch	' | grep 'day=' | tail -1 || true)
     if [ -n "$_ledger" ]; then
       printf '\n每日台账（分组）\n'
@@ -889,9 +912,14 @@ do_digest() {
             if (pctv == "n/a") pcts = "n/a"
             else if (pctv == "") pcts = "-"
             else pcts = pctv "%"
-            printf "  包 %-18s %s (%s/%s)  做种 %s / 总 %s\n", pk, pcts,
-                   (val[pk, "packnum"] == "" ? "-" : val[pk, "packnum"]),
-                   (val[pk, "packden"] == "" ? "-" : val[pk, "packden"]),
+            # ★★ 分数格的渲染（2026-09-21 更正）—— 起因见下面那条注释块。
+            #   判据：**只有分母是真数且非 0 时**才印 `num/den`；否则印 `n/a`。
+            #   ★ 不印 `0/0`：那**不是**"完成度 0"，是"分母为 0 ⇒ 算不出"，
+            #     与 `pcts` 的 `n/a` 是**同一件事**，印成两个形状会让人以为是两个问题。
+            numv = val[pk, "packnum"]; denv = val[pk, "packden"]
+            if (denv == "" || denv + 0 == 0) frac = "n/a"
+            else frac = numv "/" denv
+            printf "  包 %-18s %s (%s)  做种 %s / 总 %s\n", pk, pcts, frac,
                    (val[pk, "seeding"]  == "" ? "-" : val[pk, "seeding"]),
                    (val[pk, "total"]    == "" ? "-" : val[pk, "total"])
           }

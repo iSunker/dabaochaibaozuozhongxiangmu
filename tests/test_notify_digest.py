@@ -174,12 +174,12 @@ try:
           [ln for ln in out.splitlines() if "批次明细" in ln])
 
     # ★ 本批四行：frds(22/18/2) dc0816(0/15/1) mbf(0/0/1) dc1139(9/0/2)
-    #   ⇒ frds 1 批 ok合计 22；dc-collection **2 批** ok合计 9（0+9）
-    check("★ frds 聚合出 1 批（成功合计 22）",
-          "1 批  成功合计   22" in out,
+    #   ⇒ frds 1 批 发出请求 22；dc-collection **2 批** 发出请求 9（0+9）
+    check("★ frds 聚合出 1 批（发出请求 22）",
+          "1 批  发出请求   22" in out,
           [ln for ln in out.splitlines() if "frds" in ln])
     check("★ dc-collection 聚合出 **2 批**（不是两行）",
-          "2 批  成功合计    9" in out,
+          "2 批  发出请求    9" in out,
           [ln for ln in out.splitlines() if "dc-collection" in ln])
     check("★ 聚合行仍带「新增做种」（按包分列：frds 18 / dc 15）",
           "新增做种 18" in out and "新增做种 15" in out,
@@ -228,9 +228,9 @@ try:
           [ln for ln in out.splitlines() if "failed" in ln])
     check("★ 只有 p1 那行带 `★失败`（p2 干净 ⇒ 不带）",
           sum(1 for ln in out.splitlines() if "★失败" in ln) == 1,
-          [ln for ln in out.splitlines() if "批  ok合计" in ln])
-    check("★ 异常行仍带正确的成功合计（39+40=79）",
-          "2 批  成功合计   79" in out,
+          [ln for ln in out.splitlines() if "发出请求" in ln])
+    check("★ 异常行仍带正确的发出请求数（39+40=79）",
+          "2 批  发出请求   79" in out,
           [ln for ln in out.splitlines() if "p1" in ln])
 finally:
     lab.cleanup()
@@ -309,10 +309,18 @@ print("\n── ⑥b ★★ 中文标签化：**读数逐字不变**（2026-09-2
 #      （`3` 还在，但**显示的数变了**）—— ★ **肉眼看不出来**，是这一步机械对照抓到的。
 #   ⇒ 判据：**同一份台账输入，改前改后抽出的数字序列必须逐字相同**。
 #     ★ 期望值**写死在这里**（不是从输出反推）—— 取自改动前那版的实测序列。
+#
+#   ★★ 2026-09-21 这一次**故意**少了两个数**（41 → 39），**不是**回归：
+#     用户报「`包 mbf  n/a (0/0)` 和 `总 4` 并排像自相矛盾」⇒ 修了渲染：
+#     **分母为 0 时印 `n/a` 而不印 `0/0`**（`packnum`/`packden` 两个 0 因此消失，
+#     `seeding:mbf` 的 0 与 `total:mbf` 的 4 **照旧在**）。
+#     ⇒ 尾部由 `… 0 0 0 4` 变成 `… 0 4`。★ 判据没放松：**只在"该少的地方"少了两个**，
+#       别的数一个没动 —— 这正是这条对照要守的东西（`ERR-AI-09` 同族：
+#       别把"预期之内的少"当成"没少"）。
 EXPECTED_NUMS = [
     "2026", "09", "20", "1133", "2", "2", "0", "1", "2063", "999", "3", "0", "0", "0",
     "3", "0", "3", "0", "0", "14", "3744", "3", "99", "517", "522", "95", "74", "78",
-    "74", "115", "250", "2024", "100", "443", "444", "443", "486", "0", "0", "0", "4",
+    "74", "115", "250", "2024", "100", "443", "444", "443", "486", "0", "4",
 ]
 LEDGER = (
     row("2026-09-20 00:38:28", "batch", "每日台账",
@@ -349,6 +357,51 @@ try:
     naked = [k for k in (" fa=", " fb=", " fd=", "fz=", "lg_", "qb_total=", "unclaimed=")
              if k in r.stdout]
     check("★ 正文里不再出现裸术语键（fa=/fb=/fz=/lg_…）", naked == [], naked)
+    # ★★ 2026-09-21：`n/a (0/0)` ⇒ `n/a (n/a)`（用户报「和 `总 4` 并排像矛盾」）。
+    #   判据两条，缺一不可：① 分母为 0 时**不再**印 `0/0`；② 但 `总 4` **照旧在**
+    #   （★ 别把"分母 0"顺手读成"这个包没片子" —— `total` 才管那个）。
+    check("★★ `mbf` 那行印 `n/a (n/a)` —— 分母为 0 时不再印 `0/0`",
+          "mbf                n/a (n/a)" in r.stdout,
+          [ln for ln in r.stdout.splitlines() if "mbf" in ln])
+    check("★★ 且 `做种 0 / 总 4` **照旧在**（分母 0 ≠ 这个包没片子）",
+          "做种 0 / 总 4" in r.stdout,
+          [ln for ln in r.stdout.splitlines() if "mbf" in ln])
+    check("★ 反过来：分母非 0 的包**仍印分数**（`74/78`）—— 别一刀切成都印 n/a",
+          "95% (74/78)" in r.stdout,
+          [ln for ln in r.stdout.splitlines() if "dc-collection" in ln])
+finally:
+    lab.cleanup()
+
+# =====================================================================
+print("\n── ⑥c ★★ 两个 awk 段都**活着**（`|| true` 会把 awk 语法错吞成空段）──")
+#   ★★ 这条的来历（2026-09-21，实测踩到）：
+#     我在批明细那段 awk 的注释里写了一个**单引号**，而整个 awk 程序裹在 shell 的
+#     单引号里 ⇒ 程序在那一点被**截断** ⇒ awk 报 `(END OF FILE)` 并退出，
+#     而 `|| true` 把非零退出码**吞掉**（`rc` 仍是 0）、明细段**静默为空**。
+#     ★★ 症状与"这批恰好没有可聚合的行"**完全一样** —— 又是 `ERR-AI-09` 的形状：
+#       两种截然不同的原因，观测读数一样。
+#   ⇒ 判据：两段各自的**必然产物**都必须在。空段 ⇒ 红。
+lab = Lab()
+try:
+    lab.tsv("2026-09-13", DAY13)
+    lab.tsv("2026-09-14", DAY14)
+    r = lab.run()
+    check("★★ 批明细段**非空**（awk 被截断时它会静默为空）",
+          "1 批  发出请求   22" in r.stdout,
+          [ln for ln in r.stdout.splitlines() if "发出请求" in ln])
+    check("★★ 台账段**非空**（同一个坑会打掉这一段 —— 两段是**两个独立 awk**）",
+          "每日台账（分组）" in r.stdout and "  日期        " in r.stdout,
+          [ln for ln in r.stdout.splitlines() if "台账" in ln or "日期" in ln])
+    # ★★ 反向往回证：**这个坑真的会被这两条抓到**（`ERR-AI-09` 的固定动作）。
+    #   实测（2026-09-21）：在批明细那段 awk 的注释里加一个**落单**单引号
+    #   ⇒ awk 报 `(END OF FILE)`、该段**静默为空**、rc **仍是 0**
+    #   ⇒ ⑥c 的第一条与第三条**当场红**，第二条（台账段）**不红** ——
+    #     ★ 因为两段是**两个独立的 awk 程序**，截断其中一个不会波及另一个。
+    #     ★★ 我第一版把这条断言写成"同一根因会一起打掉两段"，**是错的** ——
+    #       是这次变异实测把它纠正过来的（判据不能靠推想）。
+    check("★★ stderr 里**没有** awk 报错（`(END OF FILE)` = 程序被截断）",
+          "awk:" not in r.stderr,
+          r.stderr.strip()[:300])
 finally:
     lab.cleanup()
 

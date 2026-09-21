@@ -12,7 +12,7 @@
     "test_linkguard.py": 66,
     "test_matched_indexers_union.py": 15,
     "test_next_sleep.py": 21,
-    "test_notify_digest.py": 51,
+    "test_notify_digest.py": 57,
     "test_notify_drain.py": 34,
     "test_once_gate.py": 41,
     "test_orchestrator_clients.py": 20,
@@ -78,7 +78,7 @@
     "test_torznab_probe.py": "钉 `scripts/diag/torznab-probe.py` 的**判据工具本身**（`26.38-A`：验 Torznab 的 `tvsearch` 响应体里有没有可解析的季字段），以及它的**退避闸**（两只时钟）。★ 为什么需要：该探针**原先只抠 `<title>`** —— item 后面的 `link`/`guid`/`torznab:attr` **整段被丢** ⇒ 「响应里没有季字段」这句话**没有判据**（不是『看了说没有』，是『根本没看』，`B.10`）。★ `--raw` 打原始响应，**必须过 `redact()`**（很多站把 passkey 编进 `<link>`，而它读的是 NAS 生产 `.env`）。★★ 退避闸**两只时钟**：A = Prowlarr 的 `disabledTill`（本地接口），B = cross-seed 的 `retry_after`（本地库）。★ **只读 A 是假绿** —— 实测 A 说「窗口已过」而 B 说「还剩 7h」，接着就 429（2026-09-21）。两个取**晚**的那个。★ 闸**只读**跨库、且**只选** id/status/retry_after 三列，**不取** `url`/`apikey`（那两列里是全站共用密钥）。★★★ 本文件有**自己的心跳**（`ERR-AI-09` 第三次同形复发）：变异 J 实测——把探针的超时 `except` 换成一个永不触发的类型 ⇒ 本测试**退出码 1 但 FAIL 行 = 0**（它自己在 `src.index(...)` 上抛了 `ValueError`）。⇒ 「崩」与「红」**此前读数一模一样**。已修：① 那两处 `index()` 改成先 `find`；② 装 `sys.excepthook` 打一行 `CRASHED`；③ 收尾打 `MAIN_OK`（没看到就是崩了）。★ 配套 `tests/mutate-probe.sh`：11 个变异**逐个该红就红**（含『崩』的自检）。"
   },
   "scripts": 37,
-  "total": 1452,
+  "total": 1458,
   "failures": 0,
   "failed_files": [],
   "measured_at": "2026-09-21",
