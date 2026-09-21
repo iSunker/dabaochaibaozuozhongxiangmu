@@ -137,6 +137,40 @@ def cadence_for(indexer: str, *, cadence_days: int = DEFAULT_CADENCE_DAYS,
 FIRST_EXPLORE_BUDGET = 1
 
 
+def _lookup_seen(indexer_seen: dict[str, str], ix: str) -> str | None:
+    """按**站名主干**在 `indexer_seen` 里找时间戳。找不到返回 `None`。
+
+    ★★★ 为什么必须是主干、不能裸比（2026-09-22 实测的第二处缺陷）
+    ------------------------------------------------------------
+      `indexer_seen` 的键来自 **cross-seed 的原值**，带 caps 后缀：
+          `'NanyangPT (南洋)'`
+      而 `--indexers` 是**人手写的短名**：
+          `'NanyangPT'`
+
+      裸比 `indexer_seen.get(ix)` ⇒ `None` ⇒ 判「从没搜过」⇒ **永远到期**。
+      实测（`state.db`）：43 部待搜里 **37 部**的到期站是那个永远匹配不上的幽灵名，
+      而站名表里那个短名「库里从没出现过」—— 就是它。
+
+    ★★ 这个缺陷的形状（比它本身更值得记）：
+      同一仓里**已经有一把正确的尺** —— `norm_indexer_name()`。
+      它被用在 `check_indexers()`（名单对账）与 `DriveSession`（退避判定），
+      **那两处工作正常**（自检打「索引器自检通过」）⇒ 日志上一切正常，
+      唯独**这里**漏用 ⇒ 数慢慢偏成「每轮都到期」，且不报错。
+      ⇒ 教训：**同一概念有两把尺时，要数清有几处用**（本处与 `next_due_at` 是漏的两处）。
+
+    ★ 为什么不直接 `indexer_seen[norm] = ...` 改写调用方的字典：
+      调用方（`todo_detail` / `movies` 的行）可能共用同一个 dict，
+      就地改会**污染**其它读者。这里是纯查询，不改输入。
+    """
+    if ix in indexer_seen:              # 快路径：名字本来就对得上
+        return indexer_seen[ix]
+    want = norm_indexer_name(ix)
+    for k, v in indexer_seen.items():
+        if norm_indexer_name(k) == want:
+            return v
+    return None
+
+
 def due_indexers(
     indexer_seen: dict[str, str],
     indexers_now: list[str],
@@ -166,7 +200,10 @@ def due_indexers(
     fresh: list[str] = []          # 够周期的（不受预算限制）
     never: list[str] = []          # 从没搜过的（受预算限制）
     for ix in pool:
-        last = _parse_ts(indexer_seen.get(ix))
+        # ★★★ 必须走 `_lookup_seen`（按主干），**不能**裸比 `indexer_seen.get(ix)`。
+        #   裸比会让 `'NanyangPT'` 永远查不到库键 `'NanyangPT (南洋)'`
+        #   ⇒ 判「从没搜过」⇒ 永远到期。见 `_lookup_seen` 的 docstring。
+        last = _parse_ts(_lookup_seen(indexer_seen, ix))
         if last is None:
             never.append(ix)
             continue
@@ -199,7 +236,10 @@ def next_due_at(
     pool = list(indexers_now) or sorted(indexer_seen) or [UNKNOWN_INDEXER]
     times = []
     for ix in pool:
-        last = _parse_ts(indexer_seen.get(ix))
+        # ★★ 与 `due_indexers` **同一把尺**（见 `_lookup_seen`）。
+        #   原先这里是裸比 ⇒ 这个函数同样是"幽灵站名"受害者：
+        #   `next_due_at` 会把"从没搜过"判成"现在就该搜"（返回 None）。
+        last = _parse_ts(_lookup_seen(indexer_seen, ix))
         if last is None:
             return None                      # 有站从没搜过 → 现在就该搜
         days = cadence_for(ix, cadence_days=cadence_days,
