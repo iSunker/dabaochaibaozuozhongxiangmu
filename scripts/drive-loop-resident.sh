@@ -246,6 +246,23 @@ fi
 #   ★ 但**参数有了第二个声明点就要有判据** —— 见 `tests/test_drive_loop_service.py`
 #     钉 `--indexers` 的那条（本文件的 `--indexers` 与 `run.sh` 逐字相同）。
 #
+# ★★ `--limit` 从 **50 → 500**（2026-09-22，用户拍「调大 --limit（额度换速度）」）
+# ------------------------------------------------------------
+#   为什么是 50 挡事：合池下池子是「**每次从头取前 N**」、`--limit` 是**全局**的，
+#   而全池欠账实测 **565** 部（`§26.34` 一）⇒ `50` 意味着**每一批都重跑池子的前 50**，
+#   剩下的欠账**永远不会被取到**。★ 于是 `§26.34` 那笔"5 批清零"的收益
+#   **只在第一批成立** —— 这是我此前把它当成"已解决"的误读。
+#   500 ⇒ 一批=把全池清一遍，之后每批只剩**真正新到期**的片子。
+#   ★ 这不是"把请求数抬 10 倍"：`ok` 是**发出多少条 webhook**（每条 1 次搜索），
+#     取多少部片子由池子决定，池子空了就自然停。
+#   ★ 代价：轮到"全轮空"那天，判定全完成要去数**空闲轮**（3 轮 × 45 分 ≈ 2.25h）；
+#     上界由 `--max-rounds` 兜着。★ 想临时压回去：`sh run-resident.sh --limit 50`
+#     （`"$@"` 在后面，argparse 取最后一次）。
+#
+# ★ `DRIVE_LIMIT` / `DRIVE_PACKS` 是**运行时可覆盖口**（compose 的 `environment:`
+#   传进来，见 `docker-compose.yml`）。默认值两边一致；不给 env 就是这里的值。
+# ★ 要临时换名单而不改代码：`DRIVE_PACKS=xxx` 传进容器即可（`--packs` 默认读它）。
+#
 # `"$@"` 放最后：用户在命令行给的参数覆盖上面的。
 # ★ 要临时关掉合池：`sh run-resident.sh` 传不了"关"（`--pool` 是 store_true）
 #   ⇒ 直接改这一行，或用 `docker compose run` 覆盖整条 command。
@@ -255,7 +272,7 @@ RC=0
   --qbit-url "http://qbittorrent-reseed:3060" \
   --env "$COMPOSE_DIR/.env" \
   --indexers HDtime,HDFans,NanyangPT,BTSCHOOL \
-  --limit 50 \
+  --limit "${DRIVE_LIMIT:-500}" \
   --pool \
   "$@" || RC=$?
 

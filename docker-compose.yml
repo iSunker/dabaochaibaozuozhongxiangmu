@@ -281,6 +281,21 @@ services:
       # 容器方言 ②：镜像里没有 sudo，而 build-farm.sh 用 `${SUDO-sudo}` ——
       #   给空串它就跳过 sudo 直接跑（那步本来也 `|| true`）
       - SUDO=
+      # ★★ 两个**运行时覆盖口**（2026-09-22 加）—— 让「名单」「额度」不用改代码、不用重建镜像
+      #    ★ 起因：`run-resident.sh` **不传** `--packs`，所以容器的名单 = `drive-loop.py`
+      #      的 `PACKS_DEFAULT`；而我把那个默认值从 3 个包缩到 1 个之后，NAS 上要生效
+      #      **必须重新部署 + 重启容器**。有了 `DRIVE_PACKS`，改名单变成"改这里 + 重启"。
+      #    ★ `DRIVE_LIMIT` 同理：入口脚本写的是 `--limit "${DRIVE_LIMIT:-500}"`
+      #      （`--pool` 下是**全局**额度，池子欠账实测 565 ⇒ 50 会让每批重跑同一批头部）。
+      #    ★ 两边默认值**与代码逐字相同** ⇒ 不给 env 时行为不变（不制造新的漂移点）。
+      #    ★★ 必须写在 `environment:` 里 —— **这里**才是键值对的地盘：
+      #      我第一版把它写进了 `volumes:` 下面，而 **YAML 不报错**、Docker 也**不报错**
+      #      （短语法挂载是 `源:目标`，`DRIVE_PACKS=xxx` 看着就像一条合法相对路径挂载）
+      #      ⇒ 结果是"改了 compose、什么也没发生"，而且**顺手少挂了两个目录**。
+      #      ★ 这正是 `A.11` 那个形状（"参数看着生效、其实没生效"）；逮住它的是
+      #        `tests/test_drive_loop_service.py` ①k 那条**逐条**挂载断言。
+      - DRIVE_PACKS=${DRIVE_PACKS:-frds-top250-2024}
+      - DRIVE_LIMIT=${DRIVE_LIMIT:-500}
     volumes:
       # ① compose 目录，**同名同路径**（见上面「挂载为什么是整目录 1:1」）
       #    ★ 用绝对路径字面量，**不用 `./`** —— `./` 解析到容器内不存在的宿主路径，
@@ -289,24 +304,27 @@ services:
       # ② 媒体卷，同理必须同名同路径；而且 **§9：硬链接不能跨卷** ⇒
       #    农场与源数据必须同一条设备，所以这个挂载**只能是整卷**
       - /volume1/video:/volume1/video
-      # ③ ★★★ 时区：把 NAS 的 `/etc/localtime` 直接挂进来（2026-09-21 加）
-      #    ★ 起因（实测）：这个容器的**日志文本时间戳比真实时间快 8 小时**
-      #      （日志已写到 `09-22 01:33`，而真实是 `09-21 17:54`），
-      #      而**同时**它写的 epoch（`.drive-loop.state` 的 `heartbeat_ts`）**是对的**。
-      #    ★★ 根因：`TZ=${TZ}` 只让 `strftime` 按 +8 **显示**，而本镜像
-      #      （`python:3.12-slim`）**没有 tzdata** ⇒ 容器内部时间仍是 UTC ⇒
-      #      **`TZ` 被算了两遍**（UTC+8 再 +8）。★ 另外 5 个服务用的是
-      #      linuxserver 镜像、**自带 tzdata** ⇒ 它们时间是对的 ⇒ **只修这一个**。
-      #    ★★ 为什么挂文件而不是装 tzdata：装 tzdata 要**重新 build 镜像**，
-      #      而本项目有硬约束「只能本地 build + `docker load`」（`§26.5`）。
-      #      挂 `/etc/localtime` 是**运行时**解决，不改镜像、不破那条约束。
-      #    ★ 这是 **read-only** 挂载 —— 容器没有写它的理由。
-      #    ★★ 副作用（写明，不是没看见）：容器从此**跟随 NAS 的时区**，
-      #      不再受 `TZ` 环境变量控制。★ 要改时区就改 NAS，别改这里。
+      # ③ 时区：挂 NAS 的 `/etc/localtime`（2026-09-21 加）
+      #    ★★★ 2026-09-22 **更正起因**：原先这里写「日志时间戳比真实时间快 8 小时」，
+      #      **那是错的** —— 我把本机（Windows，**本来就是东八区**）的 `18:02`
+      #      当成 UTC 去和 NAS 的 `02:09` 比，才算出"差 8 小时"。
+      #      用户实测：`date -u` = `18:10 UTC`、`date -R` = `02:10 +0800` ——
+      #      **NAS 的时钟、时区、容器时间一直是对的**。（详见 `§26.46`）
+      #    ★★ 结论：**这个挂载不是修 bug 用的**，它只是"跟随 NAS"这个偏好。
+      #      留着是因为它**无害且确实让容器跟随 NAS**（read-only，不需要重建镜像
+      #      —— 本项目有「只能本地 build + `docker load`」的硬约束，装 tzdata 会破它）。
+      #      ★ 要撤它就单独撤：`git revert 646be99` 里那两行，并**顺手在容器里
+      #        再确认一次 `date` 与 NAS 一致**（★ 别再基于推断动手 —— 这次就是如此）。
+      #    ★★ 副作用（写明）：容器从此**跟随 NAS 时区**，`TZ` 环境变量不再说了算。
+      #      要改时区就改 NAS，别改这里。
       - /etc/localtime:/etc/localtime:ro
-      # ④ 时区名（`/etc/timezone` 是个文本文件，只有一行 `Asia/Shanghai`）——
-      #    ★ 有些库读它而不是读 `localtime`；两个都给，免得修一半。
-      - /etc/timezone:/etc/timezone:ro
+      # ④ ★★ 2026-09-22 **已删** `- /etc/timezone:/etc/timezone:ro`
+      #    ★ 实测 NAS 上**没有** `/etc/timezone` 这个文件
+      #      （容器里 `cat /etc/timezone` 报 `No such file or directory`）。
+      #    ★★ Docker 挂一个**不存在的宿主文件**时不会报错，而是**建一个空目录**顶上
+      #      ⇒ 容器里 `/etc/timezone` 变成一个**空目录** ⇒ 纯负担、零收益。
+      #    ★ 文档与实际**不一致**本身就是缺陷（`B.10`）—— 所以这里删掉并留痕，
+      #      而不是"反正不影响"就这么放着。
     # ★★ 这里必须是 `entrypoint:`，**不是 `command:`** —— 2026-09-17 实测踩过：
     #   镜像的 `ENTRYPOINT ["python", "/app/scripts/drive-loop.py"]` **不会被 command 覆盖**
     #   （`command:` 只替换 **CMD**）⇒ 写成 `command: ["sh", "...run-resident.sh"]` 时，

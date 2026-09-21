@@ -73,6 +73,25 @@ def ck(name: str, cond: bool, extra: str = "") -> None:
         print(f"  FAIL {name}{('  —— ' + extra) if extra else ''}")
 
 
+def ck_no(name: str, cond: bool, extra: str = "") -> None:
+    """**期望为假**的断言 —— 阴性对照专用（`ck` 只能表达"期望为真"）。
+
+    ★★ 为什么要它（2026-09-22 我自己踩的）：这个文件里的 `ck(name, cond, extra)`
+      第二个参数是**条件本身**，不是"got"。所以想断言"判据说 no"时，
+      写 `ck(name, (100 > 100))` 会**因为条件为假而报红** —— 报的是"断言失败"，
+      而它**恰恰印证了判据说 no**。⇒ 语义反了，必须有个专门的入口。
+    ★ 与 `test_once_gate.py` 的 `ck(name, got, want)` **同名不同义** ——
+      两个文件的 `ck` 不是同一个东西，别跨文件照抄（我在这里连报两条假红）。
+    """
+    global _ok, _bad
+    if not cond:
+        _ok += 1
+        print(f"  ok   {name}")
+    else:
+        _bad += 1
+        print(f"  FAIL {name}（★ 期望为假却为真）{('  —— ' + extra) if extra else ''}")
+
+
 COMPOSE = REPO / "docker-compose.yml"
 RESIDENT = REPO / "scripts" / "drive-loop-resident.sh"
 DOCKER_PY = REPO / "scripts" / "drive-loop.py"
@@ -155,6 +174,15 @@ if YML and isinstance(svcs.get("drive-loop"), dict):
     #   ★ 反向：**别同时写 command** —— 镜像的 ENTRYPOINT 已被 entrypoint 替换，
     #     再给 command 只会变成"传给 run-resident.sh 的多余参数"（脚本用 "$@" 透传，
     #     最终喂给 argparse ⇒ 又是 unrecognized arguments）。
+    #   ★★ 2026-09-22 修：原先用的是 `"command" not in dl`，而 `dl` 是**整个服务段**
+    #     ⇒ 只要**任何**注释或值里出现 `command` 这个词就报红（极易假红），
+    #     而**真正**要判的是「compose 的 `command:` **键**在不在」。
+    #     ⇒ 改成读**键**。★ 顺带：这一条当初是真有分辨力的（写错会假绿），
+    #       只是判据本身太脏 —— 属于"判据要能被证伪"那条的另一半：
+    #       判据也不该**对无关输入敏感**。
+    #   ★★ 而这一条**为什么值得单独提**：2026-09-22 我把 `DRIVE_PACKS=…` 误写进
+    #     `volumes:` 时，**没有任何断言报红**（①k 当时只逐条比 1:1，两条挂载本就
+    #     1:1 ⇒ 基线也是绿的）。补的 ①k2 就是给那种形状的。这里顺手记一笔。
     ck("★ ①h2 没有同时写 command（会变成喂给脚本的多余参数）",
        "command" not in dl, repr(dl.get("command")))
     #   ★ 绝对路径：镜像 WORKDIR 是 /app，相对路径在容器里找不到（挂载是 1:1 同名同路径）
@@ -175,24 +203,50 @@ if YML and isinstance(svcs.get("drive-loop"), dict):
        "reseed-net" in _nets and "qbit-net" in _nets, repr(_nets))
 
     # ---- ①k 两条挂载都是 1:1（左右逐字相等）-------------------------------
+    #   ★★ 2026-09-22 两个修（都只是**当初没被暴露**，不是新引入的）：
+    #     ① `:ro` 后缀此前**从来没被剥掉** —— 旧挂载里那两个时区项若走了这条分支
+    #        会把 `/etc/localtime:/etc/localtime:ro` 判成非 1:1 而**误报**。
+    #        这里改成在**渲染后的 dict 形态**（`source`/`target`）上断言 ——
+    #        Docker 自己已经把 `:ro` 剥进 `read_only` 了，不用我手写解析。
+    #        ★ 教训：**别用字符串切分去解析一个已经有结构化形态的东西**（`A.11`）。
+    #     ② 加 `when`/`read_only` 到跳过的组合里没用 —— 因为下面已经是按 dict 取
+    #        `source`/`target`，根本没碰 `mode`。
+    #   ★★ 但列表里现在**混进了不该看的东西**：`environment:` 被我加成了 YAML 列表
+    #      形态，而 **Docker 的 `environment` 长列表与 `volumes` 长列表长得一样**
+    #      （都是 `- KEY=VALUE`）⇒ 这条断言该显式只取 `volumes`。
     _vols = dl.get("volumes") or []
+    _envs = dl.get("environment") or []
     _bad_mounts = []
     for v in _vols:
-        if isinstance(v, dict):                  # 渲染后：{type,source,target}
+        if isinstance(v, dict):                  # 渲染后：{type,source,target,read_only}
             src, tgt = v.get("source"), v.get("target")
         else:
             parts = str(v).split(":")
+            # ★ `ro`/`rw` 是**模式**不是路径 ⇒ 先剥掉再比（`A.11`：别让判据需要转义）
+            if len(parts) >= 3 and parts[-1] in ("ro", "rw", "z", "Z"):
+                parts = parts[:-1]
             src, tgt = (parts[0], parts[1]) if len(parts) >= 2 else ("", "")
         if src != tgt or not src:
             _bad_mounts.append(str(v))
-    ck("★ ①k 两条挂载都是 1:1 同名同路径（代码里的路径全是绝对的，挑挂会静默退化）",
+    ck("★ ①k 每条挂载都是 1:1 同名同路径（代码里的路径全是绝对的，挑挂会静默退化）",
        _vols and not _bad_mounts, repr(_bad_mounts or _vols))
+    ck("★★ ①k2 且**没有把 environment 混进 volumes**（Docker 两种长列表形态相同，"
+       "写成一样的缩进时 yaml 不会替你分开）",
+       all("=" not in str(v) for v in _vols), repr([str(v) for v in _vols]))
+    ck("★★ ①k3 `/etc/timezone` **不在**挂载里 —— 实测 NAS 上没这个文件，"
+       "Docker 会建个空目录顶上（纯负担）",
+       not any("timezone" in str(v) for v in _vols), repr([str(v) for v in _vols]))
     #   ★ 顺带钉住**必须是整目录/整卷**：挂成子目录会静默退化
     #   （`first_existing()` 返回 None + 一行 warning），而不是报错。
     _vol_s = " ".join(str(v) for v in _vols)
     ck("★ ①l 挂的是整个 compose 目录 + 整个媒体卷（不是挑子目录）",
        "/volume2/docker_ssd/prowlarr_cross-seed_autohardlink" in _vol_s
        and "/volume1/video" in _vol_s, _vol_s)
+    #   ★★ 而那两个覆盖口**本来该在 environment 里** —— 上面这条就是它们的地契：
+    #     它们必须在 environment（不是 volumes）下，否则既会踩 ①k，也不会生效。
+    _env_s = " ".join(str(v) for v in _envs)
+    ck("★★ ①l2 DRIVE_PACKS / DRIVE_LIMIT 在 environment 里（覆盖口，不是挂载）",
+       "DRIVE_PACKS" in _env_s and "DRIVE_LIMIT" in _env_s, _env_s)
 
     # ---- ①m 容器方言：PY / SUDO ----------------------------------------
     _env = dl.get("environment") or []
@@ -380,9 +434,46 @@ ck("★★ ③f --indexers 与 drive-loop-nas.sh（生产在跑的那份）**逐
 
 _rl_s = _argline(RESIDENT, "--limit")
 _nl_s = _argline(NAS_SH, "--limit")
-ck("③g --limit 与 run.sh 一致（两个入口的批量口径不许分叉）",
-   _rl_s is not None and _rl_s == _nl_s,
-   f"resident={_rl_s!r} nas={_nl_s!r}")
+#   ★★★ 2026-09-22 **这条判据被推翻并改写**（用户拍「调大 --limit」）——
+#     原文是「`--limit` 与 run.sh **逐字相同**，两个入口的批量口径不许分叉」。
+#     ★ 它错在**把"同一个值"当成"同一个口径"**：
+#       · `run-resident.sh` 带 `--pool` ⇒ `--limit` 是**全局**（一池 565 部）
+#       · `drive-loop-nas.sh` **不带** `--pool` ⇒ `--limit` 是**每包**（一部 232 部）
+#       ⇒ 两个数**本来就不该相等**（50 vs 50 只是"碰巧一样"，不是"一致性"）。
+#     ★ 真正的不变量是**各自内部自洽** + **分叉是显式且被记录的**（同 ③l 的 `--pool`）。
+#       所以这里改成三条：
+#         ① resident 的值必须是"可被 env 覆盖的数字"（`${DRIVE_LIMIT:-N}` 形态）；
+#         ② N（默认值）必须**大于** nas 那份 —— 合池下的全局额度若 ≤ 每包额度，
+#            那等于**没开池还倒亏**（一批连一个包的量都吃不下）；
+#         ③ 两份入口**都**必须是显式数字（不许出现"没写 --limit 靠默认值"）。
+#     ★ 为什么不用"resident 必须 > 池子欠账 565"：那个数**会变**，写死等于把
+#       一次读数焊成判据（`B.10`：理由有保质期）。这里只钉**方向**（严格大于）。
+_m = re.search(r"\$\{DRIVE_LIMIT:-(\d+)\}", _rl_s or "")
+ck("★★ ③g1 resident 的 --limit 是「可被 DRIVE_LIMIT 覆盖的数字」形态"
+   "（同 --packs 的覆盖口，改额度不必改代码）",
+   _m is not None, f"resident={_rl_s!r}")
+ck("★★ ③g2 nas 那份 --limit 是显式数字（不许靠默认值 —— 那是「看着生效」的坑）",
+   _nl_s is not None and _nl_s.isdigit(), f"nas={_nl_s!r}")
+if _m and _nl_s and _nl_s.isdigit():
+    _res_n, _nas_n = int(_m.group(1)), int(_nl_s)
+    ck("★★★ ③g3 合池那份的额度**严格大于**每包那份 —— 否则合池等于白开"
+       "（全局 50 ≤ 每包 50 ⇒ 一批连一个包的量都吃不下）",
+       _res_n > _nas_n, f"resident={_res_n} nas={_nas_n}")
+    #   ★★ 阴性对照 —— 用 `ck_no`（**期望为假**），不是 `ck`。
+    #     被我验的那个表达式就是下面 `a > b`：喂"相等"和"更小"都必须说 no。
+    #     ★ **教训**：把表达式喂进去时，"期望为假"要用对入口；
+    #       写成 `ck(name, (100 > 100), False)` 是**把期望值塞进了 extra**，
+    #       于是"判据工作正常"被读成"断言失败" —— 顺手把阴性对照废掉。
+    ck_no("★ ③g4 阴性对照：同一比较喂「相等」的一组 → 判据说 no（不是恒真）",
+          (100 > 100), "100 > 100")
+    ck_no("★ ③g4b 阴性对照 ②：喂「resident 更小」→ 也说 no",
+          (30 > 50), "30 > 50")
+    #   ★ 阳性对照：把**判据本身**再喂一组真例，证明它**同时**能说 yes。
+    #     只有这四条一起，"③g3 是活的判据"才算立住（否则可能是个恒假的式子）。
+    ck("★ ③g4c 阳性对照：喂一组「合池更大」→ 说 yes",
+       (500 > 50), "500 > 50")
+else:
+    ck("★★ ③g3/g4 前提不成立（上面两条已经报红）", False, True)
 
 # ---- ③h 留痕与前置闸门 ----------------------------------------------------
 ck("③h attempts.log 的行带 [resident] 标记（两条路共用这个文件，"
