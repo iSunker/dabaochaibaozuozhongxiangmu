@@ -370,6 +370,7 @@ LOCAL_ONLY = [
     #   这一版把要跑的东西整个装进一个 heredoc，`docker exec -i` 喂 stdin
     #   ⇒ 宿主上**只需一个文件**（`cat > p.sh` 一次粘完）。
     #   ★ 与 `chk-volume1-free.sh` 同族：**在 NAS 上跑**、只读、**故意不进白名单**。
+    (r"^scripts/diag/q\.py$",                     "待搜池查询（在 **NAS** 上经 docker exec 跑；只读 mode=ro + query_only、**回读 state.py 的 md5** 否则拒绝出数；诊断件，故意不部署）"),
     (r"^scripts/diag/probe-pool-nas\.sh$",        "`--pool` 空池探针·宿主侧单文件版（在 **NAS** 上跑；heredoc→docker exec -i，只读、零请求、无凭据；故意不部署）"),
 ]
 
