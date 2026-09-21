@@ -174,8 +174,12 @@ import tempfile as _tf                              # noqa: E402
 
 # ★★ 先造夹具、**再**上绊线（`tp.os` 与 `tempfile` 是**同一个模块对象**：改它就是改全局）。
 stub_env = pathlib.Path(_tf.mkdtemp(prefix="tp-trip-")) / "stub.env"
-stub_env.write_text("TORZNAB_URLS=http://prowlarr:9696/1/api?apikey=%s\n"
-                    % ("c" * 32), encoding="utf-8")
+stub_env.write_text(
+    # ★ 两个条目：① 让 --id 1 找得到；② 让 --any 跳到 2 时**也有**可跳的
+    #   （否则 ⑩ 那条会报「没有 path 为 /2/api 的条目」，而不是走到闸后面的逻辑）。
+    "TORZNAB_URLS=http://prowlarr:9696/1/api?apikey=%s,"
+    "http://prowlarr:9696/2/api?apikey=%s\n" % ("c" * 32, "c" * 32),
+    encoding="utf-8")
 
 _saved = {}
 
@@ -252,21 +256,32 @@ ck("★ 且它跑到头了（rc 是个真值，说明没被绊线自己掐断）
 print("  --   ★ 为什么这条比 AST 黑名单强：黑名单漏掉过 `__import__(\"os\").makedirs`")
 print("      （实测：第一版断言**仍是绿的** —— `ERR-AI-05` 形状），绊线兜住了整类。")
 
-# ★ subprocess / shutil 连 import 都不许（这个探针不该有执行能力）
+# ★ subprocess / shutil / requests 连 import 都不许（这个探针不该有执行能力）。
+# ★★ `socket` **另当别论**：它只用来 `except socket.timeout`（**接住超时**），
+#    不是执行能力 —— 而"有没有执行能力"才是这条断言要钉的。
+#    ⇒ ★ 所以判据要**更准**：不是"不许 import socket"，而是
+#      **不许拿 socket 去连别的东西**（`socket.socket` / `create_connection` 之类）。
 import ast                                          # noqa: E402
 
 src = SCRIPT.read_text(encoding="utf-8")
 tree = ast.parse(src)
-BAD_MODULES = {"subprocess", "shutil", "socket", "requests"}
+BAD_MODULES = {"subprocess", "shutil", "requests"}
 imported = set()
 for node in ast.walk(tree):
     if isinstance(node, ast.Import):
         imported.update(a.name.split(".")[0] for a in node.names)
     if isinstance(node, ast.ImportFrom) and node.module:
         imported.add(node.module.split(".")[0])
-ck("★ 不 import subprocess / shutil / socket / requests",
+ck("★ 不 import subprocess / shutil / requests",
    not (imported & BAD_MODULES), f"发现：{sorted(imported & BAD_MODULES)}")
 ck("★ 不用 os.system（文本层再钉一道）", "os.system" not in src, "出现了 os.system")
+# ★★ `socket` 只许用来**接住超时**，不许拿去**建连接**
+_sock_calls = [n for n in ast.walk(tree)
+               if isinstance(n, ast.Attribute) and n.attr in
+               ("socket", "create_connection", "create_server", "socketpair")]
+ck("★★ `socket` 只用于 `except socket.timeout`，**不建任何连接**",
+   not _sock_calls,
+   f"发现 socket 建连接的调用：{[a.attr for a in _sock_calls]}")
 
 # ==========================================================================
 print("\n⑥ 命令行：`--dump-attrs` 与 `--raw` 是**并列**开关，且文档与代码一致")
@@ -416,6 +431,187 @@ ck("★ 剧名被 URL 编码（中文剧名不会把请求弄坏）",
    _queries["1"])
 print("  --   ★★ 这一格的意义：A 的『两个对照』**至少在对的那条路上** ——")
 print("      ★ 至于站点**服务端**认不认 season，只能真跑（那才耗额度）。")
+
+# ==========================================================================
+print("\n⑧ ★★★ 退避闸：**退避期不发请求**（纯函数，离线证）")
+# --------------------------------------------------------------------------
+# ★★ 这一节钉的是 2026-09-21 实测暴露的那个洞：我**手动**查过两只时钟、
+#    确认 HDFans「窗口已过」，**下一条命令它还是 429**。
+#    ⇒ ★ 判据：**「这个站现在能不能问」必须由程序在读的那一刻算**，
+#      人手查一次的结果**在两次调用之间就会过期**。
+# ★ 而且「判不出来」这一支**必须与「没被禁」分开** ——
+#   否则一个解析失败会被读成"可以跑"，于是又拿到一个假读数（`B.10`：未验 ≠ 无）。
+import time as _tm                                    # noqa: E402
+
+_NOW = _tm.time()
+_FUTURE = "2099-09-21T22:03:23Z"
+_PAST = "2000-01-01T00:00:00Z"
+
+ok1, bl1 = tp.disarm_at(["1"], {}, _NOW)
+ck("★ 数组里没有该站 ⇒ 可用（= 站点没被 Prowlarr 禁）", ok1 == ["1"] and not bl1,
+   f"ok={ok1} blocked={bl1}")
+ok2, bl2 = tp.disarm_at(["1"], {"1": _FUTURE}, _NOW)
+ck("★★ `disabledTill` 在未来 ⇒ **被拦住**（这就是那次 429 的正解）",
+   ok2 == [] and len(bl2) == 1, f"ok={ok2} blocked={bl2}")
+ck("★ 拦截理由里**带还剩多久**（人要知道等多久，不是只知道「被拦了」）",
+   bl2 and "还剩" in bl2[0][1], f"{bl2}")
+ok3, _ = tp.disarm_at(["1"], {"1": _PAST}, _NOW)
+ck("★ `disabledTill` 已过期 ⇒ 放行", ok3 == ["1"], f"ok={ok3}")
+# ★★★ 最关键的两格：**判不出来时不许放行**
+ok4, bl4 = tp.disarm_at(["1"], {"1": "garbage"}, _NOW)
+ck("★★★ `disabledTill` 解析不了 ⇒ **拦住**（判不出 ≠ 没被禁）",
+   ok4 == [] and bl4, f"ok={ok4} blocked={bl4}")
+ok5, bl5 = tp.disarm_at(["1"], {"1": 12345}, _NOW)
+ck("★★★ `disabledTill` 是意外类型 ⇒ **拦住**（同上，不放行）",
+   ok5 == [] and bl5, f"ok={ok5} blocked={bl5}")
+# ★ --force 是唯一能绕过它的东西，且必须真的绕过去（否则那个开关是假的）
+ok6, bl6 = tp.disarm_at(["1", "2"], {"1": _FUTURE, "2": _FUTURE}, _NOW, force=True)
+ck("★ `--force` 能绕过（★ 这是唯一出口，且它是个显式开关）",
+   ok6 == ["1", "2"] and not bl6, f"ok={ok6} blocked={bl6}")
+# ★ 挑站顺序：全被禁 ⇒ 什么都不放行（**不许"矮子里拔将军"**）
+ok7, bl7 = tp.disarm_at(["1", "2", "4", "5"], {k: _FUTURE for k in ("1", "2", "4", "5")}, _NOW)
+ck("★★ 全被禁 ⇒ 一个都不放行（**不许矮子里拔将军**）",
+   ok7 == [] and len(bl7) == 4, f"ok={ok7} nblocked={len(bl7)}")
+
+# ★ 超时必须是**独立退出码 4**，且**不许**和 429 混成一个
+ck("★★ 超时有自己的退出码 4（源码里 `return 4`）", "return 4" in src, "没有 return 4")
+ck("★★ 超时分支排在宽 `except Exception` **之前**（否则被吞成 1）",
+   src.index("TimeoutError, socket.timeout") < src.index("请求失败：%s: %s"),
+   "超时被宽 except 接走了 ⇒ 它和「网络不通」读数一样")
+ck("★ 超时输出里明说它**不是**「没有季字段」",
+   "响应里没有季字段" in src, "没交代超时不等于「没有」")
+ck("★ 超时输出里给了「三种可能分不开」那条判读",
+   "分不开" in src, "没给判读")
+ck("★ `--timeout` 可调（默认仍是 30）", "--timeout" in src and "timeout = 30" in src,
+   "超时不可调")
+
+# ==========================================================================
+print("\n⑨ ★★ 命令行默认值：**不许**把带退避的站当默认的 tacit 目标")
+# --------------------------------------------------------------------------
+ck("★ `--any` 与 `--force` 都在源码里被解析",
+   '"--any"' in src and '"--force"' in src, "开关没实现")
+ck("★★ 退避闸读不到状态时，`--any` **不生效**（不猜一个候选出来）",
+   "不自动挑站" in src, "读不到状态时它还是挑了个站 ⇒ 那是猜")
+ck("★ 退避闸的输出里点名了 `ERR-SVC-12`（退避时读数是假的）",
+   "ERR-SVC-12" in src, "没交代为什么退避期不能跑")
+# ★★ 退避闸**只读 Prowlarr 本地的 indexerstatus**，**绝不**去调 `/api/v1/indexer`
+#   —— 那个响应带 `fields`（cookie / passkey）。★ 这是"脱敏纪律①：能不取就不取"。
+# ★ 我的第一版这条写得**很糟**：它拿 `"/api/v1/indexer\"" ... not in src` 当判据，
+#   结果**命中的是 docstring 里那句解释**（我正是在那句里写下了这个接口名），
+#   于是它**恒定报红** —— 一条"永远红的闸门"（同 `ERR-AI-06`：常红 = 没人看）。
+# ⇒ 改成**只查真正的调用点**：AST 里 `urllib.request.Request(...)` 的实参。
+_urls_in_calls = []
+for _n in ast.walk(tree):
+    if (isinstance(_n, ast.Call) and isinstance(_n.func, ast.Attribute)
+            and _n.func.attr == "Request"):
+        for _a in _n.args:
+            if isinstance(_a, ast.Constant) and isinstance(_a.value, str):
+                _urls_in_calls.append(_a.value)
+            if isinstance(_a, ast.BinOp):        # 拼接出来的（base + "...")
+                for _sub in ast.walk(_a):
+                    if isinstance(_sub, ast.Constant) and isinstance(_sub.value, str):
+                        _urls_in_calls.append(_sub.value)
+ck("★★ 退避闸只调 `indexerstatus`，**不调** `/api/v1/indexer`（那个带 cookie/passkey）",
+   any("indexerstatus" in u for u in _urls_in_calls)
+   and not any(u.rstrip("/").endswith("/api/v1/indexer") for u in _urls_in_calls),
+   f"实际请求的路径片段：{[u for u in _urls_in_calls if u.startswith('/')]}")
+print("  --   ★★ 为什么这一节值得 20 行断言：这一轮**三次命令全是废读数**，")
+print("      ★ 而根因不是「站点不给季字段」，是「我在退避期问了它」（ERR-SVC-12）。")
+
+# ==========================================================================
+print("\n⑩ ★★★ 接线检查：`main()` **真的**把退避闸用上了吗（行为判据，不是源码文本）")
+# --------------------------------------------------------------------------
+# ★★★ 为什么必须有这一节：⑧ 测的是 `disarm_at` **这个纯函数**。
+#     而**实测**——把 `fetch_disabled(...)` 换成 `({}, None)`（= 退避闸永远放行）
+#     之后，⑧ 的 20 条断言**一条都不红**（红 0）。
+#     ★ 根因：**纯函数对 ≠ main() 用了它**。这正是 `ERR-AI-05` 的又一个变体：
+#       "我测了那段逻辑"与"那段逻辑被接上了"**是两件事**。
+# ⇒ 判据：把整个 `main()` 跑一遍，**喂一份"该站被禁"的状态**，看它**拒不拒绝**。
+#   ★ 做法与 ⑦ 同一形状：把 urlopen 换掉 —— 但这次**要能分别回答两个接口**：
+#     ① Prowlarr 本地 `/api/v1/indexerstatus`（退避闸要读它）
+#     ② 站点的 `/N/api`（真正的查询 —— ★ **一旦走到这里，就是闸没拦住**）
+class _FakeResp2:
+    """⑦ 的 `_FakeResp` 无参；⑩ 要能分别喂两段不同的 body ⇒ 单独一个带参的。"""
+    status = 200
+
+    def __init__(self, body):
+        self._b = body
+
+    def read(self):
+        return self._b
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+_idx_hits = []          # 走到"真正的站点查询"就算一次
+
+
+def _fake_urlopen2(req, timeout=None):
+    u = req.full_url
+    if "/api/v1/indexerstatus" in u:
+        # ★ 伪造：id=1 被禁用到一个很远的将来 ⇒ 闸**必须**拦住 --id 1
+        return _FakeResp2(b'[{"indexerId":1,"disabledTill":"2099-01-01T00:00:00Z"}]')
+    _idx_hits.append(u)                              # ★ 这是"闸没拦住"的证据
+    return _FakeResp2(b'<rss><channel></channel></rss>')
+
+
+_real2 = tp.urllib.request.urlopen
+tp.urllib.request.urlopen = _fake_urlopen2
+try:
+    # ① --id 1（被禁）⇒ 必须走退避闸、**不**碰站点
+    _idx_hits.clear()
+    with contextlib.redirect_stdout(io.StringIO()) as _cap1:
+        _rc1 = tp.main(["T", "1", "--env", str(stub_env)])
+    _out1 = _cap1.getvalue()
+    ck("★★★ 该站被禁时 ⇒ `main()` 返回 3（不是 0/1）", _rc1 == 3, f"rc={_rc1}")
+    ck("★★★ 且**根本没有向站点发那个查询**（`_idx_hits` 为空）",
+       not _idx_hits, f"发了 {len(_idx_hits)} 次 ⇒ 退避闸没接上")
+    ck("★ 且输出里点名了「不发请求」", "不发请求" in _out1, _out1[-200:])
+
+    # ② --any：id=1 被禁 ⇒ 应跳过去挑下一个（2）
+    _idx_hits.clear()
+    with contextlib.redirect_stdout(io.StringIO()) as _cap2:
+        _rc2 = tp.main(["T", "1", "--any", "--env", str(stub_env)])
+    _out2 = _cap2.getvalue()
+    ck("★★ `--any` 跳过了被禁的 id=1（输出里说挑中的不是 1）",
+       "挑中 id=2" in _out2 or ("挑中 id=" in _out2 and "挑中 id=1" not in _out2),
+       _out2[-300:])
+    ck("★★ 且这一次**确实**向站点发了（跳过被禁的之后就该真查）",
+       bool(_idx_hits), "`--any` 挑到站之后却没发查询")
+
+    # ③ --force：明确绕过 ⇒ 必须真的发出去（否则那个开关是假的）
+    _idx_hits.clear()
+    with contextlib.redirect_stdout(io.StringIO()):
+        _rc3 = tp.main(["T", "1", "--force", "--env", str(stub_env)])
+    ck("★★ `--force` 真能绕过退避闸（发出去了）", bool(_idx_hits),
+       "`--force` 却还是被拦住了 ⇒ 这个开关是假的")
+    ck("★ 而且它**照常出结果**（rc=0，不是把它变成错误路径）", _rc3 == 0, f"rc={_rc3}")
+
+    # ④ ★ 反向：退避**读不到**时不许猜一个候选出来
+    def _fake_urlopen3(req, timeout=None):
+        if "/api/v1/indexerstatus" in req.full_url:
+            raise OSError("假装读不到状态")
+        _idx_hits.append(req.full_url)
+        return _FakeResp2(b'<rss><channel></channel></rss>')
+
+    tp.urllib.request.urlopen = _fake_urlopen3
+    _idx_hits.clear()
+    with contextlib.redirect_stdout(io.StringIO()) as _cap4:
+        _rc4 = tp.main(["T", "1", "--any", "--env", str(stub_env)])
+    _out4 = _cap4.getvalue()
+    ck("★★★ 退避状态**读不到**时 ⇒ 返回 3、且不猜候选", _rc4 == 3, f"rc={_rc4}")
+    ck("★★★ 且同样**没发站点查询**", not _idx_hits, f"发了 {len(_idx_hits)} 次")
+    ck("★ 且明说「读不到 ≠ 没被禁」", "读不到" in _out4 and "不自动挑站" in _out4,
+       _out4[-250:])
+finally:
+    tp.urllib.request.urlopen = _real2
+print("  --   ★★★ 这一节是 ⑧ 的**接线**对照：⑧ 证明闸的逻辑对，⑩ 证明闸**真的接上了**。")
+print("      ★ 实测：把 fetch_disabled 换成空 map（闸永远放行）⇒ ⑧ 的 20 条**一条不红**，")
+print("        本条**立刻红**。★ 同 ERR-AI-05：「测了那段逻辑」≠「那段逻辑被接上了」。")
 
 print(f"\n{'=' * 60}")
 print(f"断言 {_ok + _bad} 条：{_ok} 过 / {_bad} 失败")
