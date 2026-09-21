@@ -919,6 +919,95 @@ def qb_999_watch(args) -> tuple[str, dict]:
 
 
 # --------------------------------------------------------------------------- #
+# qB「卡种」—— 匹配到了却下不来（`e404b1ca#7`）
+# --------------------------------------------------------------------------- #
+# 判据本体在 `orchestrator/state.py`（`qb_stalled_band`）—— 同上面几条：
+# **本进程跑在 NAS 宿主机上**，判据只有一份才谈得上两侧一致。
+#
+# ★★ 为什么要有它（用户 2026-09-20 的场景：「涌入上百个种子做不下」）：
+#   `MATCHED` 已在 `DONE_STAGES`（**不重搜是对的**，代码早就这样），
+#   `qb_999_band` 也早有了。**缺的是"看得见"** —— 这批片子
+#     · 不进 `UNMATCHED` 的分池计数（它们不是"没搜到"）
+#     · 不算 `SEEDING`（进度里既不加分子也不加分母）
+#     · 不卡 999（那条要求 `progress ≥ 0.99`，而"做不下"的大多没到）
+#   ⇒ **从所有现有观测里同时漏出去**。这正是 §26.33 那个形状：
+#     观测坏了，下游全是假红/假绿。
+#
+# ★ 基线：同 `qb_999_watch` 的形状（首读只记基线不响、一致则静默、
+#   缩回静默采纳但正文写出来）。★ 用**同一个** `.reconcile.state` 文件、
+#   **另一个**键 —— 那条"读→改→写必须紧挨着"的约束（见 `qb_999_watch` 里那段）
+#   对 `_reconcile_write` 成立，本函数照同样的规矩紧挨着读写，所以安全。
+STALLED_BASELINE_KEY = "_qb_stalled_baseline"
+
+
+def qb_stalled_watch(args) -> tuple[str, dict]:
+    """问 :3060 要「卡种」的条数 → (给日报正文的一段, 给 metrics 的字典)。
+
+    ★ **绝不抛**（同 `qb_999_watch`）：它挂在每天一次的日报里，而日报挂在
+      每 15 分钟一批的生产循环里。一次 qB 抖动不该让整份日报消失。
+    ★ 读不到时 metrics 给 `n/a` —— **必须给**，否则 TSV 里「这次读失败了」和
+      「那天根本没跑」长得一模一样，事后分不开。
+    ★ `total`（分母）跟着走：单说「3 条」判不了是 3/932 还是 3/5。
+    ★★ **只识别 + 通知，不碰 qB**（不 pause / 不删 / 不改 tag）——
+      同 `reseed_freeze` 那条**否决记录**：用户要的是先"看见"。
+    """
+    url = getattr(args, "qbit_url", None)
+    if not url:
+        return ("qB 卡种：跳过（没有 --qbit-url）",
+                {"qb_stalled": "no-url", "qb_stalled_total": "no-url"})
+    try:
+        r = S.qb_stalled_band(S.qbit_all_torrents(url))
+    except Exception as e:              # noqa: BLE001 —— 附属观测，绝不拖垮日报
+        LOG.debug("读 qB 卡种失败", exc_info=True)
+        return (f"qB 卡种：读不到（{type(e).__name__}: {e}）",
+                {"qb_stalled": "n/a", "qb_stalled_total": "n/a"})
+
+    # ★★ 读 → 改 → 写**紧挨着**（约束同 `qb_999_watch` 里那段注释）。
+    live = _reconcile_read()
+    raw = live.get(STALLED_BASELINE_KEY)
+    first = raw is None                 # ★ 「从没读过」与「读到过一个空集」是两回事
+    base = set(_qb_999_norm(raw))
+    cur = set(r["hashes"])
+    new = sorted(cur - base)
+    live[STALLED_BASELINE_KEY] = sorted(cur)     # ★ 写 == cur，**不是 base ∪ cur**
+    _reconcile_write(live)
+
+    if r["n"] == 0 and first and not cur:
+        # ★ 从来没卡过、现在也没有 ⇒ **一句话就够**，不配基线（给"没事"配基线没意义）。
+        return (f"qB 卡种（分母 {r['total']}）：0 条",
+                {"qb_stalled": 0, "qb_stalled_new": 0, "qb_stalled_total": r["total"]})
+    if first:
+        # ★ 首读**不响**（#47 立的规矩）：现存的那几条是"已接受的现状"，
+        #   不是今天新冒出来的。响一次就得配冷却，而那正是要避免的噪音。
+        verdict = f"首次读数，记基线（{r['n']} 条）"
+    elif new:
+        verdict = f"新增 {len(new)} 条"
+    elif cur == base:
+        verdict = "与基线一致"
+    else:
+        # 缩回（含清空）：静默采纳，但**必须在正文里写出来** —— 否则「清掉了」
+        # 和「判据没读到」从外面看一模一样（#47 的教训，别省这一句）。
+        gone = len(base) - len(cur)
+        verdict = f"比基线少 {gone} 条（已采纳）" + ("—— 已清空" if not cur else "")
+
+    # ★ 按档列（**只列命中过的档**）：四档的处置方向不同，合并成一个数就再也分不开。
+    detail = ""
+    if r["by_state"]:
+        parts = "，".join(f"{k} {v}" for k, v in sorted(r["by_state"].items()))
+        detail = f"  分档：{parts}\n"
+    note = (f"qB 卡种（分母 {r['total']}）\n"
+            f"  卡住的（stalledDL/metaDL/checkingDL/error）： {r['n']} 条 —— {verdict}\n"
+            f"{detail}")
+    # ★ 只报数量与档名，**不报种子名 / hash**（同 `qb_999_watch` 的口径：
+    #   日报是要发出去的）。`hashes` 只参与基线运算，不进正文、不进 metrics。
+    m: dict = {"qb_stalled": r["n"], "qb_stalled_total": r["total"],
+               "qb_stalled_new": 0 if first else len(new)}
+    for k, v in r["by_state"].items():
+        m[f"qb_stalled_{k}"] = v
+    return note, m
+
+
+# --------------------------------------------------------------------------- #
 # qB「装不出来」—— 缺的那一点点永远补不上的单种（**只识别 + 通知，不碰 qB**）
 # --------------------------------------------------------------------------- #
 # 判据本体在 `orchestrator/state.py`（`reseed_unbuildable_band` / `reseed_no_peer_band`），
@@ -2047,6 +2136,16 @@ def report_daily(args, *, force: bool = False, farm_note: str = "") -> bool:
     qb_note, qb_metrics = qb_999_watch(args)
     parts.append(qb_note)
 
+    # qB「卡种」：匹配到了却下不来（`stalledDL`/`metaDL`/`checkingDL`/`error`）。
+    # ★ 与上面那条**并列**、同样受 `reconcile_watch` 那条「读→改→写必须紧挨着」
+    #   的约束（它也用 `.reconcile.state`，只是**另一个键**）—— 详见
+    #   `qb_999_watch` 里的说明。**别挪进 `reconcile_watch` 内部**。
+    # ★★ 它是 `qb_999_watch` 的**互补**观测，不是重复：那条只看得见
+    #   `progress ≥ 0.99` 且停滞 >24h 的；用户场景里"做不下"的大多**没到 99%**
+    #   ⇒ 那些**只有这条**看得见（`e404b1ca#7`）。
+    st_note, st_metrics = qb_stalled_watch(args)
+    parts.append(st_note)
+
     # 「装不出来」/「没 peer」（见本节函数上方的说明；★ 只识别 + 通知，**不碰 qB**）。
     # ★ 用自己的状态文件 `.reseed-freeze.state`，所以**不**受 `reconcile_watch`
     #   那条「读→改→写」的约束 —— 但**仍然摆在它外面**：缘由与 `qb_999_watch`
@@ -2065,7 +2164,7 @@ def report_daily(args, *, force: bool = False, farm_note: str = "") -> bool:
     #   **不记正文**）—— 详见 iyuu_watch 的说明。
     if emit("batch", "每日台账", body=body, key="daily",
             metrics={"day": today, **iyuu_metrics, **rec_metrics, **qb_metrics,
-                     **fz_metrics, **lg_metrics, **pp_metrics}):
+                     **st_metrics, **fz_metrics, **lg_metrics, **pp_metrics}):
         _daily_set(today)
         LOG.info("已投递每日台账（额度 + 趋势）")
         return True
