@@ -98,6 +98,29 @@ def is_alert(rule):
 KNOWN_NAS = [
     # ---- 生产独有：含凭据 / 运行时状态，**故意**不进白名单（deploy.sh 原则第 2 条）----
     (r"^\.env$",                                  "真实凭据"),
+    # ★★ 2026-09-21 加：**SMB 客户端的临时残留**，不是任何人有意放上去的东西。
+    #   实测 `stat`：0 字节、属主 **197609(艾森克)**（= Windows 侧用户，NAS 上的
+    #   服务进程一律 root，见 `A.2.1`）、Birth == Modify == 创建那一刻（**从未被写过**）、
+    #   名字形如 `_AW7IV~D` —— 8.3 短名 + `~` + 一位数字的 Win32 保留形状。
+    #   ★ 创建时刻（09-21 13:03）**本机正在做整目录的 SMB 遍历**（`check-deploy-drift`
+    #     那类扫描 + `ls` 递归）⇒ 这是客户端在探索 / 写临时文件时留下的，**服务端从未引用它**。
+    #   ★ 为什么必须登记而不是"删掉了事"：它**没有可复现的来源**（代码里 zero 处引用，
+    #     已 grep）⇒ 删了下次扫描还会再报一遍「未知」⇒ 哨兵**常红 = 没有哨兵**
+    #     （本节下方 `__pycache__` 那条同族：哨兵量的是「NAS 上有什么」）。
+    #   ★ **不写成宽规则**（如 `^_.*~.$`）：那会把将来任何同形状的东西都静默放行
+    #     —— 同 `.state.tmp` 那条的取舍。这里锚死这个**已经读出来的具体名字**。
+    (r"^_AW7IV~D$",                               "★ SMB 客户端临时残留（0 字节 / 属主=Windows 侧用户 / 从未被写过）"),
+    # ★★ 2026-09-21 加：**一个 0 字节的孤儿库** —— 真正的状态库是 `drive-loop/hlink/state.db`。
+    #   ★ 生成它的**那条路已经堵住了**：`StateStore.__init__` 的 `create=False`（默认）
+    #     会在文件不在时抛 `FileNotFoundError`，`create=True` 只有 `init` 与测试夹具显式传
+    #     ⇒ 「打错一层路径就在媒体目录里留下一个空 state.db」这个现场**不会再发生**。
+    #   ★ 而 `RESEED_STATE_DB=/state/state.db`（compose 的 orchestrator 服务）**是正常的** ——
+    #     它容器内挂在 `:ro`、指向 `drive-loop/hlink`，那个赋值**不是**这条的成因。
+    #   ★ 所以它是**已定性的存量**：内容为空（0 字节）⇒ 删掉它**不会丢任何读数**。
+    #   ★★ 处置建议（`--cleanup` 的规矩：只 mv 不 rm）：搬进 `_cleanup-<日期>/` 再删。
+    #     记录在案是为了**它长得像"真库"**这件事本身值得留痕（同 `ERR-SQL-04` 的形状：
+    #     0 字节的 state.db 会伪装成「一部都没登记」）。
+    (r"^drive-loop/state\.db$",                   "★ 0 字节孤儿库（真库在 drive-loop/hlink/state.db；成因已堵）"),
     (r"^prowlarr/",                               "站点 cookie + Prowlarr 库"),
     (r"^cross-seed/cross-seed\.db.*",             "cross-seed 库（含 -wal/-shm）"),
     (r"^cross-seed/cross-seeds/",                 "cross-seed 硬链接产物"),
