@@ -1689,6 +1689,50 @@ class StateStore:
             out.append((r, due))
         return out
 
+    def todo_pooled(self, packs: list[str], *, indexers_now: list[str] | None = None,
+                    include_cooldown: bool = False,
+                    cadence_days: int = DEFAULT_CADENCE_DAYS,
+                    cadence_by_indexer: dict[str, int] | None = None,
+                    now: datetime | None = None,
+                    limit: int | None = None) -> list[tuple[str, sqlite3.Row, list[str]]]:
+        """★★ **跨包合池**（`e404b1ca#6` ①，用户 2026-09-20 拍：方案 a）。
+
+        返回 `[(pack, row, due_indexers), …]`，**已按池序排好、已按 `limit` 截断**。
+
+        **为什么要有它**（用户原话：「一批多少种子不能按包定，三包合起来取 N 个」）——
+        原先批次来源是**按包轮换**（`once_round` 的 `(last_pack_idx+1) % len(packs)`），
+        每次只跑一个包，于是：
+          · `--limit 50` 是**每包** 50，三包名义上一轮吃 150
+          · 一个小包（`mbf` 只有 4 部、且实测 `Found 0 torrents`）**也会占掉一整个批次**
+          · 而欠账全在 `frds`（232 部 SKIPPED）里 ⇒ 轮到 dc/mbf 的那些批**纯属浪费额度**
+
+        合池之后一批**横跨多包**，`--limit` 是**全局**的 —— 额度只花在**池序最前**的片子上，
+        不管它属于哪个包。
+
+        ★★ **按包分段记账**（用户 2026-09-20 拍）：返回值**带 `pack`**，
+          调用方按包分段落账，`emit("batch")` 的 `pack=` **仍然是真包名** ⇒
+          日报的「按包聚合」**口径一字不改**，账仍能对到包上。
+
+        ★ 排序用的是**与 `todo()` 同一条** `TODO_PRIORITY`（`SKIPPED` → `ERROR`
+          → `PENDING` → `UNMATCHED`），同级按**目录名**。这样"欠账永远优先"这条
+          在合池之后仍然成立（实测：前 50 名精确落在 `frds` 的 232 部 SKIPPED 上）。
+          ★ 平手键里**不带包名** —— 带上就等于"按包名排序"，那正是我们要摆脱的东西；
+            靠 `dir_name` 是全局唯一的（同一农场里单片目录不重名）来保证稳定。
+        """
+        now = now or datetime.now()
+        pooled: list[tuple[str, sqlite3.Row, list[str]]] = []
+        for pk in packs:
+            for row, due in self.todo_detail(
+                    pk, indexers_now=indexers_now, include_cooldown=include_cooldown,
+                    cadence_days=cadence_days, cadence_by_indexer=cadence_by_indexer,
+                    now=now):
+                pooled.append((pk, row, due))
+        pooled.sort(key=lambda t: (TODO_PRIORITY.get(t[1]["stage"], 9),
+                                   t[1]["dir_name"]))
+        if limit:
+            return pooled[:limit]
+        return pooled
+
     def cadence_table(self, pack: str, *, indexers_now: list[str] | None = None,
                       cadence_days: int = DEFAULT_CADENCE_DAYS,
                       cadence_by_indexer: dict[str, int] | None = None) -> dict[str, dict]:

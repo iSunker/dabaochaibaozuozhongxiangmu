@@ -2210,19 +2210,49 @@ def run_round(pack: str, args, api_key: str) -> S.DriveStats | None:
 
     ★ 回灌必须带 qB（qbit_torrents）—— 否则 stage 推导拿不到"是否在做种"，
       原本 SEEDING 的片子会被误降级成 MATCHED（2026-09-11 踩过）。
+
+    ★★ `--pool`（`e404b1ca#6` ①）：此时 `pack` 只当**批次标签**用（`"pool"`），
+       实际取件是**跨包合池**、`--limit` 是**全局**的。`args.packs` 给出池子里的包。
+       ★ 记账仍**按包分段**（用户 2026-09-20 拍）：每个出现在本批里的包各发一条
+         `batch` 事件、各带**自己的** `pack=` 与读数 ⇒ 日报「按包聚合」口径不变。
     """
     st = S.StateStore(args.db)
     try:
         idx = [i.strip() for i in (args.indexers or "").split(",") if i.strip()] or None
-        pairs = st.todo_detail(pack, indexers_now=idx,
-                               include_cooldown=args.include_cooldown,
-                               cadence_days=args.cadence_days,
-                               cadence_by_indexer=S.parse_cadence(args.cadence))
-        seeding_before = sum(1 for r in st.movies(pack) if r["stage"] == S.STAGE_SEEDING)
+        if getattr(args, "pool", False):
+            # ★★ 合池：一次拿到全局池序，按 **全局** `--limit` 截断。
+            #   ★ `--batch` 在合池下**没有意义**（池是"每次从头取前 N"、不是切片），
+            #     所以这里显式拒绝，而不是悄悄忽略 —— 悄悄忽略正是"参数看着生效、
+            #     其实没生效"那类坑（`A.11`）。
+            if args.batch:
+                LOG.warning("[pool] `--batch` 在合池模式下无效（池每次按全局 --limit 取前 N）；"
+                            "要分批请用 `--limit`。本次**忽略** --batch。")
+            pooled = st.todo_pooled(
+                list(args.packs), indexers_now=idx,
+                include_cooldown=args.include_cooldown,
+                cadence_days=args.cadence_days,
+                cadence_by_indexer=S.parse_cadence(args.cadence),
+                limit=args.limit)
+            pairs = [(r, due) for _, r, due in pooled]
+            batch_packs = sorted({pk for pk, _, _ in pooled})
+            seeding_before = {pk: sum(1 for r in st.movies(pk)
+                                      if r["stage"] == S.STAGE_SEEDING)
+                              for pk in batch_packs}
+            plan = (f"合池：{len(args.packs)} 个包共 {len(pairs)} 部待搜，"
+                    f"本批取全局前 {len(pairs)}（--limit {args.limit}）"
+                    f"；本批涉及包：{', '.join(batch_packs) or '（无）'}")
+        else:
+            pairs = st.todo_detail(pack, indexers_now=idx,
+                                   include_cooldown=args.include_cooldown,
+                                   cadence_days=args.cadence_days,
+                                   cadence_by_indexer=S.parse_cadence(args.cadence))
+            seeding_before = sum(1 for r in st.movies(pack) if r["stage"] == S.STAGE_SEEDING)
+            batch_packs = [pack]
     finally:
         st.con.close()
 
-    pairs, plan = S.apply_batch(pairs, limit=args.limit, batch=args.batch)
+    if not getattr(args, "pool", False):
+        pairs, plan = S.apply_batch(pairs, limit=args.limit, batch=args.batch)
     if pairs is None:
         LOG.warning("[%s] %s", pack, plan)
         return None
@@ -2230,6 +2260,8 @@ def run_round(pack: str, args, api_key: str) -> S.DriveStats | None:
     if not paths:
         LOG.info("[%s] 没有待搜索项。", pack)
         return None
+    if getattr(args, "pool", False):
+        LOG.info("[pool] %s", plan)
 
     # ★ 必须把 on_event 接到 LOG 上，否则整批**全程零输出**（2026-09-12 凌晨踩过，
     #   当时对着空日志怀疑批次被杀了，白查一轮）。
@@ -2292,44 +2324,84 @@ def run_round(pack: str, args, api_key: str) -> S.DriveStats | None:
         except Exception as e:  # noqa: BLE001
             LOG.warning("取 qB 列表失败（忽略）: %s", e)
     st = S.StateStore(args.db)
+    # ★★ 记账口径：**每批一个包**（老行为）vs **按包分段**（`--pool`，用户 2026-09-20 拍）。
+    #   ★ 合池时 `sync_pack` **仍按包调**（它本来就是"重算这个包的行"），
+    #     所以"分段"不是额外发明 —— 是把原本那一次调用变成**每个涉及的包各一次**。
+    #     日报的「按包聚合」正是靠 `batch` 事件的 `pack=` 键，于是口径**一字不改**。
+    seg_packs = batch_packs if getattr(args, "pool", False) else [pack]
+    segs: list[dict] = []
     try:
-        rep = S.sync_pack(
-            st, pack,
-            crossseed_db=args.db_path,
-            log_paths=args.log or [],
-            qbit_torrents=qb,
-            indexers_override=[i.strip() for i in (args.indexers or "").split(",")
-                               if i.strip()] or None,
-            indexer_alias=S.parse_alias(args.indexer_alias),
-            cadence_days=args.cadence_days,
-            cadence_by_indexer=S.parse_cadence(args.cadence),
-        )
-        stats.resync = rep
-        stats.still_skipped = sum(1 for r in st.movies(pack)
-                                  if r["stage"] == S.STAGE_SKIPPED)
-        stats.newly_seeding = (sum(1 for r in st.movies(pack)
-                                   if r["stage"] == S.STAGE_SEEDING) - seeding_before)
+        for pk in seg_packs:
+            rep = S.sync_pack(
+                st, pk,
+                crossseed_db=args.db_path,
+                log_paths=args.log or [],
+                qbit_torrents=qb,
+                indexers_override=[i.strip() for i in (args.indexers or "").split(",")
+                                   if i.strip()] or None,
+                indexer_alias=S.parse_alias(args.indexer_alias),
+                cadence_days=args.cadence_days,
+                cadence_by_indexer=S.parse_cadence(args.cadence),
+            )
+            before = (seeding_before.get(pk, 0) if isinstance(seeding_before, dict)
+                      else seeding_before)
+            segs.append({
+                "pack": pk,
+                "rep": rep,
+                "still_skipped": sum(1 for r in st.movies(pk)
+                                     if r["stage"] == S.STAGE_SKIPPED),
+                "newly_seeding": (sum(1 for r in st.movies(pk)
+                                      if r["stage"] == S.STAGE_SEEDING) - before),
+            })
     finally:
         st.con.close()
-    LOG.info("[%s] 回灌：搜过 %s / 匹配 %s / 新增做种 %d / 仍 SKIPPED %d",
-             pack, rep.from_db + rep.from_log, rep.matched,
-             stats.newly_seeding, stats.still_skipped)
+    # ★ 整批的汇总（老字段保持**老语义**：单包时 == 那一个包；合池时 == 各段之和）。
+    #   ★ `stats.resync` 只在单包时给"那一个" —— 合池时给**最后一段**会是错的读数，
+    #     所以合池下显式留 None，改由各段自己报（`LOG.info` 逐段打印）。
+    if len(segs) == 1:
+        stats.resync = segs[0]["rep"]
+    stats.still_skipped = sum(s["still_skipped"] for s in segs)
+    stats.newly_seeding = sum(s["newly_seeding"] for s in segs)
+    for s in segs:
+        rep = s["rep"]
+        LOG.info("[%s] 回灌：搜过 %s / 匹配 %s / 新增做种 %d / 仍 SKIPPED %d",
+                 s["pack"], rep.from_db + rep.from_log, rep.matched,
+                 s["newly_seeding"], s["still_skipped"])
     # 批次事件 → 只进每日摘要（不立刻发信）。好消息不该半夜吵醒人，
     # 但也不能只躺在几万行日志里 —— 摘要就是它的去向。
     # ★ key 不含时间戳，且 batch 不冷却（见 notify._cooled），所以每批都会进摘要；
     #   摘要正是靠这些行统计「最近两次运行窗口的批次数」。
-    emit("batch", f"{pack} 本批完成",
-         body=(f"包: {pack}\n"
-               f"发送: 成功 {stats.ok} / 失败 {stats.failed}\n"
-               f"新增做种: {stats.newly_seeding} 部\n"
-               f"仍 SKIPPED: {stats.still_skipped}\n"
-               f"退避: {stats.backoff_hits} 次（等待 {stats.waited_sec / 60:.1f} 分钟）\n"
-               f"回灌: 搜过 {rep.from_db + rep.from_log} / 匹配 {rep.matched}\n"),
-         key=f"batch:{pack}",
-         metrics={"pack": pack, "ok": stats.ok, "failed": stats.failed,
-                  "newly_seeding": stats.newly_seeding,
-                  "still_skipped": stats.still_skipped,
-                  "backoff_hits": stats.backoff_hits})
+    # ★★ `--pool` 下**每个包发一条**（`pack` = 真包名 ⇒ 日报按包聚合口径不变）。
+    #   ★ `ok`/`failed`/退避次数是**整批**的读数、**无法按包拆**（一轮 `DriveSession`
+    #     是混着发的）⇒ 只在**第一段**记它们，其余段记 0 并在正文里写明。
+    #     这比"按片数摊派"诚实 —— 摊派出来的数是编的，而 `A.12.1` 不许编读数。
+    for i, s in enumerate(segs):
+        pk, rep = s["pack"], s["rep"]
+        first = (i == 0)
+        emit("batch", f"{pk} 本批完成",
+             body=(f"包: {pk}\n"
+                   + ("" if len(segs) == 1 else
+                      f"★ 本批是**合池批**（{len(segs)} 个包）："
+                      f"{', '.join(x['pack'] for x in segs)}\n"
+                      f"  发送/退避是**整批**读数，只记在第一段；本段只记包内读数。\n"
+                      if first else "")
+                   + (f"发送: 成功 {stats.ok} / 失败 {stats.failed}\n" if first
+                      else "发送: 见本批第一段（合池批不按包拆）\n")
+                   + f"新增做种: {s['newly_seeding']} 部\n"
+                   + f"仍 SKIPPED: {s['still_skipped']}\n"
+                   + (f"退避: {stats.backoff_hits} 次"
+                      f"（等待 {stats.waited_sec / 60:.1f} 分钟）\n" if first
+                      else "")
+                   + f"回灌: 搜过 {rep.from_db + rep.from_log} / 匹配 {rep.matched}\n"),
+             key=f"batch:{pk}",
+             metrics={"pack": pk,
+                      "ok": stats.ok if first else 0,
+                      "failed": stats.failed if first else 0,
+                      "newly_seeding": s["newly_seeding"],
+                      "still_skipped": s["still_skipped"],
+                      "backoff_hits": stats.backoff_hits if first else 0,
+                      "pool_segs": len(segs)})
+
     # 每天一次的台账（额度 + 趋势）+「有站点此刻在退避」的即时告警。
     # ★ 放在批次自己的 batch 事件**之后** —— 台账要反映刚回灌完的最新状态。
     after_batch_reports(args)
@@ -2683,7 +2755,13 @@ def once_round(packs: list[str], args, api_key: str, min_sleep: float) -> int:
         return 0
 
     idx = (int(st.get("last_pack_idx", -1)) + 1) % len(packs)
-    pack = packs[idx]
+    # ★★ `--pool`：合池下**没有"轮到哪个包"** —— 每批都取全局池前 N。
+    #   ★ `idx` 仍照算并落盘（`last_pack_idx` 是已落盘读数，含义不擅自改），
+    #     只是不再用它选包。
+    #   ★ 用 `getattr(..., False)` 而不是 `args.pool`：调用方（含测试）会构造
+    #     **只带自己那几个字段**的 ad-hoc Namespace ⇒ 硬取属性会让它们全炸
+    #     （2026-09-21 实测：`test_once_gate` 就是这么红的）。"没给" = "关着"。
+    pack = "pool" if getattr(args, "pool", False) else packs[idx]
     # ★★ `#58` D1：容器里 `running_pid` **语义不同**（恒为 1，见 batch_alive 的说明）。
     #   这里自动判"我是不是在容器里"，容器版就多写一个标记键，让 batch_alive 跳过 pid。
     #   ★ 判据用**文件系统**（`/.dockerenv`）而不是环境变量：环境变量可能是人传进来的、
@@ -2765,6 +2843,17 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="反馈驱动循环：自动续跑 cross-seed 搜索")
     ap.add_argument("--packs", default=PACKS_DEFAULT,
                     help=f"包顺序，逗号分隔（轮流推进），默认 {PACKS_DEFAULT}")
+    # ★★ `--pool`（`e404b1ca#6` ①，用户 2026-09-20 拍：方案 a）：**跨包合池**。
+    #   ★ 关着（默认）= 老行为：每批 **一个**包、`--limit` 是**每包**的。
+    #   ★ 开着 = 三包合成一个池、`--limit` 是**全局**的 ⇒ 额度只花在**池序最前**
+    #     的片子上，不管它属于哪个包。
+    #   ★ 为什么默认**关**：这是改变"额度怎么分配"的**产品决定**，不是纯优化
+    #     （同 `PACKS_DEFAULT` 那条注释的道理）。开了之后：
+    #       · 欠账（`frds` 的 232 部 SKIPPED）会**每批都被优先吃掉** —— 好事
+    #       · 但小包（`mbf`）**再也不会独占一整批** ⇒ 它的读数是"混在批里"拿到的
+    #     ⇒ 换默认值要**人拍**，所以在 `--pool` 上显式开关，不偷偷改。
+    ap.add_argument("--pool", action="store_true",
+                    help="跨包合池：--limit 变全局（三包合起来取 N 个），记账仍按包分段")
     ap.add_argument("--once", action="store_true", help="只跑一轮（配合计划任务）")
     # ★ 为什么需要它：有几个观测（链接守护、对账基线、卡 999）**只挂在日报里**
     #   —— 它们要有个「锚」才能谈"变化"，而自然日报一天只投一次。想**当场起锚**
@@ -2971,19 +3060,46 @@ def main() -> int:
              os.getpid(), "container" if _in_container else "host")
 
     while args.max_rounds == 0 or round_no < args.max_rounds:
-        pack = packs[cur_pack_idx % len(packs)]
+        # ★★ `--pool`：不再"轮到一个包"，而是**每轮都取全局池的前 N**（`e404b1ca#6` ①）。
+        #   ★ `cur_pack_idx` 在合池下**不再参与选包**（没有"轮到谁"了），但仍照常
+        #     递增/落盘 —— 因为 `last_pack_idx` 是**已落盘的读数**，改了含义会让
+        #     旧读数的解释变（同 `PACKS_DEFAULT` 那段注释的顾虑）。
+        #   ★ 合池下 `--once` 就是"跑一批合池"，与老语义一致（跑一批）。
+        pack = ("pool" if getattr(args, "pool", False)
+                else packs[cur_pack_idx % len(packs)])
         round_no += 1
 
         if args.dry_run:
             LOG.info("[%s] dry-run：列出待搜计划（不发请求）", pack)
             st = S.StateStore(args.db)
             idx = [i.strip() for i in (args.indexers or "").split(",") if i.strip()] or None
-            pairs = st.todo_detail(pack, indexers_now=idx,
-                                   include_cooldown=args.include_cooldown,
-                                   cadence_days=args.cadence_days,
-                                   cadence_by_indexer=S.parse_cadence(args.cadence))
-            pairs, plan = S.apply_batch(pairs, limit=args.limit, batch=args.batch)
-            LOG.info("[%s] %s", pack, plan)
+            if getattr(args, "pool", False):
+                pooled = st.todo_pooled(
+                    list(packs), indexers_now=idx,
+                    include_cooldown=args.include_cooldown,
+                    cadence_days=args.cadence_days,
+                    cadence_by_indexer=S.parse_cadence(args.cadence),
+                    limit=args.limit)
+                from collections import Counter as _C
+                by_pack = _C(pk for pk, _, _ in pooled)
+                LOG.info("[pool] dry-run：全池 %d 部待搜，本批取全局前 %d"
+                         "（--limit %d）；本批涉及包：%s",
+                         sum(1 for pk in packs
+                             for _ in st.todo_detail(
+                                 pk, indexers_now=idx,
+                                 include_cooldown=args.include_cooldown,
+                                 cadence_days=args.cadence_days,
+                                 cadence_by_indexer=S.parse_cadence(args.cadence))),
+                         len(pooled), args.limit,
+                         ", ".join(f"{k}×{v}" for k, v in sorted(by_pack.items()))
+                         or "（无）")
+            else:
+                pairs = st.todo_detail(pack, indexers_now=idx,
+                                       include_cooldown=args.include_cooldown,
+                                       cadence_days=args.cadence_days,
+                                       cadence_by_indexer=S.parse_cadence(args.cadence))
+                pairs, plan = S.apply_batch(pairs, limit=args.limit, batch=args.batch)
+                LOG.info("[%s] %s", pack, plan)
             st.con.close()
             if args.once:
                 return 0
@@ -3025,9 +3141,15 @@ def main() -> int:
         if stats is None:
             LOG.info("[%s] 本批无动作（没待搜或计划为空），跳过该包", pack)
             consec = update_abort_streak(consec, None)   # 正常，两个计数都清零
-            # 全部包都没待搜 → 全部完成，退出
             cur_pack_idx += 1
-            if cur_pack_idx % len(packs) == 0:
+            # ★★ 合池下判据**更强**：一个批就是**整个池**，所以"本批没待搜" **直接**
+            #   等于"三包全空" ⇒ 立刻判全完成，不用再等 3 轮轮空。
+            #   ★ 非合池时保持老行为（要轮到**每个**包都空才算）—— 一次空批只说明
+            #     "轮到的那个包空了"，别的包可能还有欠账。
+            if getattr(args, "pool", False):
+                if alert_if_all_done(packs, args.db):
+                    return 0
+            elif cur_pack_idx % len(packs) == 0:
                 if alert_if_all_done(packs, args.db):
                     return 0
             if args.once:
@@ -3055,7 +3177,9 @@ def main() -> int:
             return 0
         sleep_sec = max(sleep_sec, min_sleep)
         _resident_state(round_no, cur_pack_idx - 1, consec, "正常收工")
-        LOG.info("等待 %.1f 分钟后跑下一批（%s）", sleep_sec / 60, packs[cur_pack_idx % len(packs)])
+        LOG.info("等待 %.1f 分钟后跑下一批（%s）", sleep_sec / 60,
+                 "合池：三包前 N 个" if getattr(args, "pool", False)
+                 else packs[cur_pack_idx % len(packs)])
         # ★★ 2026-09-18：**这就是那 45 分钟的睡眠** —— autoheal 误杀就发生在这里。
         #   包一层 `PHASE_IDLE` 心跳之后，心跳**全时新鲜** ⇒ healthcheck 不再判死；
         #   而 `batch_alive()` 看到 `phase=idle` ⇒ 知道该让位（而不是「永远在跑」）。
