@@ -363,6 +363,14 @@ LOCAL_ONLY = [
     #     但它**能**在本机对着合成库跑（`PROBE_DB`/`PROBE_ROOT` 可覆盖）——
     #     这条很重要：本机验不过的探针 = 只能裸奔上线的读数来源。
     (r"^scripts/diag/probe-pool\.py$",            "`--pool` 空池探针（**容器内**跑：只读 mode=ro + query_only、零请求、无凭据；诊断件，故意不部署）"),
+    # ★★ 2026-09-22 第二版：**宿主侧**单文件自包含版。第一版（上面那个）走不通 ——
+    #   它得先 `docker cp` 进容器，而 NAS 上**还没有 `scripts/` 目录**
+    #   （`deploy.sh --apply` 一直没跑）⇒ `lstat … no such file` 起手就死，
+    #   而 `docker cp` 读的是**发送端**文件系统、容器挂载盖不到它 ⇒ 那条路不通。
+    #   这一版把要跑的东西整个装进一个 heredoc，`docker exec -i` 喂 stdin
+    #   ⇒ 宿主上**只需一个文件**（`cat > p.sh` 一次粘完）。
+    #   ★ 与 `chk-volume1-free.sh` 同族：**在 NAS 上跑**、只读、**故意不进白名单**。
+    (r"^scripts/diag/probe-pool-nas\.sh$",        "`--pool` 空池探针·宿主侧单文件版（在 **NAS** 上跑；heredoc→docker exec -i，只读、零请求、无凭据；故意不部署）"),
 ]
 
 # 受管、但**不在 git 里**的本地源（正常情况只有生成物）。没列在这里的会被 B 方向报出来 ——
