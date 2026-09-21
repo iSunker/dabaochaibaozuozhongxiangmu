@@ -2378,7 +2378,22 @@ def run_round(pack: str, args, api_key: str) -> S.DriveStats | None:
       原本 SEEDING 的片子会被误降级成 MATCHED（2026-09-11 踩过）。
 
     ★★ `--pool`（`e404b1ca#6` ①）：此时 `pack` 只当**批次标签**用（`"pool"`），
-       实际取件是**跨包合池**、`--limit` 是**全局**的。`args.packs` 给出池子里的包。
+       实际取件是**跨包合池**、`--limit` 是**全局**的。`packs`（**已清洗的列表**）给出池子里的包。
+
+       ★★★ **绝不要在这里写 `args.packs`** —— 那是 `--packs` 的**原始字符串**
+         （`"a,b"`，见 `main()` 里 `packs = [p.strip() for p in args.packs.split(",") …]`），
+         而 `list("frds-top250-2024")` **不是在切逗号**：它把字符串**拆成一个个字符**
+         ⇒ 变成 16 个单字符"包名" ⇒ `WHERE pack='f'` 之类**一个都匹配不上**
+         ⇒ `movies()` 全空 ⇒ **池子恒为 0、每轮都打「没有待搜索项」**。
+
+       ★★ 这个错**只在 `--pool` 上暴露**（非 `--pool` 那条用干净的 `pack`），
+         症状是**静默**的：启动日志打的是清洗过的 `packs`（`packs=['frds-top250-2024']`），
+         **看着完全正常**；日志报「没有待搜索项」而不是报错；
+         而同一个进程加 `--dry-run` 反而正常（那条路用的正是 `packs`）
+         ⇒ 2026-09-22 实测：**常驻连续 14 轮、7 小时全空**，`--dry-run` 给 43、去掉给 0。
+         ★ 判据的形状：**两处调用同一函数、参数看起来一样、结果不同 ⇒ 去比那两个表达式的
+         *类型*，不是值**。当时两边打印出来都是 `frds-top250-2024`。
+
        ★ 记账仍**按包分段**（用户 2026-09-20 拍）：每个出现在本批里的包各发一条
          `batch` 事件、各带**自己的** `pack=` 与读数 ⇒ 日报「按包聚合」口径不变。
     """
@@ -2394,7 +2409,7 @@ def run_round(pack: str, args, api_key: str) -> S.DriveStats | None:
                 LOG.warning("[pool] `--batch` 在合池模式下无效（池每次按全局 --limit 取前 N）；"
                             "要分批请用 `--limit`。本次**忽略** --batch。")
             pooled = st.todo_pooled(
-                list(args.packs), indexers_now=idx,
+                list(packs), indexers_now=idx,
                 include_cooldown=args.include_cooldown,
                 cadence_days=args.cadence_days,
                 cadence_by_indexer=S.parse_cadence(args.cadence),
@@ -2404,7 +2419,7 @@ def run_round(pack: str, args, api_key: str) -> S.DriveStats | None:
             seeding_before = {pk: sum(1 for r in st.movies(pk)
                                       if r["stage"] == S.STAGE_SEEDING)
                               for pk in batch_packs}
-            plan = (f"合池：{len(args.packs)} 个包共 {len(pairs)} 部待搜，"
+            plan = (f"合池：{len(packs)} 个包共 {len(pairs)} 部待搜，"
                     f"本批取全局前 {len(pairs)}（--limit {args.limit}）"
                     f"；本批涉及包：{', '.join(batch_packs) or '（无）'}")
         else:
