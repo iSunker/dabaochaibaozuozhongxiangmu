@@ -116,6 +116,27 @@ def cadence_for(indexer: str, *, cadence_days: int = DEFAULT_CADENCE_DAYS,
     return int(cadence_days)
 
 
+#: ★★ 首次探索预算（2026-09-20，`e404b1ca#6` ③）。
+#:
+#: **为什么要有它**（实测，不是推演）：`due_indexers` 原先「从没在某个站搜过 → 无条件该搜」，
+#: 于是**每一批**都把这 272 部 `UNMATCHED` 判成"到期"。实测分布（`state.db`，2026-09-20）：
+#:
+#:     缺 ['BTSCHOOL','HDtime','NanyangPT']            n=234
+#:     缺 ['BTSCHOOL','HDFans','HDtime','NanyangPT']   n=38
+#:
+#: ⇒ 它们**每批都占满 `--limit 50` 的名额**。用户看到的「limit 50 就一直把上次没匹配进的
+#:   加到这次」的机制真身就是它 —— 不是"优先级排错"，是**这几个站对它们永远判该搜**。
+#:
+#: ★ 规则：一部片子里"从没搜过的站"**最多算 `first_explore_budget` 个**（默认 1）。
+#:   于是 272 部不会同一批全部到期，而是**一批消化一批**：每部每轮推进 1 个新站，
+#:   3~4 轮扫完。★ 这是**限流**，不是**放弃** —— 没被选中的站**下一个周期仍然会到期**。
+#:
+#: ★ 为什么默认是 1 而不是 0：0 会让"从没搜过的站"**永远排不上**（那才是真丢事）。
+#:   1 = 每部片每轮至少推进一个没搜过的站，欠账一定在收敛。
+#:  ★ 为什么不是"不限"（=旧行为）：那样它就**退化回吃光名额**那个缺陷。
+FIRST_EXPLORE_BUDGET = 1
+
+
 def due_indexers(
     indexer_seen: dict[str, str],
     indexers_now: list[str],
@@ -123,29 +144,44 @@ def due_indexers(
     cadence_days: int = DEFAULT_CADENCE_DAYS,
     cadence_by_indexer: dict[str, int] | None = None,
     now: datetime | None = None,
+    first_explore_budget: int = FIRST_EXPLORE_BUDGET,
 ) -> list[str]:
     """**这一部片子，现在该在哪些站上重搜？**
 
     规则（这就是「每站按周期重搜」的落地）：
-      * 从没在这个站搜过            → 该搜
-      * 上次搜到现在 ≥ 该站的周期   → 该搜
+      * 上次搜到现在 ≥ 该站的周期   → 该搜（**优先，不受预算限制**）
+      * 从没在这个站搜过            → 该搜，但**每轮最多算 `first_explore_budget` 个**
       * 否则                        → 等
 
     `indexers_now` 为空时，退化成"用它自己记录过的站"（避免没传 --indexers 就什么都不搜）。
+
+    ★★ `first_explore_budget`（见 `FIRST_EXPLORE_BUDGET` 那段注释）：**"从没搜过"的站
+    必须限流**，否则 272 部 `UNMATCHED` 每批都到期、吃光 `--limit`。
+    ★ **够周期的站不受预算限制** —— 预算是用来**防无限欠账**的，不是用来压下正常轮换的；
+      把两者混在一起会让"早就该重搜"的站被"没搜过的站"挤掉（那正是我们要修的毛病）。
+    ★ 排序：先到期的（`last + cadence` 最早的），再没搜过的 —— 这样预算花在**最该补**的站上。
     """
     now = now or datetime.now()
     pool = list(indexers_now) or sorted(indexer_seen) or [UNKNOWN_INDEXER]
-    out = []
+    fresh: list[str] = []          # 够周期的（不受预算限制）
+    never: list[str] = []          # 从没搜过的（受预算限制）
     for ix in pool:
         last = _parse_ts(indexer_seen.get(ix))
         if last is None:
-            out.append(ix)
+            never.append(ix)
             continue
         days = cadence_for(ix, cadence_days=cadence_days,
                            cadence_by_indexer=cadence_by_indexer)
         if (now - last) >= timedelta(days=days):
-            out.append(ix)
-    return out
+            fresh.append(ix)
+    # ★ 站名排序保证**确定性**：同一输入两次调用必须给同一个答案（否则测试会飘、
+    #   而"这一批到底搜了谁"就复现不出来）。`pool` 的顺序来自 `--indexers`，是稳定的，
+    #   但这里仍显式排序，免得以后有人把 `pool` 改成 set。
+    if first_explore_budget is None or first_explore_budget < 0:
+        picked_never = sorted(never)
+    else:
+        picked_never = sorted(never)[:int(first_explore_budget)]
+    return fresh + picked_never
 
 
 def next_due_at(
