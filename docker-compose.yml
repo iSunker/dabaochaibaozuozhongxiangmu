@@ -289,6 +289,24 @@ services:
       # ② 媒体卷，同理必须同名同路径；而且 **§9：硬链接不能跨卷** ⇒
       #    农场与源数据必须同一条设备，所以这个挂载**只能是整卷**
       - /volume1/video:/volume1/video
+      # ③ ★★★ 时区：把 NAS 的 `/etc/localtime` 直接挂进来（2026-09-21 加）
+      #    ★ 起因（实测）：这个容器的**日志文本时间戳比真实时间快 8 小时**
+      #      （日志已写到 `09-22 01:33`，而真实是 `09-21 17:54`），
+      #      而**同时**它写的 epoch（`.drive-loop.state` 的 `heartbeat_ts`）**是对的**。
+      #    ★★ 根因：`TZ=${TZ}` 只让 `strftime` 按 +8 **显示**，而本镜像
+      #      （`python:3.12-slim`）**没有 tzdata** ⇒ 容器内部时间仍是 UTC ⇒
+      #      **`TZ` 被算了两遍**（UTC+8 再 +8）。★ 另外 5 个服务用的是
+      #      linuxserver 镜像、**自带 tzdata** ⇒ 它们时间是对的 ⇒ **只修这一个**。
+      #    ★★ 为什么挂文件而不是装 tzdata：装 tzdata 要**重新 build 镜像**，
+      #      而本项目有硬约束「只能本地 build + `docker load`」（`§26.5`）。
+      #      挂 `/etc/localtime` 是**运行时**解决，不改镜像、不破那条约束。
+      #    ★ 这是 **read-only** 挂载 —— 容器没有写它的理由。
+      #    ★★ 副作用（写明，不是没看见）：容器从此**跟随 NAS 的时区**，
+      #      不再受 `TZ` 环境变量控制。★ 要改时区就改 NAS，别改这里。
+      - /etc/localtime:/etc/localtime:ro
+      # ④ 时区名（`/etc/timezone` 是个文本文件，只有一行 `Asia/Shanghai`）——
+      #    ★ 有些库读它而不是读 `localtime`；两个都给，免得修一半。
+      - /etc/timezone:/etc/timezone:ro
     # ★★ 这里必须是 `entrypoint:`，**不是 `command:`** —— 2026-09-17 实测踩过：
     #   镜像的 `ENTRYPOINT ["python", "/app/scripts/drive-loop.py"]` **不会被 command 覆盖**
     #   （`command:` 只替换 **CMD**）⇒ 写成 `command: ["sh", "...run-resident.sh"]` 时，
