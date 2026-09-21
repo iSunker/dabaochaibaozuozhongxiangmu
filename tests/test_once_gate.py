@@ -60,8 +60,12 @@ def args_ns():
 
 
 # 打桩：跑批不真跑，只返回一个假 stats
+# ★ 签名必须与 `dl.run_round` **逐字一致**（2026-09-22：给它加了 `packs` 参数，
+#   桩没跟上 ⇒ ⑨ 那条"stats=None 也要巡检"**静默**变成 0 次调用、报红）。
+#   ★ 为什么不用 `lambda *a, **k`：那样签名漂了也不会红 —— 而"参数加了、桩没跟上"
+#     正是这次要防的形状（同 `ck` 同名不同语义那类坑）。
 _next_stats = [S.DriveStats(ok=50)]
-dl.run_round = lambda pack, args, api_key: _next_stats[0]
+dl.run_round = lambda pack, packs, args, api_key: _next_stats[0]
 dl.alert_if_all_done = lambda *a, **k: None
 dl.emit = lambda *a, **k: False
 dl.init_notifier = lambda *a, **k: None
@@ -250,7 +254,7 @@ ck("★★ 轮转按**下标**、与名单内容无关（合成名单：0→1→
 _seen = []
 
 
-def _capture(pack, args, api_key):
+def _capture(pack, packs, args, api_key):
     _seen.append(pack)
     return S.DriveStats(ok=1)
 

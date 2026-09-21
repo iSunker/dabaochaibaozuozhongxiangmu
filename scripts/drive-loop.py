@@ -181,6 +181,28 @@ DEFAULT_DB = os.environ.get("RESEED_STATE_DB", str(ROOT / "hlink" / "state.db"))
 PACKS_DEFAULT = os.environ.get("DRIVE_PACKS") or "frds-top250-2024"
 
 
+def packs_from_arg(spec: str | None) -> list[str]:
+    """把 `--packs` 的**原始字符串**（`"a,b"`）清洗成包名列表。
+
+    ★★★ 为什么必须是**函数**、不许各处自己写一遍
+    ------------------------------------------------------------
+    2026-09-22 实测事故：`run_round` 里写的是 `list(args.packs)` —— 而 `args.packs`
+    是**字符串**，`list("frds-top250-2024")` 把包名**拆成了 16 个单字符**
+    ⇒ `WHERE pack='f'` 一个都匹配不上 ⇒ **池子恒为 0、连续 14 轮 / 7 小时全空**。
+    ⇒ 修的时候我在 `run_round` 里写了 `list(packs)`，而 `run_round` 的作用域里
+      **根本没有 `packs`**（它是 `main()` 的局部变量）⇒ 当场 `NameError`。
+    ★ 两次都栽在**同一件事**上：「`--packs` 的原始串」和「包名列表」是**两个东西**，
+      而它们的字面量长得一样。
+
+    ⇒ 所以把它提成**唯一一处**转换点：谁要包名列表，就调它。
+      于是"这里是字符串还是列表"不再靠记性，而靠**这个函数名**。
+      ★ 同 `A.11`「同一事实只在一处维护」：`--packs` 的**解析**也只在这一处。
+      ★ 与 `PACKS_DEFAULT` 那条注释同形：那个常量解决"默认值两处各写一份会漂"，
+        本函数解决"**解析**两处各写一份会漂"。
+    """
+    return [p.strip() for p in (spec or "").split(",") if p.strip()]
+
+
 # --------------------------------------------------------------------------- #
 # cross-seed 的 compose 目录
 # --------------------------------------------------------------------------- #
@@ -2371,7 +2393,7 @@ def after_batch_reports(args) -> None:
         LOG.debug("收尾通知失败（不影响跑批）", exc_info=True)
 
 
-def run_round(pack: str, args, api_key: str) -> S.DriveStats | None:
+def run_round(pack: str, packs: list[str], args, api_key: str) -> S.DriveStats | None:
     """对指定包跑一批 drive + 回灌。返回 DriveStats；无待搜 / 出错返回 None。
 
     ★ 回灌必须带 qB（qbit_torrents）—— 否则 stage 推导拿不到"是否在做种"，
@@ -2396,7 +2418,29 @@ def run_round(pack: str, args, api_key: str) -> S.DriveStats | None:
 
        ★ 记账仍**按包分段**（用户 2026-09-20 拍）：每个出现在本批里的包各发一条
          `batch` 事件、各带**自己的** `pack=` 与读数 ⇒ 日报「按包聚合」口径不变。
+
+    ★★★ `packs` 是**显式参数**（不是从 `args.packs` 现算）—— 故意的：
+      2026-09-22 的事故就是"以为 `args.packs` 是列表"。做成参数后，
+      **"这里是原始串还是列表"在调用点就看得见**，不靠记性。
+      ⇒ 下面那条 guard 把判据从"类型"再收一道：`list("frds…")` 会得到 16 个
+        **单字符**，它们**不是**库里真有的包名 ⇒ 当场炸在入口，**不再静默算空**。
     """
+    # ★★★ 入口 guard：`packs` 必须是"包名列表"的**形状**。
+    #   允许 2 个字符以上的元素（真包名如 `frds-top250-2024` / `mbf`；
+    #   `mbf` 是 3 字符 ⇒ 下界取 2 是安全的），并且元素里不许出现**单字符**。
+    #   ★ 为什么这条能抓住事故：`list("frds-top250-2024")` 的 16 个元素**全是单字符**
+    #     ⇒ 直接命中。而正常的包名列表里**至少有一个**多字符元素。
+    #   ★ 为什么不是"必须是 list[str]"就完事：事故原码 `list(args.packs)` **也**是
+    #     `list[str]` —— 类型对了、**内容错了**。⇒ 判据必须落在**元素形状**上，
+    #     这正是 `ERR-AI-09` 那条"防假绿的装置本身可能是假绿的"。
+    assert isinstance(packs, list) and packs, (
+        "run_round 的 packs 必须是非空列表，收到 %r" % (type(packs).__name__,))
+    assert any(len(p) > 1 for p in packs), (
+        "★★★ run_round 的 packs 里**全是单字符**（%r）—— 这几乎肯定是把 `--packs` 的"
+        "**原始字符串**当列表用了（`list('frds-top250-2024')` 会拆成 16 个字符）"
+        "⇒ 查库恒空、池子恒为 0（2026-09-22 那次事故）。"
+        " 正确做法：`packs_from_arg(args.packs)`。" % (packs[:8],))
+
     st = S.StateStore(args.db)
     try:
         idx = [i.strip() for i in (args.indexers or "").split(",") if i.strip()] or None
@@ -2973,7 +3017,7 @@ def once_round(packs: list[str], args, api_key: str, min_sleep: float) -> int:
         #   （例如宿主任务与常驻容器交接的窗口），写一个准确的 `running` 是对的。
         #   ★ 也**不能**在这里写 `idle`：这一批**确实在跑**。
         with Heartbeat(phase=PHASE_RUNNING):
-            stats = run_round(pack, args, api_key)
+            stats = run_round(pack, packs, args, api_key)
         sleep_sec = log_result(pack, stats)
         if stats is None:
             # 这个包没待搜 —— 看看是不是所有包都干完了（无人值守时必须出声）
@@ -3099,7 +3143,9 @@ def main() -> int:
         ],
     )
 
-    packs = [p.strip() for p in args.packs.split(",") if p.strip()]
+    # ★ 唯一一处 `--packs` 解析（见 `packs_from_arg` 的 docstring：
+    #   2026-09-22 两次栽在"原始串 vs 包名列表"上）
+    packs = packs_from_arg(args.packs)
 
     # 默认日志路径（cross-seed 的 info 日志），回灌要用
     if not args.log:
@@ -3301,7 +3347,7 @@ def main() -> int:
             # ★★ 2026-09-18：显式给 `phase=PHASE_RUNNING` —— 这是**唯一的**跑批态，
             #   其它三处（启动 / dry-run / 无动作 / 收工）都该是 `idle`。
             with Heartbeat(phase=PHASE_RUNNING):
-                stats = run_round(pack, args, api_key)
+                stats = run_round(pack, packs, args, api_key)
         except Exception as e:  # noqa: BLE001 —— 循环不能因单批异常而死
             LOG.exception("[%s] 本批异常（继续循环）", pack)
             emit("alert", f"{pack} 本批异常",

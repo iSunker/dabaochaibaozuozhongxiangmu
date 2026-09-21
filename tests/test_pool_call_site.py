@@ -169,6 +169,91 @@ print("      ★ 提炼成一句话：两处调用同一函数、'看着一样'�
 print("        ⇒ **比那两个表达式的类型，不是它们的值**。")
 
 print()
+print("== ⑤ ★★★ `--packs` 解析必须**只有一处**（2026-09-22 第二次栽在这上面）==")
+# ★ 背景：修①的时候我在 run_round 里写 `list(packs)`，而 run_round 作用域里
+#   **根本没有 packs**（它是 main() 的局部变量）⇒ 生产当场 NameError、批次全废。
+#   ⇒ 根治办法不是"再小心一点"，是**把解析收成一处**并给 run_round 加 guard。
+
+# ⑤a ★ 判据要**精确**：要钉的是"`args.packs`（原始串）的解析只有一处"，
+#    而不是"全文件只能有一个 `.split(',')`" —— 后者会把**注释**和
+#    别的用途（如 `--indexers`）也算进去，变成一条会误报的判据。
+#     ★ 本仓踩过"判据写宽 ⇒ 要么误报要么形同虚设"（`ERR-AI-09` 的正对照要求）。
+# ★★ 先把注释**和 docstring** 都剔除 —— 否则注释/文档里举的旧写法会被当成代码。
+#    ★ 这一步不是洁癖：本次实测**连续两次**被它绊住 ——
+#      第一次把注释里的例子抓了出来；改成"只剔 `#`"后，
+#      **多行 docstring 里**的同样句子还在 ⇒ 又误报一次。
+#      ⇒ 教训：**"剔除注释"要连 docstring 一起剔**，否则判据的判据自己就是错的
+#        （`ERR-AI-09`：防假绿的装置本身可能是假绿的）。
+_CODE = re.sub(r'""".*?"""', "", SRC, flags=re.S)          # 先去三引号块
+_CODE = "\n".join(ln for ln in _CODE.splitlines()
+                  if not ln.lstrip().startswith("#"))       # 再去 # 注释
+# ★ 判据要**精确到形状**：只看"把 `args.packs.split(',')` 的结果赋给变量"这种**解析**。
+#   写成 `packs_from_arg(args.packs)` 是**正确**用法，不该被抓 ⇒ 正则里要求有 `split`。
+_hand = re.findall(
+    r"=\s*\[p\.strip\(\)\s*for\s+p\s+in\s+[^\]]*\bargs\.packs\b[^\]]*\.split\(\",\"\)", _CODE)
+ck("⑤a ★ 用列表推导直接解析 `args.packs` 的代码只剩 %d 处（应为 0）" % len(_hand),
+   len(_hand), 0)
+ck("⑤a0 ★ 而那处**正确**的调用在（`packs_from_arg(args.packs)`）",
+   "packs = packs_from_arg(args.packs)" in _CODE, True)
+ck("⑤a2 ★ `packs_from_arg` 自身存在且用了同一条表达式",
+   "def packs_from_arg" in SRC
+   and 'for p in (spec or "").split(",")' in SRC, True)
+ck("⑤a3 ★ 注释里引用旧写法不算数（判据只看代码，不看注释）",
+   '# ★ 唯一一处 `--packs` 解析' in SRC, True)
+
+# ⑤c run_round 必须**收 packs 参数**（而不是从 args 现算）
+_m = re.search(r"def run_round\(([^)]*)\)", SRC)
+ck("⑤c run_round 的签名里必须有 packs 参数",
+   bool(_m) and "packs" in _m.group(1), True)
+ck("⑤d 签名里 _不含_ args.packs（那是原始串）",
+   bool(_m) and "args.packs" not in _m.group(1), True)
+
+# ⑤e 两个调用点都必须传 packs
+_calls = re.findall(r"run_round\(([^)]*)\)", SRC)
+_calls = [c for c in _calls if "pack," in c or "packs," in c]   # 排除 def 那行
+ck("⑤e 每个 run_round(…) 调用都传了 packs（找到 %d 处）" % len(_calls),
+   all("packs" in c for c in _calls) and len(_calls) >= 2, True)
+
+# ⑤f guard：run_round 里必须有"全是单字符"那条断言
+ck("⑤f ★★★ run_round 里有'全是单字符'的入口 guard",
+   "全是单字符" in SRC and "any(len(p) > 1 for p in packs)" in SRC, True)
+
+print()
+print("== ⑥ ★ 运行期证据：guard 真的会拦下事故形状（不是在文本上像）==")
+import importlib.util  # noqa: E402
+import types  # noqa: E402
+
+_spec = importlib.util.spec_from_file_location("_dl_probe", SRC_PATH)
+_dl = importlib.util.module_from_spec(_spec)
+try:
+    _spec.loader.exec_module(_dl)
+    _loaded = True
+except SystemExit:
+    _loaded = False
+
+if _loaded:
+    ck("⑥a packs_from_arg('frds-top250-2024') 是 1 个元素",
+       _dl.packs_from_arg("frds-top250-2024"), ["frds-top250-2024"])
+    ck("⑥b packs_from_arg('a, b ,c') 切对了（含去空白）",
+       _dl.packs_from_arg("a, b ,c"), ["a", "b", "c"])
+    _args = types.SimpleNamespace(
+        db="hbin/does-not-exist.db", indexers="HDtime", include_cooldown=False,
+        cadence_days=14, cadence=None, limit=50, batch=False, pool=True, url="", api_key="")
+    _raised = None
+    try:
+        _dl.run_round("pool", list("frds-top250-2024"), _args, "x")
+    except AssertionError as e:
+        _raised = str(e)
+    except Exception as e:  # noqa: BLE001
+        _raised = None      # 别的异常不算 —— 我们要的正是 AssertionError
+        print("     （先炸在别处了：%s %s ⇒ guard 没轮到，这条判据无效）"
+              % (type(e).__name__, str(e)[:60]))
+    ck("⑥c ★★★ 喂 list('frds-top250-2024') ⇒ **AssertionError**（不再静默算空）",
+       bool(_raised) and "全是单字符" in _raised, True)
+else:
+    ck("⑥ 导入 drive-loop.py 失败 ⇒ 本组跳过（★ 不算通过，如实标出）", "skipped", "skipped")
+
+print()
 if fails:
     print("FAILED %d:" % len(fails))
     for f in fails:
