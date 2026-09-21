@@ -34,8 +34,35 @@ A 要回答的问题是「**Torznab 的 `tvsearch` 响应体里，有没有可�
 """
 from __future__ import annotations
 
+import sys as _sys_pre
+
+# ★★★「崩」与「红」的区分装置（2026-09-21 加）。
+#   ★ 实测：把探针里超时的那个 `except` 换成一个**永不触发的类型**（= 超时落回宽
+#     `except`）⇒ 本测试**退出码 1 但 `FAIL` 行 = 0**：它不是"红"，是**自己在 480 行抛了
+#     `ValueError: substring not found`**。
+#   ⇒ ★★ 两种完全不同的结局，**读数一模一样**（都只是"非零退出码"）：
+#        ① 某条断言**判成了假**（真信号 ⇒ 改被测代码）
+#        ② 测试**自己崩了**（假信号 ⇒ 改测试）
+#   ⇒ 这是 `ERR-AI-09`（"我的验证装置自己是一根假绿装置"）的**第三次同形复发**。
+#   ⇒ 判据：`sys.excepthook` **只在未捕获异常**时被调用；`sys.exit()` 走 SystemExit
+#     **不会**触发它 ⇒ "崩"从此有自己的读数（正文里没有 `MAIN_OK` 也是同一个信号）。
+def _crash_hook(_t, _v, _tbk):
+    import traceback as _tbm
+    print("\n" + "!" * 60)
+    print("★★★ 本测试**崩了**（不是断言判假）—— %s: %s" % (_t.__name__, _v))
+    print("★★ 退出码 1 的两种含义，别混（`ERR-AI-09`）：")
+    print("    ① 某条 `ck(...)` 判假  ⇒ 该改**被测代码**；")
+    print("    ② 测试文件自己抛异常 ⇒ 该改**测试本身**（而它此前长得跟①一样）。")
+    print("   ★ 分辨：正文里**没有** `MAIN_OK` ⇒ 是 ②。")
+    print("!" * 60)
+    _tbm.print_exception(_t, _v, _tbk)
+
+
+_sys_pre.excepthook = _crash_hook
+
 import contextlib
 import importlib.util
+import re
 import io
 import pathlib
 import sys
@@ -81,6 +108,33 @@ print("\n① items_of：item 必须**整块**留下（这就是原来那个 bug 
 # ★ 凭据形状的值**拼出来**，不在源码里写字面量 —— 否则推前扫描会扫到这个测试自己
 #   （同 `test_scan_secrets.py` 的文件头纪律 ②）。
 KEYISH = "a" * 4 + "b" * 28                     # 32 位，hex 形状
+
+# ★★★ 全局打桩：**所有** `tp.main()` 调用都不许碰到真的 NAS（2026-09-21 加）。
+#   ★ 起因是一个真缺陷：退避闸让 `main()` 每次都要读**两只时钟**，而 ⑦ 那节
+#     只打了 `urlopen` ⇒ 它真去开了生产库，读到 5 列时**直接崩**
+#     （`ValueError: too many values to unpack`）。那**不是**被测代码的读数，
+#     是**测试自己的环境泄漏**。
+#   ⇒ ★★ 离线测试必须自己说了算：**NAS 上那两个数变了，这里的结论一个字都不该变**。
+_ORIG_FETCH_DISABLED = tp.fetch_disabled
+_ORIG_FETCH_CS = tp.fetch_cs_retry
+
+
+def _clocks_all_clear(env=None, idx=None, timeout=8):
+    """默认桩：Prowlarr 说"没禁任何站"。"""
+    return {}, None
+
+
+def _cs_all_clear_default(db=None, timeout=8):
+    """默认桩：cross-seed 说"没有站的 retry_after 未到"。
+
+    ★ 只给候选的 1/2/4/5 置上 —— 别的编号仍走"库里没有这个站 ⇒ 不放行"那条真逻辑。
+    """
+    return ({k: {"retry_after": None} for k in ("1", "2", "3", "4", "5")}, None)
+
+
+tp.fetch_disabled = _clocks_all_clear
+tp.fetch_cs_retry = _cs_all_clear_default
+
 BODY = (
     '<?xml version="1.0"?><rss xmlns:torznab="http://torznab.com/schemas/2015/feed">'
     "<channel>"
@@ -476,7 +530,11 @@ ck("★★ 全被禁 ⇒ 一个都不放行（**不许矮子里拔将军**）",
 # ★ 超时必须是**独立退出码 4**，且**不许**和 429 混成一个
 ck("★★ 超时有自己的退出码 4（源码里 `return 4`）", "return 4" in src, "没有 return 4")
 ck("★★ 超时分支排在宽 `except Exception` **之前**（否则被吞成 1）",
-   src.index("TimeoutError, socket.timeout") < src.index("请求失败：%s: %s"),
+   # ★★ 原来写成 `src.index(A) < src.index(B)` —— 一旦 A 不在源码里（**正是变异 J**），
+   #   `index` 抛 `ValueError` ⇒ **测试崩**，而"崩"的退出码与"判成红"**一模一样**。
+   #   ⇒ 改成先 `find`、`-1` 直接算**判假**（出错就往"红"倒 —— 不许静默变绿）。
+   (0 <= src.find("TimeoutError, socket.timeout")
+        < src.find("请求失败：%s: %s")),
    "超时被宽 except 接走了 ⇒ 它和「网络不通」读数一样")
 ck("★ 超时输出里明说它**不是**「没有季字段」",
    "响应里没有季字段" in src, "没交代超时不等于「没有」")
@@ -520,6 +578,13 @@ print("      ★ 而根因不是「站点不给季字段」，是「我在退避
 
 # ==========================================================================
 print("\n⑩ ★★★ 接线检查：`main()` **真的**把退避闸用上了吗（行为判据，不是源码文本）")
+# ★★ 本节要用**真的** `fetch_disabled` 去解析下面伪造的 `indexerstatus` 响应体
+#   （判据就是"喂一份该站被禁的状态，看它拒不拒绝"）。而文件顶部那个全局桩把
+#   它钉成了"没有任何站被禁" ⇒ 那条路径会死。★ 这里换回原函数：
+#   `urlopen` 已经是假的（不碰真 NAS），恢复它只是**让它去解析我们伪造的 body**。
+#   ★ `fetch_cs_retry` **保持全局桩** —— 本节只问"退避闸有没有接上"，
+#     钉住第二只时钟能让结论少一个会变的输入。
+tp.fetch_disabled = _ORIG_FETCH_DISABLED
 # --------------------------------------------------------------------------
 # ★★★ 为什么必须有这一节：⑧ 测的是 `disarm_at` **这个纯函数**。
 #     而**实测**——把 `fetch_disabled(...)` 换成 `({}, None)`（= 退避闸永远放行）
@@ -609,10 +674,219 @@ try:
        _out4[-250:])
 finally:
     tp.urllib.request.urlopen = _real2
+    tp.fetch_disabled = _clocks_all_clear      # ★ 收回本节临时换上的真函数
 print("  --   ★★★ 这一节是 ⑧ 的**接线**对照：⑧ 证明闸的逻辑对，⑩ 证明闸**真的接上了**。")
 print("      ★ 实测：把 fetch_disabled 换成空 map（闸永远放行）⇒ ⑧ 的 20 条**一条不红**，")
 print("        本条**立刻红**。★ 同 ERR-AI-05：「测了那段逻辑」≠「那段逻辑被接上了」。")
 
+# ==========================================================================
+print("\n⑪ ★★★ 两只时钟：`disabledTill`（Prowlarr）**和** `retry_after`（cross-seed）")
+# --------------------------------------------------------------------------
+# ★★ 这一节钉的是 26.38-A 那次真跑暴露的**第二个**洞：
+#   闸只读了 A（Prowlarr），而实测 **A 说「窗口已过」、B 说「还剩 7h」** ——
+#   接着就 429。⇒ ★ 只读一只时钟 = 假绿。
+#
+# ★ 具体读数（2026-09-21 16:0x 实读）：
+#     A：`indexerstatus` = [HDtime(id=1)]  ⇒ id=2/4/5 **不在数组** ⇒ 看着「没被禁」
+#     B：`indexer` 表的 `retry_after` = 09-21 **07:35**，**比当时晚** ⇒ 真在被拦
+#   ★★ 两个库各说各话，**取晚的那个**才叫「现在能不能问」。
+
+# ---- A 侧：读不到（None）时**不许**放行 ----------------------------------
+_o, _b = tp.disarm_at(["2"], None, 1.0e9, force=False, cs_map=None)
+ck("★★★ A（Prowlarr）读不到 ⇒ **不放行**（读不到 ≠ 没被禁）", _o == [] and len(_b) == 1, str(_b))
+ck("   ★ 理由里点名「读不到」与「没被禁」", ("读不到" in _b[0][1] and "没被禁" in _b[0][1]), _b[0][1])
+
+# ---- 单只时钟的行为不变（向后兼容回归）-----------------------------------
+_o, _b = tp.disarm_at(["2"], {"2": None}, 1.0e9, force=False, cs_map=None)
+ck("★ A 说没有该站 ⇒ 放行（不传 cs_map = 没查 B，行为同以前）", _o == ["2"] and _b == [], str(_b))
+
+# ---- ★★★ 核心：A 说「过」、B 说「没到」⇒ **必须拦** -----------------------
+# 这就是实测那一次的形状。★ 做成断言，是为了**下次不会再只读 A**。
+_cs_future = {"2": {"retry_after": int((1.0e9 + 3600) * 1000)}}      # B：+1 小时
+_o, _b = tp.disarm_at(["2"], {"2": None}, 1.0e9, force=False, cs_map=_cs_future)
+ck("★★★ A 说「过」而 B 说「没到」⇒ **拦住**（实测那次 429 的正解）",
+   (_o == [] and len(_b) == 1), ("ok=%s blocked=%s" % (_o, _b)))
+ck("   ★ 理由里必须点名是 **cross-seed 那一只** 时钟（不是含混的「被禁」）",
+   ("cross-seed" in _b[0][1] and "retry_after" in _b[0][1]), _b[0][1])
+ck("   ★ 且带**还剩多久**（人要知道等多久）", ("还剩" in _b[0][1]), _b[0][1])
+
+# ---- B 说「已过期」⇒ 两只都过 ⇒ 放行 -------------------------------------
+_cs_past = {"2": {"retry_after": int(1.0e9 * 1000)}}                  # B：刚好到期
+_o, _b = tp.disarm_at(["2"], {"2": None}, 1.0e9, force=False, cs_map=_cs_past)
+ck("★★ 两只时钟都过 ⇒ 放行", (_o == ["2"] and _b == []), ("ok=%s blocked=%s" % (_o, _b)))
+
+# ---- B 里**没有这个站** ⇒ 两种含义分不开 ⇒ 不放行（保守方向）-------------
+# ① 这个站从没搜出去过（失败不记行）② 不在 cross-seed 的 indexer 表里。
+# ★ 读数一模一样 ⇒ **不猜**。
+_o, _b = tp.disarm_at(["9"], {"9": None}, 1.0e9, force=False, cs_map={"2": {"retry_after": None}})
+ck("★★ B 里没有这个站 ⇒ **不放行**（分不清「从没搜过」与「没登记」）",
+   (_o == [] and len(_b) == 1), str(_b))
+ck("   ★ 且理由里明说这两个分不清", ("分不清" in _b[0][1]), _b[0][1])
+
+# ---- B 的 retry_after 为空 ⇒ 那一格就是「没拦」（库里的正常态）-----------
+_o, _b = tp.disarm_at(["2"], {"2": None}, 1.0e9, force=False,
+                      cs_map={"2": {"retry_after": None}})
+ck("★ B 的 retry_after 为空 ⇒ 这一格没拦（已过期或从没被限流）", (_o == ["2"] and _b == []), str(_b))
+
+# ---- B 的 retry_after 是意外类型 ⇒ 判不出 ⇒ 不放行 -----------------------
+_o, _b = tp.disarm_at(["2"], {"2": None}, 1.0e9, force=False,
+                      cs_map={"2": {"retry_after": "garbage"}})
+ck("★★★ B 的 retry_after 类型意外 ⇒ **不放行**（判不出 ≠ 没被拦）",
+   (_o == [] and len(_b) == 1), str(_b))
+
+# ---- ★ A 自己就说被禁 ⇒ 短路在 A（不必再看 B）----------------------------
+_o, _b = tp.disarm_at(["2"], {"2": "2099-01-01T00:00:00Z"}, 1.0e9, force=False,
+                      cs_map={"2": {"retry_after": None}})
+ck("★ A 已说被禁 ⇒ 拦在 A", (_o == [] and "Prowlarr" in _b[0][1]), _b[0][1])
+
+# ---- ★★ `--force` 仍然绕过**两只**时钟 -----------------------------------
+_o, _b = tp.disarm_at(["2"], {"2": "2099-01-01T00:00:00Z"}, 1.0e9, force=True,
+                      cs_map={"2": {"retry_after": int((1.0e9 + 999) * 1000)}})
+ck("★★ `--force` 是唯一出口，且它绕过**两只**时钟（不是只绕 A）",
+   (_o == ["2"] and _b == []), ("ok=%s blocked=%s" % (_o, _b)))
+
+# ---- ★ 全被禁（两只都拦）⇒ 一个都不放行 ----------------------------------
+_o, _b = tp.disarm_at(["1", "2"], {"1": "2099-01-01T00:00:00Z", "2": "2099-01-01T00:00:00Z"},
+                      1.0e9, force=False,
+                      cs_map={"1": {"retry_after": None}, "2": {"retry_after": None}})
+ck("★★ 全被禁 ⇒ 一个都不放行（不许矮子里拔将军）", (_o == [] and len(_b) == 2), str(_b))
+
+# ---- ★★ 源码级：第二只时钟**存在**，且**不取带凭据的两列** ---------------
+# ★ 这是「脱敏纪律①：能不取就不取」的机器判据 —— cross-seed 的 `indexer` 表里
+#   `url`/`apikey` 两列含**全站共用的密钥**，取它俩就是自找泄漏面。
+_sec_src = SCRIPT.read_text(encoding="utf-8")
+ck("★★ 源码里有第二只时钟（`fetch_cs_retry`，读 `retry_after`）",
+   ("def fetch_cs_retry" in _sec_src and "retry_after" in _sec_src), "没找到 fetch_cs_retry")
+_seg = _sec_src.split("def fetch_cs_retry", 1)[1].split(chr(10) + "def ", 1)[0]
+# ★★ 判据要抓**那一条 SQL 语句**，不能拿整段源码判 —— 第一版用了
+#   `"url" not in _seg`，而 _seg 含 docstring，里面那句「url 与 apikey 一律不取」
+#   **正是我自己写的说明** ⇒ 判据被自己的注释绊倒（同 ERR-AI-05：测的是文本不是 SQL）。
+_sqls = re.findall(r"con\.execute\(\s*(?:'([^']*)'|\"([^\"]*)\"|f?\"\"\"([^\"]*)\"\"\")",
+                   _seg)
+_sql = " ".join(x for tup in _sqls for x in tup if x)
+ck("★★★ 那条 SQL **只选** id/status/retry_after 三列 —— 不取 url/apikey",
+   ("retry_after" in _sql and "apikey" not in _sql and "url" not in _sql),
+   ("SQL = %r" % _sql))
+ck("★ 它以只读方式打开（`mode=ro`）—— 绝不写生产库", ("mode=ro" in _seg), "没看到 mode=ro")
+
+# ==========================================================================
+print("\n⑫ ★★★ 接线 + 「超时不是『没有』」")
+# --------------------------------------------------------------------------
+# ★★ 为什么单列一节：`TimeoutError` 与 `HTTP 429` 是**两件完全不同的事**，
+#   而在这之前**两者只打一行 `请求失败：TimeoutError`** —— 读数一样。
+#   ★ 实测（2026-09-21）：三条命令 = 两次超时 + 一次 429，**全是废读数**；
+#     而「全是超时」与「全是 429」推出来的东西完全不同（前者连门都没进）。
+
+# ① 源码级：超时分支必须**排在**宽 `except Exception` **之前**
+#    ★ 顺序反了，超时会被宽 except 接走 ⇒ 读数就退回"跟网络不通长得一样"。
+_i_to = _sec_src.find("except (TimeoutError, socket.timeout)")
+_i_wide = _sec_src.find("except Exception as e:", max(_i_to, 0))
+ck("★★ 超时分支**排在**宽 `except Exception` 之前（顺序反了读数就退回去了）",
+   (_i_to >= 0 and _i_wide > _i_to), ("超时@%s 宽@%s" % (_i_to, _i_wide)))
+ck("★★★ 超时输出里明说它**不是**「响应里没有季字段」",
+   ("超时 ≠ 429" in _sec_src and "未验" in _sec_src), "超时那段没交代它属于「未验」")
+ck("★ 超时有**自己的**退出码 4（与 429 的 1 分开）", ("return 4" in _sec_src), "没找到 return 4")
+
+# ② ★★ 行为判据：让 urlopen 抛超时，看 main() 是不是返回 4、且**没**报成功
+_real3 = tp.urllib.request.urlopen
+
+
+def _fake_timeout_ok(req, timeout=None):
+    if "/api/v1/indexerstatus" in req.full_url:
+        return _FakeResp2(b'[]')                     # A：没有任何站被禁 ⇒ 闸放行
+    raise TimeoutError("simulated")
+
+
+def _no_gate(env, idx, timeout=8):
+    return ({}, None)
+
+
+def _cs_all_clear(db, timeout=None):
+    return ({"1": {"retry_after": None}, "2": {"retry_after": None},
+             "4": {"retry_after": None}, "5": {"retry_after": None}}, None)
+
+
+_e_real_cs, _e_real_idx = _cs_all_clear_default, _clocks_all_clear
+tp.fetch_cs_retry, tp.fetch_disabled = _cs_all_clear, _no_gate
+tp.urllib.request.urlopen = _fake_timeout_ok
+try:
+    with contextlib.redirect_stdout(io.StringIO()) as _cap5:
+        _rc5 = tp.main(["T", "1", "--env", str(stub_env)])
+    _out5 = _cap5.getvalue()
+finally:
+    tp.urllib.request.urlopen = _real3
+    tp.fetch_cs_retry, tp.fetch_disabled = _cs_all_clear_default, _clocks_all_clear
+ck("★★★ 超时 ⇒ 退出码 **4**（不是 1、更不是 0）", (_rc5 == 4), ("rc=%s" % _rc5))
+ck("★★★ 且输出里**不许**出现「条数 =」（那是「拿到了响应体」的样子）",
+   ("条数 =" not in _out5), _out5[-200:])
+ck("★★ 且明说这是**未验**（`B.10`：未验 ≠ 无）", ("未验" in _out5), _out5[-300:])
+ck("★ 且把三种可能列出来（站点慢 / 排队 / 挂了）—— 这三种读数分不开",
+   ("站点慢" in _out5 or "排队" in _out5), _out5[-300:])
+
+# ③ ★★ 行为判据：main() 真的会把 cross-seed 的 retry_after 当闸用
+_real4 = tp.urllib.request.urlopen
+_hits5 = []
+
+
+def _cs_all_future(db, timeout=None):
+    _t = int((_tm.time() + 99999) * 1000)
+    return ({"1": {"retry_after": _t}, "2": {"retry_after": _t},
+             "4": {"retry_after": _t}, "5": {"retry_after": _t}}, None)
+
+
+def _fake_urlopen5(req, timeout=None):
+    if "/api/v1/indexerstatus" in req.full_url:
+        return _FakeResp2(b'[]')                     # ★ A 说：没有任何站被禁
+    _hits5.append(req.full_url)                      # ★ 走到这里 = 闸没拦住
+    return _FakeResp2(b'<rss><channel></channel></rss>')
+
+
+tp.fetch_cs_retry, tp.fetch_disabled = _cs_all_future, _no_gate
+tp.urllib.request.urlopen = _fake_urlopen5
+try:
+    with contextlib.redirect_stdout(io.StringIO()) as _cap6:
+        _rc6 = tp.main(["T", "1", "--any", "--env", str(stub_env)])
+    _out6 = _cap6.getvalue()
+finally:
+    tp.urllib.request.urlopen = _real4
+    tp.fetch_cs_retry, tp.fetch_disabled = _cs_all_clear_default, _clocks_all_clear
+ck("★★★ A 说都能用而 B 说全没到 ⇒ **一个都不发**（这就是实测那次的形状）",
+   (_rc6 == 3 and not _hits5), ("rc=%s hits=%s" % (_rc6, len(_hits5))))
+ck("★ 且输出里点名是**两只时钟都看过**", ("两只时钟" in _out6), _out6[-300:])
+
+# ④ ★★ 行为判据：B 读不到 ⇒ 不许当成「A 单独说了算」
+_hits6 = []
+
+
+def _cs_err(db, timeout=None):
+    return None, "simulated: SMB unreachable"
+
+
+def _fake_urlopen6(req, timeout=None):
+    if "/api/v1/indexerstatus" in req.full_url:
+        return _FakeResp2(b'[]')
+    _hits6.append(req.full_url)
+    return _FakeResp2(b'<rss><channel></channel></rss>')
+
+
+tp.fetch_cs_retry, tp.fetch_disabled = _cs_err, _no_gate
+tp.urllib.request.urlopen = _fake_urlopen6
+try:
+    with contextlib.redirect_stdout(io.StringIO()) as _cap7:
+        _rc7 = tp.main(["T", "1", "--any", "--env", str(stub_env)])
+    _out7 = _cap7.getvalue()
+finally:
+    tp.urllib.request.urlopen = _real4
+    tp.fetch_cs_retry, tp.fetch_disabled = _cs_all_clear_default, _clocks_all_clear
+ck("★★★ 第二只时钟读不到 ⇒ `--any` **不生效**、也不发请求（只读 A 是假绿）",
+   (_rc7 == 3 and not _hits6), ("rc=%s hits=%s" % (_rc7, len(_hits6))))
+ck("★ 且输出里明说「只读 A 是假绿」这件事", ("假绿" in _out7), _out7[-400:])
+
 print(f"\n{'=' * 60}")
 print(f"断言 {_ok + _bad} 条：{_ok} 过 / {_bad} 失败")
+if _bad:
+    print("★★ 判读：上面**有 FAIL** ⇒ 是「断言判假」，该改被测代码。")
+else:
+    print("★★ 判读：**没有 FAIL** ⇒ 断言全过。")
+print("★★★ MAIN_OK —— 看到这一行才说明**主体跑到了尾**（没崩）")
 sys.exit(0 if _bad == 0 else 1)

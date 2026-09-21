@@ -55,6 +55,10 @@ SUMMARY §20.9.5 的退出条件里，有一格日志**分不开**：
     --any   ★★ **自动挑一个"现在没被退避"的站** —— 按 1/2/4/5 的顺序试，
            遇到被禁的就跳过。★ 为什么需要它：**退避时跑出来的读数是假的**
            （`ERR-SVC-12`），而人手记不住哪个站现在能用。
+           ★★★ **它要两只时钟都说"能"才挑**（2026-09-21 补）：
+           Prowlarr 的 `disabledTill`（A）+ cross-seed 的 `retry_after`（B）。
+           ★ **只读 A 是假绿** —— 实测 A 说「窗口已过」而 B 说「还剩 7h」
+           （HDFans），接着就 429。两个取**晚**的那个。
     --force
            ★ **跳过退避闸，强行发**（★ 只在你**确实知道**自己在干什么时用；
            它会让下面那个"退避期不发请求"的保护失效）。
@@ -73,19 +77,20 @@ SUMMARY §20.9.5 的退出条件里，有一格日志**分不开**：
 | **0** | 拿到了响应体 | ★ **能** |
 | **1** | HTTP 错（429/401/5xx 等） | ★ **不能**（429 = 退避，读数无意义）|
 | **2** | 读不到 `.env` | ★ **不能**（"读不到" ≠ "没有"）|
-| **3** | ★★ **退避闸拦下了**（本地就拒了，**没出网**） | ★ **不能**（但也没浪费额度）|
+| **3** | ★★ **退避闸拦下了**（本地就拒了，**没出网**） | ★ **不能**（但也没浪费额度）—— ★ **两只时钟都说"能"才放行** |
 | **4** | ★★ **超时** —— 请求发出去了、**没能等到答复** | ★★★ **不能**。★ 它与 429 **不是一回事**：<br>429 = 我知道自己被限流；**超时 = 我不知道发生了什么**。<br>★★ `B.10`：超时**不是**"响应里没有季字段"，是**这次没读到响应**。|
 """
 from __future__ import annotations
 
 import os
+import pathlib
 import re
 import socket
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
-import time
 
 for _s in (sys.stdout, sys.stderr):
     try:
@@ -95,6 +100,11 @@ for _s in (sys.stdout, sys.stderr):
 
 NAS_ENV = "//iSunker-DS423/docker_ssd/prowlarr_cross-seed_autohardlink/.env"
 NAS_IP = "192.168.0.7"
+#: ★ cross-seed 的库（UNC）。**只读**、`mode=ro`、且**绝不取 `url`/`apikey` 两列**。
+NAS_CROSSSEED_DB = ("//iSunker-DS423/docker_ssd/prowlarr_cross-seed_autohardlink"
+                    "/cross-seed/cross-seed.db")
+#: 墙钟（`retry_after`）与本地时钟差多少秒算「同一个窗口」——见 `disarm_at`。
+CLOCK_SKEW_SEC = 120
 
 # ---- 脱敏（出口口径，与 scan-secrets.py / 04_probes.py 同一形状）----
 # ★ 为什么 `--raw` 必须过它：原始响应里的 `<link>` / `<guid>` 常把 passkey 编进去。
@@ -172,7 +182,29 @@ def torznab_all(env_path: str):
     raise SystemExit("[!!] .env 的 TORZNAB_URLS 里没有任何条目")
 
 
-def disarm_at(indexer_ids, disabled_map, now, force=False):
+def _parse_iso(ts, now):
+    """ISO8601（`…Z` 或带 offset）→ epoch 秒；解析不了返回 None。"""
+    import datetime as _dt
+    if not isinstance(ts, str):
+        return None
+    try:
+        when = _dt.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except Exception:                                  # noqa: BLE001
+        return None
+    if when.tzinfo is None:                            # 没带时区 ⇒ 按 UTC 读（Prowlarr 给的是 Z）
+        when = when.replace(tzinfo=_dt.timezone.utc)
+    return when.timestamp()
+
+
+def _with_cs(cs, i, v):
+    """把 cross-seed 那一侧的读数并进一格（**没给就原样返回**，不编一个 0 出来）。"""
+    out = dict(i)
+    if cs is not None:
+        out["cs"] = v
+    return out
+
+
+def disarm_at(indexer_ids, disabled_map, now, force=False, cs_map=None):
     """★★★ 退避闸（**纯函数**，可离线测）—— 挑出"现在能问"的站。
 
     ★★ 为什么必须在**探针里**做、而不是靠人先查一遍
@@ -182,42 +214,90 @@ def disarm_at(indexer_ids, disabled_map, now, force=False):
     ⇒ ★ 判据：**"这个站现在能不能问"必须由程序在读的那一刻算**，
       人手查一次的结果**在两次调用之间就会过期**。
 
-    ★ 数据从哪来：Prowlarr 的 `/api/v1/indexerstatus` 是**本地**接口
-      （查它**不碰站点、不耗额度**），`disabledTill` 是 Prowlarr 自己立的闸。
-      —— 与 `scripts/diag/prowlarr-indexerstatus.py` 同一口径（`ERR-SVC-17` 的 ② 机制）。
+    ★★ 两只时钟，缺一只就是假绿（2026-09-21 实测补上）
+    --------------------------------------------------
+    | 时钟 | 谁立的闸 | 存在哪 | 管什么 |
+    |---|---|---|---|
+    | **A** `disabledTill` | Prowlarr | `/api/v1/indexerstatus`（本地，不耗额度）| Prowlarr 何时肯**转发** |
+    | **B** `retry_after` | cross-seed | `cross-seed.db` 的 `indexer` 表（本地，不耗额度）| cross-seed 何时肯**再问** |
+
+    ★★★ **只读 A 是这根闸门上一轮的真漏洞**：2026-09-21 16:0x 实测
+      **A 说 HDFans 的窗口已过（数组里没有它）而 B 的 `retry_after` 还没到** ——
+      两个数据库各说各话，**取晚的那个**才是「现在能不能问」。
+      ⇒ ★ 这条与 `prowlarr-indexerstatus.py` 末尾那句
+        「两个时钟不一致时**以更长的为准**」是同一个判据，**现在它进了代码**。
+
+    ★ 数据从哪来：两个都是**本地**接口/库（查它**不碰站点、不耗额度**）。
+      —— 与 `scripts/diag/prowlarr-indexerstatus.py`（A）/
+      `scripts/diag/check-indexer-timestamps.py`（B）同一口径（`ERR-SVC-17`）。
+
+    参数
+      `indexer_ids`  候选编号（字符串）
+      `disabled_map` A 的读数：`{编号: disabledTill 或 None}`；`None`（整体）= A 读不到
+      `cs_map`       B 的读数：`{编号: {"retry_after": int 毫秒 或 None}}`；
+                     ★ **不传**（`None`）= 调用方**没查** B（向后兼容，行为同以前）
+      `force`        跳过两只时钟
 
     返回 `(可用编号列表, 被禁的 [(编号, 原因)])`。
-    ★★ `disabledTill` 解析不出来的**一律按"被禁"处理** ——
-      **判不出来时不许放行**（同 `rotate-crossseed-key.py` 的容器闸：unknown 不放行）。
+    ★★ 解析不出来的**一律按"被禁"处理** —— **判不出来时不许放行**
+      （同 `rotate-crossseed-key.py` 的容器闸：unknown 不放行）。
     """
     ok, blocked = [], []
     for i in indexer_ids:
-        dt = disabled_map.get(i)
         if force:
             ok.append(i)
             continue
-        if dt is None:
-            # 数组里没有这个站 ⇒ ① 站点真发 / 或没被 Prowlarr 禁用 ⇒ 可用
-            ok.append(i)
+
+        # ---- 时钟 A：Prowlarr 本地禁用 ----
+        if disabled_map is None:
+            blocked.append((i, "Prowlarr 状态**读不到** ⇒ ★ 判不出，不放行（读不到 ≠ 没被禁）"))
             continue
-        if isinstance(dt, str):
-            try:
-                import datetime as _dt
-                when = _dt.datetime.fromisoformat(dt.replace("Z", "+00:00"))
-                nowdt = _dt.datetime.fromtimestamp(now, tz=_dt.timezone.utc)
-                if when > nowdt:
-                    remain = int((when - nowdt).total_seconds())
-                    blocked.append((i, "Prowlarr 禁用至 %s（还剩 %d 分 %d 秒）"
-                                    % (dt, remain // 60, remain % 60)))
-                    continue
-            except Exception:                          # noqa: BLE001
+        dt = disabled_map.get(i)
+        if dt is not None:
+            if not isinstance(dt, str):
+                blocked.append((i, "disabledTill 是意外类型（%r）⇒ ★ 判不出，不放行" % (dt,)))
+                continue
+            a_when = _parse_iso(dt, now)
+            if a_when is None:
                 blocked.append((i, "disabledTill 解析不了（%r）⇒ ★ 判不出，不放行" % (dt,)))
                 continue
-        else:
-            blocked.append((i, "disabledTill 是意外类型（%r）⇒ ★ 判不出，不放行" % (dt,)))
-            continue
-        ok.append(i)                                    # 解析成功且已过期
+            if a_when > now:
+                remain = int(a_when - now)
+                blocked.append((i, "Prowlarr 禁用至 %s（还剩 %d 分 %d 秒）"
+                                % (dt, remain // 60, remain % 60)))
+                continue
+
+        # ---- 时钟 B：cross-seed 自己的退避（★ A 说"过"时它可能还说"没到"）----
+        if cs_map is not None:
+            row = cs_map.get(i)
+            if row is None:
+                # 两种情况，**读数一模一样，本函数分不开** ⇒ 一律不放行（保守方向）。
+                # ① 这个站**从没搜出去过**（失败不记行 ⇒ 库里没有行）
+                # ② 它不在 cross-seed 的 `indexer` 表里（`.env` 加了站但没重建容器）
+                # ★ 这里**不猜**是哪种 —— 猜错就是发一个必然 429 的请求。
+                blocked.append((i, "cross-seed 库里**没有这个站的记录** ⇒ ★ 分不清"
+                                   "「从没搜过」还是「没登记」，不放行"))
+                continue
+            b_ms = row.get("retry_after")
+            if b_ms is not None:
+                if not isinstance(b_ms, (int, float)):
+                    blocked.append((i, "cross-seed retry_after 是意外类型（%r）⇒ ★ 判不出，不放行"
+                                    % (b_ms,)))
+                    continue
+                b_when = b_ms / 1000.0
+                if abs(b_when - now) > CLOCK_SKEW_SEC and b_when > now:
+                    remain = int(b_when - now)
+                    blocked.append((i, "cross-seed retry_after 未到 %s（还剩 %d 分 %d 秒）"
+                                    % (_local(b_when), remain // 60, remain % 60)))
+                    continue
+        ok.append(i)
     return ok, blocked
+
+
+def _local(epoch):
+    """epoch 秒 → 本地时间串（**读数**用，不是判据）。"""
+    import datetime as _dt
+    return _dt.datetime.fromtimestamp(epoch).strftime("%m-%d %H:%M:%S")
 
 
 def fetch_disabled(env_path, idx, timeout=8):
@@ -249,6 +329,37 @@ def fetch_disabled(env_path, idx, timeout=8):
     for row in data:
         if isinstance(row, dict) and "indexerId" in row:
             out[str(row["indexerId"])] = row.get("disabledTill")
+    return out, None
+
+
+def fetch_cs_retry(crossseed_db, timeout=8):
+    """★ 读 cross-seed **本地**库的第二个时钟：`indexer` 表的 `retry_after`。
+
+    返回 `(编号 → {"retry_after": 毫秒 或 None}, 错误串或 None)`。
+    ★★ **只取 `id` / `status` / `retry_after` 三列** —— `url` 与 `apikey` **一律不取**
+      （那两列里有全站共用的密钥；见 `check-indexer-timestamps.py` 同一纪律）。
+    ★ 读不到时返回错误串 —— **绝不读成"没被拦"**（`B.10`）。
+    ★ 打开方式必须是 `file:////<host>/<path>?mode=ro`：写成 `file://<host>/…`
+      会被当成 URI 的 authority（2026-09-12 踩过）；也不要 `cp` 到本地
+      （会丢掉 WAL 里还没 checkpoint 的改动，读到偏旧的快照）。
+    """
+    import sqlite3
+    p = pathlib.Path(crossseed_db)
+    if not p.is_file():
+        return None, "cross-seed 库不可达（SMB 断了？或路径给错）"
+    uri = "file:////" + p.as_posix().lstrip("/") + "?mode=ro"
+    try:
+        # ★ `timeout` 给短一点：这是个**辅助**时钟，它不通不该把主流程拖死。
+        con = sqlite3.connect(uri, uri=True, timeout=timeout)
+        with con:
+            rows = list(con.execute(
+                'SELECT id, status, retry_after FROM "indexer"'))
+        con.close()
+    except Exception as e:                              # noqa: BLE001
+        return None, "%s: %s" % (type(e).__name__, e)
+    out = {}
+    for iid, _st, ra in rows:
+        out[str(iid)] = {"retry_after": ra}
     return out, None
 
 
@@ -309,6 +420,11 @@ def main(argv):
     # ★ 顺序：1/2/4/5 —— ★ 刻意**不含 3**（BTSCHOOL 在 `.env` 里？不确定就一并列出）
     CAND = ["1", "2", "4", "5", "3"]
     disabled, derr = fetch_disabled(env_path, idx, timeout=8)
+    # ★★ 第二个时钟（cross-seed 的 `retry_after`）。★ 只在真的要用闸时才读它
+    #   （`--force` 时无需读；也避免为一个纯离线用法去碰 NAS 的一句多余 IO）。
+    cs_map = cs_err = None
+    if not force:
+        cs_map, cs_err = fetch_cs_retry(NAS_CROSSSEED_DB, timeout=8)
     if derr:
         print("★ 退避闸读不到 Prowlarr 本地状态：%s" % derr)
         print("  ★ 判据：**读不到 ≠ 没被禁**（`B.10`）⇒ ★ 不自动挑站。")
@@ -317,8 +433,18 @@ def main(argv):
             print("     用 `--id <编号>` 明确指定，或加 `--force`（★ 你自己担这个判断）。")
             return 3
     else:
+        if cs_err:
+            # ★ A 通了、B 没通 ⇒ **不许当成 A 单独说了算**（那正是上一轮的假绿）。
+            print("★ 退避闸的**第二只时钟**（cross-seed `retry_after`）读不到：%s" % cs_err)
+            print("  ★★ 判据：**只读 A 是假绿** —— 实测 A 说「窗口已过」而 B 说「还没到」")
+            print("     （2026-09-21：HDFans）。⇒ ★ 读不到 B 时**不自动挑站**（`B.10`）。")
+            if any_idx:
+                print("  ⇒ `--any` **本轮不生效**。要跑就用 `--id <编号>` 明确指定，")
+                print("     ★ 但**先用 `python scripts/diag/check-indexer-timestamps.py` 看一眼 B**。")
+                return 3
         if any_idx:
-            ok, blocked = disarm_at(CAND, disabled, time.time(), force=force)
+            ok, blocked = disarm_at(CAND, disabled, time.time(), force=force,
+                                    cs_map=None if cs_err else cs_map)
             if blocked:
                 print("★ 退避闸拦下 %d 个站：" % len(blocked))
                 for iid, why in blocked:
@@ -326,13 +452,15 @@ def main(argv):
             if not ok:
                 print("★★ **现在没有一个站可问** —— 不发请求（★ 也没浪费额度）。")
                 print("   ★ 等上面的窗口过去再跑。★ 退避期跑出来的读数是**假的**（`ERR-SVC-12`）。")
+                print("   ★ 两只时钟都看过了：Prowlarr `disabledTill` + cross-seed `retry_after`。")
                 return 3
             idx = ok[0]
-            print("★ --any 挑中 id=%s（★ 已确认此刻没被退避）" % idx)
+            print("★ --any 挑中 id=%s（★ 已确认**两只时钟**此刻都没拦）" % idx)
         elif not force:
-            _ok, blocked = disarm_at([idx], disabled, time.time(), force=False)
+            _ok, blocked = disarm_at([idx], disabled, time.time(), force=False,
+                                     cs_map=None if cs_err else cs_map)
             if blocked:
-                print("★★★ **这个站现在被 Prowlarr 禁着 —— 不发请求**（`id=%s`）" % idx)
+                print("★★★ **这个站现在被拦着 —— 不发请求**（`id=%s`）" % idx)
                 for iid, why in blocked:
                     print("    %s" % why)
                 print("   ★ 现在跑会拿到 429，而**退避时的读数是假的**（`ERR-SVC-12`）")
