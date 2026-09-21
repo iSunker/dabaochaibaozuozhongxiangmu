@@ -27,6 +27,7 @@
     "test_roots_from_env.py": 25,
     "test_rotate_crossseed_key_gate.py": 17,
     "test_scan_secrets.py": 29,
+    "test_seeding_by_name.py": 13,
     "test_sync_empty_sets.py": 31
   },
   "notes": {
@@ -57,12 +58,13 @@
     "test_roots_from_env.py": "`init --roots-from-env` 的**取值来源**：首选 `FARM_SOURCES`、缺席时退回 `DATA_DIRS`（★ 与 `build-farm.sh:132-155` 同一种优先顺序）。核心那格是**同一个 `.env`、同一句 `--match`**：`FARM_SOURCES` 在 → 挑得到，只有 `DATA_DIRS` → 挑 0 —— 差异只可能来自取值来源，所以它量的就是\"键换对了\"本身。另钉：退回时**必须说出来**（不静默）、两个键都没有时报错要点名两个键、`--match` 挑不中时文案点名**实际用的那个键**",
     "test_rotate_crossseed_key_gate.py": "`#109` 的**容器闸**：★ 它**原来是个假闸** —— 从不真去查容器，只是无条件要求 `--force-running`，却打出一句「需要先停掉 cross-seed 容器」（2026-09-17 新增）。⇒ 用户**真的停了**容器，脚本**仍然拒绝** ⇒ **提示与事实不符**；更糟：那句提示把用户**引向 `--force-running`**，而那正是**唯一**的保护。<br>★★ 钉的是**行为**（用桩驱动 `_sh`，不依赖真 docker）：<br>① **`running` 必须拦、`unknown` 必须拦** —— ★ `unknown` 是「**查不出**」，**不是**「没在跑」（`docker` 不可用 / daemon 连不上 / inspect 输出形状不对 / `Status=exited` 但 `Pid≠0` 自相矛盾 ⇒ 全部判 `unknown` 且**不放行**）；<br>② 只有 **`stopped` + 显式 `--force-running`** 才继续；<br>③ 判据取 **`docker inspect` 的 `State.Status`**，**不用 `docker ps`**（同日实测它会误报 `Up 4 minutes`，而 `State=exited`/`Pid=0`）。<br>★ **三处「查法写错」的自我防线**（每条都栽过）：文档串里**故意**提到 `docker ps`（解释为什么不用它）⇒ 查代码时**剔掉 docstring 节点**再 unparse，**不是** `unparse().replace(docstring)`（后者因转义**静默失效**）；`unknown` 那条断言**限定在它自己那段**里查 `return 2`（第一版查「全文有没有 `return 2`」⇒ **恒真**，删掉该分支的 `return 2` 仍绿，已变异验过）。<br>**变异验证**：把闸换回旧的无条件写法 ⇒ 红 **4** 条；把 `unknown` 的 `return 2` 删掉 ⇒ 红 **1** 条。",
     "test_scan_secrets.py": "`scripts/diag/scan-secrets.py`：阳性拦得住（值指纹 + 形状两条路）、阴性不误报；**形状层必须参与退出码**、**只拦「本次新引入」**、三类假阳性（读变量 / 英文短语 / 同字符重复）必须被规则认出来。<br>★★ **2026-09-17 加 ⑨（25 → 29）：非 ASCII 路径必须真的被扫到**（`#119`/`ERR-GIT-04`）—— `git ls-files` 默认 `core.quotepath=true` 把中文路径输出成**带引号 + 八进制转义**，下游 `(REPO / rel).is_file()` 为假 ⇒ **静默跳过**。实测本仓 **111 个文件里 25 个中文名全被跳过**（全是 `summary/*.md`）—— **而屏幕上照旧打「零命中」**。★ 修法：`-c core.quotepath=false` + `ls-files -z` 配 `split(\"\\0\")`；并加**自证那一行**「扫描范围：N/N 个文件」+「N 个路径读不到文件」告警。★ 判据是**在沙箱里放一个中文名文件**再断言它被点到名 —— 已做变异验证：换回旧写法 ⇒ **红 3 条**（含「读不到文件」与「点名」两条）。★★ **写这条时测试自己先红了一次**：我第一版断言 `rc=1`，但那个文件已被 commit ⇒ 闸门按设计报「HEAD 里本就有」而**正确地**返回 0 —— **是我把 ⑧ 的语义套到了 ⑨ 上**，断言改成量「有没有点名」，不量 rc。",
+    "test_seeding_by_name.py": "做种判定的**第二条判据**（qB 的 `name`）—— 与 cross-seed 记账**解绑**（`§26.33`）。原先 `matched_hashes` 唯一来源是 cross-seed 的 `decision` 表 ⇒ **没写 decision 就被判成没做种**（实测 qB 2141 条做种 / 544 部唯一片，而 `state.db` 说 frds 只做种 13 部，低约 30 倍）；后果双向静默：在做种的被判 `UNMATCHED` ⇒ **永不停止重搜**。★ 三个「像放宽、实为纠正」的分界：① `name` 命中**单独**即可判 SEEDING（配阴性对照：不命中不许靠 hash 蒙混）；② `seeding_names=None`（老调用点）**必须退回旧行为**，判据是「同一输入、只差该参数 ⇒ 结果不同」；③ 计数用 `max(...,1)` 而非 `+1` —— qB 里同一部片可有多条（多站各一份），而 `pack_seeding_total` 数的是**行数**。★ 变异实测（当场跑）：短路 `name` 那条路 ⇒ 红 **6** 条；`max(...,1)`→`+1` ⇒ 红 **1** 条；`None` 也放宽 ⇒ 红 **1** 条。素材全合成：SQLite 在 `tempfile.mkdtemp()` 现造，无网络、无 NAS、无真库。",
     "test_sync_empty_sets.py": "`sync_movie` 整行覆盖写 + 四个空集的后果：**SEEDING 塌成 PENDING 是降级不是删行**（连 `searched_indexers` 都被抹掉），而 `indexer_seen` 是**合并**保留的 → `next_retry_at` 被推到未来一整个周期 = **额度悄悄烧掉一轮**；端到端钉「一条计数器 / 两条静默通道」——searchee 落到**别的包**（`other_pack`）与**认不出的名字**（`unresolved`）后果一模一样，**只有后者会喊**"
   },
-  "scripts": 28,
-  "total": 1145,
+  "scripts": 29,
+  "total": 1158,
   "failures": 0,
   "failed_files": [],
-  "measured_at": "2026-09-20",
+  "measured_at": "2026-09-21",
   "command": "python tests/gen-counts.py"
 }

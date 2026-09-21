@@ -1463,11 +1463,19 @@ class StateStore:
         cadence_days: int = DEFAULT_CADENCE_DAYS,
         cadence_by_indexer: dict[str, int] | None = None,
         log_attempts: bool = True,
+        seeding_names: set[str] | None = None,
     ) -> str:
         """按事实重算这一行的 stage。返回新 stage。
 
         `attempts` / `next_retry_at` 是**我们自己的**簿记（cross-seed 不管这个）。
         `indexer_seen` 记录"每个站最后一次搜它是什么时候"，是「每站按周期重搜」的依据。
+
+        ★★ `seeding_names`（2026-09-20，`e404b1ca#5`）：qB 里所有种子的 `name`
+        （含去扩展名的形态）。**这是"在做种"的第二条独立判据** ——
+        原先只有 `seeding_hashes ∩ matched_hashes`，而后者源于 cross-seed 的
+        `decision` 表 ⇒ **cross-seed 没记账 = 判成没做种**（实测低了约 30 倍，
+        见 `sync_pack` 那段注释与 SUMMARY §26.33）。两条求并：任一条成立即算做种。
+        `None` = 调用方没给（老调用点），退回旧行为 —— **不静默放宽**。
         """
         row = self.con.execute("SELECT * FROM movie WHERE id=?", (movie_id,)).fetchone()
         if row is None:
@@ -1497,7 +1505,20 @@ class StateStore:
         old_matched_idx = {p for s in _u(row["matched_indexers"])
                            for p in str(s).split("|") if p}
         matched_indexers = old_matched_idx | {i for _, i in matched if i}
+
+        # ★★★ 做种判定**两条路求并**（`e404b1ca#5`，见函数 docstring）：
+        #   ① hash 路：`matched_hashes ∩ seeding_hashes` —— 精确，但**依赖
+        #      cross-seed 写了 decision**，没写就判成"没做种"（这就是那个 30 倍的偏差）。
+        #   ② name 路：qB 里有没有一个名叫 `dir_name` 的种子。★ 它是**独立事实**
+        #      （cross-seed 建种时用的 searchee 名 = 单片目录名），不经过它的记账。
+        #   ⇒ ①∪② 才是"这部片现在到底有没有在做种"。
         seeding_count = len(matched_hashes & seeding_hashes)
+        if seeding_names and row["dir_name"] in seeding_names:
+            # ★ 用 `max(..., 1)` 而不是 `+1`：同一部片在 qB 里可能有多个条目
+            #   （多个站各一份），但这里问的是"**这部片**做种了没"，
+            #   而 `pack_seeding_total` 数的是**行数**（stage=='SEEDING'）。
+            #   两者口径必须一致 —— 否则"做种 N 部"与"总数 M 部"会互相打脸。
+            seeding_count = max(seeding_count, 1)
 
         stage = compute_stage(
             seeding_count=seeding_count,
@@ -2258,11 +2279,48 @@ def sync_pack(
         facts.skips_seen += f.skips_seen
 
     # --- 3) qB ------------------------------------------------------------- #
+    #
+    # ★★★ 2026-09-20（`e404b1ca#5`）：**做种判据与"匹配结果"解绑**。
+    #
+    #   原先只有 hash 一条路：`seeding_count = len(matched_hashes & seeding_hashes)`
+    #   —— 而 `matched_hashes` 的唯一来源是 **cross-seed 的 `decision` 表**。
+    #   于是「cross-seed 这次没给它写 decision」⇒ 做种被判成**没做种**。
+    #
+    #   实测代价（用户凭常识抓出来的，见 SUMMARY §26.33）：qB :3060 里 **2141 条
+    #   做种 / 544 部唯一片**，而 `state.db` 说 `frds-top250-2024` 只做种 **13** 部
+    #   —— 真实是 **422/486**。**低了约 30 倍**。后果是双向静默的：
+    #     · 已在做种的片子被判 `UNMATCHED` ⇒ **永不停止重搜**（额度白烧）
+    #     · `DONE_STAGES` 那条"搜到了就不重搜"的规矩形同虚设（输入是错的）
+    #
+    #   ★ 为什么 `name` 这条路是对的、且**不是**在放宽判据：
+    #     qB 里那个种子的 `name` **就是** cross-seed 建种时用的 searchee 名，
+    #     而 searchee 名与单片 `dir_name` 同名（cross-seed 枚举规则：
+    #     dataDir 的直接子项 = searchee）。所以「qB 里有个名叫 <dir_name> 的种子」
+    #     是**独立于 cross-seed 记账的一条事实**，不是它的派生。
+    #   ★ 归属实测（2026-09-20，frds 486 部）：`name` 精确命中 **420**、
+    #     `name` 去扩展名再命中 **9**（`.mkv` 那种）、两者并集 **422** ——
+    #     与 qB 真值逐条吻合。`save_path` 末段命中 **0**（qB 的 save_path 是
+    #     按 tracker 分的 `<linkDir>/<站名>/`，**不含单片名**）⇒ 所以不走它。
+    #
+    #   ★ hash 那条**保留**：`decision` 有值而且 hash 对得上时它更精确
+    #     （能区分同名不同版）。两条求并，任一条成立即算"在做种"。
     seeding_hashes: set[str] = set()
+    #: qB 里所有种子的 `name`（含去扩展名的形态）—— 与 `dir_name` 对齐用
+    seeding_names: set[str] = set()
     for t in (qbit_torrents or []):
         h = (t.get("hash") or "").lower()
         if h:
             seeding_hashes.add(h)
+        n = (t.get("name") or "").strip()
+        if n:
+            seeding_names.add(n)
+            # ★ 同一份数据在 qB 里可能是**文件**（`X.mkv`）而不是目录（`X`）——
+            #   实测 frds 有 9 部是这种形状。只剥**最后一个**扩展名，不做
+            #   递归剥离（`S01.mkv.mkv` 这种不存在，而递归剥会把
+            #   `Avengers.Endgame.2019.BluRay` 里的 `.2019` 当成扩展名）。
+            stem = n.rsplit(".", 1)[0] if "." in n else ""
+            if stem:
+                seeding_names.add(stem)
 
     rep.indexers = indexers_now
     changed: dict[str, int] = {}
@@ -2299,6 +2357,7 @@ def sync_pack(
             skipped_indexers=skipped,
             matched=matched,
             seeding_hashes=seeding_hashes,
+            seeding_names=seeding_names,
             indexers_now=indexers_now,
             searched_at=seen,
             cadence_days=cadence_days,
