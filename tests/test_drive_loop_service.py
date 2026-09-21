@@ -395,6 +395,37 @@ ck("★ ③i 有前置闸门：读 .drive-loop.state 并能在「另一条路在
 ck("★ ③j 闸门**不读 pid**，读的是 mode（跨 pid 命名空间判 pid 是假信号）",
    '"mode"' in _SH or "'mode'" in _SH, "没引用 mode")
 
+# ---- ③k ★★ `--pool` 的开关状态（`e404b1ca#6` ①，用户 2026-09-21 拍：**开**）----
+#   ★ 为什么要钉它：`--pool` **不写进 `drive-loop.py` 的默认值**（那是产品决定，
+#     理由在 `drive-loop.py:2961` 那段），只能**在入口脚本里显式写** ⇒
+#     入口脚本一改（或有人"顺手统一两份脚本"）就会**静默改变额度分配口径**，
+#     而**不报错、日志一切正常** —— 只是欠账不再被优先吃掉。
+#   ★★ 判据要**成对**：resident **必须带**、nas **必须不带**。
+#     少了任一半，「有人给两份都加上 / 都删掉」就不会被抓住。
+#   ★ 用上面那个 `_argline` 按**参数行**取，不在全文搜（注释里也讲了 `--pool`，
+#     全文搜恒真 —— ③f 那条注释里记过同一个坑）。
+ck("★★ ③k run-resident.sh **带 `--pool`**（跨包合池：--limit 变全局，欠账优先被吃）",
+   _argline(RESIDENT, "--pool") is not None,
+   "resident 的参数行上没有 --pool —— 额度分配退回「每包各 50」")
+
+ck("★★ ③l 但 drive-loop-nas.sh **不带** `--pool`（两份入口刻意分叉，"
+   "那份已停用；不给它加是为了让改动面最小）",
+   _argline(NAS_SH, "--pool") is None,
+   "run.sh 上也出现了 --pool —— 这是**没被拍过**的改动（那份的定位是留痕/备份）")
+
+#   ★ ③m：`--pool` 必须在 `"$@"` **之前** —— 否则用户能在命令行上**覆盖**它
+#     （argparse 取最后一次）。这是有意的：`--pool` 是 store_true，
+#     **没法用 `"$@"` 关掉** ⇒ 想临时关只能改这一行（注释里也写了这句）。
+#     ⇒ 判据钉"它在 $@ 之前"，让"位置"这件事有据可查。
+_pool_line = [l for l in _SH.splitlines()
+              if l.strip().startswith("--pool") and not l.strip().startswith("#")]
+_argv_line_idx = [i for i, l in enumerate(_SH.splitlines())
+                  if l.strip().startswith('"$@"')]
+ck("★ ③m `--pool` 的**参数行位置**在 `\"$@\"` 之前",
+   bool(_pool_line) and bool(_argv_line_idx)
+   and _SH.splitlines().index(_pool_line[0]) < _argv_line_idx[0],
+   f"pool_line={_pool_line!r} argv_idx={_argv_line_idx!r}")
+
 # ==========================================================================
 print("\n=== ④ 宿主入口那份**没被改**（生产在跑，不该动）===")
 # ==========================================================================

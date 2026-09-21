@@ -4,7 +4,7 @@
     "test_check_indexers.py": 45,
     "test_deploy_gate.py": 9,
     "test_drift_junk.py": 12,
-    "test_drive_loop_service.py": 99,
+    "test_drive_loop_service.py": 102,
     "test_farm_root.py": 18,
     "test_first_explore_budget.py": 19,
     "test_hardlink_link_type.py": 17,
@@ -74,11 +74,9 @@
     "test_sync_empty_sets.py": "`sync_movie` 整行覆盖写 + 四个空集的后果：**SEEDING 塌成 PENDING 是降级不是删行**（连 `searched_indexers` 都被抹掉），而 `indexer_seen` 是**合并**保留的 → `next_retry_at` 被推到未来一整个周期 = **额度悄悄烧掉一轮**；端到端钉「一条计数器 / 两条静默通道」——searchee 落到**别的包**（`other_pack`）与**认不出的名字**（`unresolved`）后果一模一样，**只有后者会喊**"
   },
   "scripts": 35,
-  "total": 1284,
-  "failures": 1,
-  "failed_files": [
-    "test_readme_counts.py"
-  ],
+  "total": 1287,
+  "failures": 0,
+  "failed_files": [],
   "measured_at": "2026-09-21",
   "command": "python tests/gen-counts.py"
 }
