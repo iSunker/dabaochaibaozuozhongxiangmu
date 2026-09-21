@@ -33,21 +33,35 @@ SUMMARY §20.9.5 的退出条件里，有一格日志**分不开**：
 ----
 * **绝不打印 URL**（URL 里带 apikey）。只打 host:port、状态码、条数、标题。
 * **只读**：读 NAS `.env` 一次，发一次查询，不写任何东西。
+* `--dump-attrs` / `--raw` 的输出**过一遍 `redact()`** —— ★ 因为 `--raw` 打的是
+  原始响应，里面有 `<link>` / `<guid>`，**很多站把 passkey 直接编进下载 URL**
+  （`…/download.php?id=…&passkey=<32位>`）。★ 只打**前 4000 字符**，
+  且按「值的形状」抹掉凭据（同 `scan-secrets.py` / `04_probes.py` 的出口口径）。
 * 站点退避期间会拿到 **429** —— 那时读数无意义（Prowlarr 本地就拒了），**别下任何结论**。
   退避到什么时候，看 NAS 的 `drive-loop/scripts/drive-loop.log` 里
   「索引器 <站> 要等到 …」那行。
 
 用法
 ----
-    python scripts/torznab-probe.py "<原样 q>" [season] [--id N] [--env PATH]
+    python scripts/diag/torznab-probe.py "<原样 q>" [season] [--id N] [--env PATH]
+    python scripts/diag/torznab-probe.py "<剧名>" 1 --dump-attrs      # ★ 季界侦察
+    python scripts/diag/torznab-probe.py "<剧名>" 1 --raw             # ★ 原始响应头 4000 字符
 
     --id   TORZNAB_URLS 里 path 段的编号：1=HDtime 2=HDFans 3=BTSCHOOL 4=NanyangPT
            （默认 1）
     --env  生产 .env 的路径（默认走 NAS 的 UNC；给本地路径便于离线核对）
+    --dump-attrs
+           ★★ 逐条把 **item 的全文**摆出来（title 之后的 link/guid/pubDate/enclosure/
+           `torznab:attr` 全列）—— 用来回答「**响应里有没有可解析的季字段**」。
+           为什么必须有这个开关：本脚本原先**只抠 `<title>`** ⇒ 后面那些元素**整段被丢掉**，
+           于是「响应里没有季字段」这句话**当时压根没有判据**（拿不到 ≠ 没有，`B.10`）。
+    --raw  ★ 原始响应体的**前 4000 字符**（脱敏后）。`--dump-attrs` 只给已知元素，
+           这个给「有没有别的写法」（如 `torznab:attr` 之外的自定义命名空间）。
 """
 from __future__ import annotations
 
 import os
+import re
 import sys
 import urllib.error
 import urllib.parse
@@ -61,6 +75,59 @@ for _s in (sys.stdout, sys.stderr):
 
 NAS_ENV = "//iSunker-DS423/docker_ssd/prowlarr_cross-seed_autohardlink/.env"
 NAS_IP = "192.168.0.7"
+
+# ---- 脱敏（出口口径，与 scan-secrets.py / 04_probes.py 同一形状）----
+# ★ 为什么 `--raw` 必须过它：原始响应里的 `<link>` / `<guid>` 常把 passkey 编进去。
+# ★ 两条都要，缺一条就是漏洞：① 按**值的形状**抹（不只按键名）；
+#   ② 已知的凭据参数名再抹一道（形状层对短值不生效）。
+REDACT_SHAPE = re.compile(r"\b[0-9a-fA-F]{20,}\b")
+REDACT_NAME = re.compile(
+    r"(?i)((?:api_?key|passkey|torrent_pass|authkey|token|cookie|password)"
+    r"[\s\"']*(?:[=:]|%3D)[\s\"']*)([^\s\"'&<>,;]+)")
+
+
+def redact(text):
+    """★ 出口统一脱敏 —— 打印与落盘都只走这一个函数。"""
+    s = REDACT_NAME.sub(r"\1<redacted>", str(text))
+    s = REDACT_SHAPE.sub("<hex20+>", s)
+    return s
+
+
+def items_of(body):
+    """把响应体切成 item 块（**原始片段**，不是只有 title）。
+
+    ★★ 这是一次真缺口修补：原来那版把每个 item 切到 `</title>` 就丢，
+      于是 item 后面的 `link` / `guid` / `enclosure` / `torznab:attr` **全都看不见**
+      ⇒ 「响应里有没有季字段」当时**没有判据**。
+    ★ 用 `</item>` 收尾，且**不假设** item 里有 title（有的站 title 为空）。
+    """
+    out = []
+    for chunk in body.split("<item>")[1:]:
+        out.append(chunk.split("</item>", 1)[0])
+    return out
+
+
+def title_of(item_raw):
+    """从原始 item 片段里抠 title（抠不到就返回空串，不编）。"""
+    if "<title>" not in item_raw:
+        return ""
+    return item_raw.split("<title>", 1)[1].split("</title>", 1)[0].strip()
+
+
+def attrs_of(item_raw):
+    """★ 把 item 里**所有** `torznab:attr` 的 (name, value) 列出来。
+
+    ★★ 这是 A 的核心判据：**判「没有」之前，先把整个 item 的 attr 列全看一眼** ——
+      因为「站点不给」与「给了但名字不叫 season」（如 `rageid` / `tvdbid`）
+      在只搜 `name="season"` 时**读数一模一样**（`B.10`：未验 ≠ 无）。
+    """
+    out = []
+    for m in re.finditer(r"<torznab:attr\s+([^/>]*)/?>", item_raw):
+        seg = m.group(1)
+        n = re.search(r'name\s*=\s*"([^"]*)"', seg)
+        v = re.search(r'value\s*=\s*"([^"]*)"', seg)
+        out.append(((n.group(1) if n else "?"), (v.group(1) if v else "")))
+    return out
 
 
 def torznab_url(env_path: str, idx: str) -> str:
@@ -86,6 +153,7 @@ def to_host_entry(url: str, ip: str):
 
 def main(argv):
     env_path, idx, rest = NAS_ENV, "1", []
+    dump_attrs = raw = False
     i = 0
     while i < len(argv):
         a = argv[i]
@@ -93,6 +161,10 @@ def main(argv):
             idx = argv[i + 1]; i += 2; continue
         if a == "--env" and i + 1 < len(argv):
             env_path = argv[i + 1]; i += 2; continue
+        if a == "--dump-attrs":
+            dump_attrs = True; i += 1; continue
+        if a == "--raw":
+            raw = True; i += 1; continue
         rest.append(a); i += 1
 
     if not rest:
@@ -124,16 +196,59 @@ def main(argv):
         return 1
 
     print("HTTP %s" % status)
-    titles = []
-    for chunk in body.split("<item>")[1:]:
-        seg = chunk.split("</title>", 1)[0]
-        titles.append(seg.split("<title>", 1)[-1].strip())
+    items = items_of(body)
+    titles = [title_of(it) for it in items]
 
     print("条数 = %d" % len(titles))
     for n, t in enumerate(titles[:25], 1):
         print("  %2d. %s" % (n, t[:120]))
     if len(titles) > 25:
         print("  … 其余 %d 条略" % (len(titles) - 25))
+
+    if dump_attrs:
+        print()
+        print("=" * 72)
+        print("★★ item 全文（★ 出口已过 redact()）—— 用来判「响应里有没有季字段」")
+        print("=" * 72)
+        if not items:
+            print("★ 没有 item ⇒ 没有 attr 可看。（条数 0 的两种可能见下。）")
+        want = ("season", "episode", "tvdbid", "rageid", "imdb", "tvtitle",
+                "covers", "category", "size", "seeders", "grabs", "downloadvolumefactor")
+        seen = set()
+        for n, it in enumerate(items[:10], 1):
+            print()
+            print("-- item %d --" % n)
+            # ★ 该 item 里出现过的**所有**元素名 —— 这样「有没有别的写法」一并答掉
+            names = re.findall(r"<([A-Za-z_][\w:]*)[\s>/]", it)
+            print("   元素名（去重，按首现序）：%s" % ", ".join(
+                dict.fromkeys(names)))
+            at = attrs_of(it)
+            if not at:
+                print("   ★ torznab:attr：**一个都没有**")
+            else:
+                print("   torznab:attr %d 条：" % len(at))
+                for k, v in at:
+                    seen.add(k)
+                    mark = "  ★★" if k.lower() in want else "    "
+                    print("%s %-22s = %s" % (mark, k, redact(v)[:100]))
+        if items:
+            print()
+            print("★ 本轮 attr 里出现过的名字（去重）：%s" % (
+                ", ".join(sorted(seen)) or "（无）"))
+            print("★★ 判读（三条，缺一不可）：")
+            print("   ① 上面**有没有** `season` / `episode` 这类字段？")
+            print("   ② 若**没有** —— ★ 别急着写「不给」：先看元素名那一行，")
+            print("      确认不是换了个名字（`rageid`/`tvdbid` 也算**季界可用的锚**）。")
+            print("   ③ 真正的『season 在服务端生效』的判据是**两次对照**：")
+            print("      同一剧 `season=1` 与 `season=2` 各跑一次，★ **比返回集**。")
+            print("      返回集不同 ⇒ 服务端认了 season（哪怕响应体里没有季字段）。")
+
+    if raw:
+        print()
+        print("=" * 72)
+        print("★★ 原始响应前 4000 字符（★ 已过 redact()；URL/凭据一律不回显）")
+        print("=" * 72)
+        print(redact(body[:4000]))
 
     if not titles:
         print("★ 条数 0 有两种可能，本读数**分不开**：")

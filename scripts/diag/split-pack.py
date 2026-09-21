@@ -24,8 +24,9 @@
   ★ 档 2（`--by-dir`）：目录里本来就有季层（`S01/`、`Season 2/`、`第1季/`）⇒ 用**季层名**。
       ★ 它的季号来自目录名，**不是从文件名推的**。
 
-  ★ 档 3（`--season-hint`）：★★ **平铺流水号（`E01..E24`、无任何季痕迹）** ——
-      ★★★ **本脚本拒绝猜**（见下）。
+  ★ 档 3：★★ **平铺流水号（`E01..E24`、无任何季痕迹）** ——
+      ★★★ **本脚本拒绝猜**（见下）。★ **没有对应的开关**：档 3 不是一个"用某个参数
+      就能拆"的模式，而是**本脚本明确不做**的那一档（做了就是在编）。
 
 ★★ **档 3 为什么拒绝猜**：`E01..E24` 里「前 12 集是 S01」这个信息
   **不在文件名里、也不在目录结构里**。用「文件大小聚类 / 时长聚类 / 平均分」去蒙，
@@ -34,9 +35,14 @@
   ⇒ 档 3 的正路是**外部季界**（后续实现，见下），不是启发式：
      ① **Prowlarr / Torznab**（★ 优先 —— 用已有的 Prowlarr，不引入新凭据）：
         Torznab 的 `tvsearch` 支持 `season=` 参数，且返回的 item 可能带季信息。
-        ★ 但「返回里到底有没有可解析的季字段」**尚未实测** ⇒ 本脚本**不假装它有**。
+        ★ 2026-09-21 已给它备好**只读入口**（`items_of` / `attrs_of` /
+        `season_from_attrs` —— 它们只**取值**，不推断季界）。
+        ★★ 但「返回里到底有没有可解析的季字段」**仍是未验**（`26.38-A`）
+        ⇒ 本脚本**不假装它有**，也**不**因为多了这几个函数就松口。
      ② **TMDB / 豆瓣**（★ 外部凭据 + 联网 ⇒ 用户 2026-09-21 拍：**接口先留、实现后补**）。
   ⇒ 本脚本对档 3 的当前行为：**明确报「判不出」，并打印 ①/② 两条后续路线**，**不产出方案**。
+  ★★ 纪律：**任何**"按 hint/聚类/平均分"的开关都不在本脚本里 —— 那等于把"在编"
+     包装成一个可选参数（本仓最贵的教训之一）。
 
 用法：
     python scripts/diag/split-pack.py "<源包目录>"              # 默认：按文件名 SxxExx
@@ -113,6 +119,57 @@ def season_of_dir(name):
     for g in m.groups():
         if g is not None:
             return int(g)
+    return None
+
+
+def items_of(body):
+    """把 Torznab 响应体切成 item 块（**原始片段**，不是只有 title）。
+
+    ★★ 为什么 split-pack 需要这个（2026-09-21，`26.38-A`）：
+      档 3（平铺流水号、无季痕迹）的**正路**是外部季界，优先走已有的 Prowlarr/Torznab。
+      但要先把「**响应里的季字段**」拿到手才谈得上用 —— 而 Torznab 的响应是 RSS：
+      **季信息只可能长在 item 里**（`torznab:attr`），item 之外什么都没有。
+    ★ 用 `</item>` 收尾，且**不假设** item 里有 title（有的站 title 为空）。
+    ★★ 本函数与 `torznab-probe.py` 的同名函数**同一口径，刻意重复** —— 两条理由：
+      ① 两个脚本装在不同地方、各自要能独立跑（deploy 白名单不同）；
+      ② 真正的**判据**是 A 的结论，不是这段切串代码；把 A 的实现藏进探针会让
+         「档 3 的正路」依赖一个诊断工具。
+    ★ 顺便留一条**不许猜**的纪律：本函数只做切分与取值，**不推断**季界。
+    """
+    return [c.split("</item>", 1)[0] for c in body.split("<item>")[1:]]
+
+
+def attrs_of(item_raw):
+    """★ 把 item 里**所有** `torznab:attr` 的 (name, value) 列出来。
+
+    ★★ 判「没有季字段」之前，必须先把整个 item 的 attr **列全** ——
+      因为「站点不给」与「给了但名字不叫 season」（如 `rageid` / `tvdbid`）
+      在只搜 `name="season"` 时**读数一模一样**（`B.10`：未验 ≠ 无）。
+    ★★ 本函数**只读不判**：它把 attr 摆出来，判季界的责任在上面 ——
+      档 3 当前**拒绝猜**，这个函数**不改变**那条纪律。
+    """
+    out = []
+    for m in re.finditer(r"<torznab:attr\s+([^/>]*)/?>", item_raw):
+        seg = m.group(1)
+        n = re.search(r'name\s*=\s*"([^"]*)"', seg)
+        v = re.search(r'value\s*=\s*"([^"]*)"', seg)
+        out.append(((n.group(1) if n else "?"), (v.group(1) if v else "")))
+    return out
+
+
+def season_from_attrs(item_raw):
+    """★ 从 item 的 attr 里取季号 —— 取不到就返回 None（**不猜**）。
+
+    ★ 认两种来源：① 直给的 `season`；② ★ `rageid`/`tvdbid` 这类**锚**不算季号 ——
+      它们是"去别处查"的入口，不是季界本身 ⇒ ★ 本函数**只认 `season`**，
+      把「有锚但没季号」如实留给上层（那需要联网，不是这里的事）。
+    """
+    for k, v in attrs_of(item_raw):
+        if k.strip().lower() == "season":
+            try:
+                return int(v.strip())
+            except ValueError:
+                return None
     return None
 
 

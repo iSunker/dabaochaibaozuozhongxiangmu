@@ -201,6 +201,16 @@ LOCAL_ONLY = [
     #     ② 开库走 `PRAGMA query_only=1`、目录只 `iterdir()`，**零写操作**；
     #     ③ 只打**目录名与计数**，不打文件内容。
     (r"^scripts/diag/find-packs\.py$",                 "新大包发现（在 Windows 上跑；扫 NAS 目录 + 只读 state.db 对照，只报计数、零写操作、绝不自动加包）"),
+    # ★ 2026-09-21：大包按季拆分（只读）。与上面 `find-packs.py` 是**同一形状**，
+    #   但比它更窄一档 —— 它**一个凭据都不碰、一次网络都不发**（无 sqlite / 无 urlopen）。
+    #   性质（逐条实测，不是声明）：只 `os.walk` + `os.path`；**零 `open()`**；
+    #   不 import subprocess/shutil；无 os.link/mkdir/remove/rename/system。
+    #   ★ 它**不建农场条目、不移动源**，只把硬链接命令**拟好给人看** ——
+    #     理由两条：`A.10`（AI 不写 NAS）、`A.16`（源是硬链接目标，动它可能写穿）。
+    #   ★ `tests/test_split_pack.py` ⑤ 用**绊线**（把危险函数换成会抛的桩、再真跑一遍）
+    #     钉这条只读纪律 —— 因为 AST 黑名单**证不完**（`__import__("os").makedirs`
+    #     就绕过去了，实测断言仍绿，`ERR-AI-05` 形状）。
+    (r"^scripts/diag/split-pack\.py$",                 "大包按季拆分（在 Windows 上跑；只读：零 open/os.walk only、不碰凭据、不联网、只报方案不建条目）"),
     # ★ 2026-09-13：链接守护的诊断端。与上面 qb-census 那条是**同一形状**
     #   （只读 + 不回显凭据 + 只打聚合），判据也一样。它比那条更严一点：
     #   默**只出 hash 前 12 位**，发布名要 `--show-names` 才出（名字里有站点与

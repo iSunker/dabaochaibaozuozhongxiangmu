@@ -270,6 +270,43 @@ ck("★ 不 import subprocess / shutil", not (imported & BAD_MODULES),
 ck("★ 不用 os.system（文本层再钉一道）", "os.system" not in src, "出现了 os.system")
 
 # ==========================================================================
+print("\n⑤b 档 3 的**外部季界入口**（`26.38-A`）：Torznab attr 只读不判")
+# --------------------------------------------------------------------------
+# ★★ 为什么钉这三个函数：档 3 的正路是**外部季界**（Torznab 优先），
+#    所以「从响应里取季号」这条路**至少要有入口**。★ 但纪律不能因此松：
+#    **取不到季号就必须还是判不出（rc=3）**，不许因为"多了个函数"就偷偷开始猜。
+# ★ 凭据形状的值拼出来，不在源码里留字面量（推前扫描会扫到这个文件）。
+_RSS = (
+    '<rss><item><title>A.S02.1080p</title>'
+    '<torznab:attr name="season" value="2"/>'
+    '<torznab:attr name="rageid" value="99"/>'
+    "</item><item><title>B.S01.1080p</title></item></rss>"
+)
+_its = sp.items_of(_RSS)
+ck("items_of：切出 2 个 item", len(_its) == 2, f"得到 {len(_its)}")
+ck("★ item 整块留下（attr 还在，没被截掉）",
+   "<torznab:attr" in _its[0], "item 被截断了 ⇒ 取不到季号")
+ck("attrs_of 列出**所有** attr（含 rageid）",
+   sp.attrs_of(_its[0]) == [("season", "2"), ("rageid", "99")],
+   f"{sp.attrs_of(_its[0])}")
+ck("★ season_from_attrs 取到 2", sp.season_from_attrs(_its[0]) == 2,
+   f"{sp.season_from_attrs(_its[0])}")
+ck("★ 没有 season 的 item ⇒ None（**不编**）",
+   sp.season_from_attrs(_its[1]) is None, f"{sp.season_from_attrs(_its[1])}")
+ck("★★ `rageid` 那类**锚**不算季号（它只是『去别处查』的入口）",
+   sp.season_from_attrs('<torznab:attr name="rageid" value="99"/>') is None,
+   "把 rageid 当成季号了 —— 那是编")
+ck("season 值不是数字 ⇒ None（不抛、不编）",
+   sp.season_from_attrs('<torznab:attr name="season" value="S02"/>') is None,
+   "非数字值没被挡住")
+# ★★ 反向（最关键的一格）：**这几个函数存在**不许让档 3 松口 ——
+#    判据仍然是"真跑一遍、真退出码 3"（下面 ⑥ 那条；这里钉住它有 attr 入口也没用）。
+ck("★★ 有 attr 入口**也不改**档 3 的纪律（`--season-hint` 不在本脚本里）",
+   "season_from_attrs" in SCRIPT.read_text(encoding="utf-8")
+   and "--season-hint" not in SCRIPT.read_text(encoding="utf-8"),
+   "本脚本给档 3 加了个『按 hint 拆』的开关 ⇒ 那就是开始猜了")
+
+# ==========================================================================
 print("\n⑥ 档 3 的行为：拒绝猜 + 退出码 3（跑真进程，判真退出码）")
 # --------------------------------------------------------------------------
 import subprocess as _sp  # noqa: E402  ★ 本文件自己允许用它（被钉的是被测脚本）
