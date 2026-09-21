@@ -1950,6 +1950,22 @@ def pack_progress_watch(st) -> tuple[str, dict]:
                      f"  ← 各包之和，非平均值")
     else:
         lines.append("总计：n/a  ← 各包分母皆为 0")
+
+    # ★★ 两个池（`e404b1ca#6` ②，用户 2026-09-20 拍）：**欠账 vs 常态**分开报。
+    #   ★ 为什么要分开：13 行上方那个「待搜」是个**合计数**，两种性质混在一起 ——
+    #     欠账（`SKIPPED`/`ERROR`/`PENDING`）是**有限**的、清一部少一部；
+    #     常态（`UNMATCHED`）是**稳态**、只要片子在就会一直在。
+    #     混着报会**同时误导两头**：以为欠了 565 部的债 / 以为清完就没事了。
+    #   ★ 口径：只数 `DEBT_STAGES` ∪ `STEADY_STAGES`（`DONE_STAGES` 不进任何池）。
+    #   ★ `n/a` 与 `0` 分开：库里一个包都没登记时**不写 0**（`ERR-AI-03`）。
+    pool_debt = sum(r["census"].get("pool_debt", 0) for r in rows)
+    pool_steady = sum(r["census"].get("pool_steady", 0) for r in rows)
+    lines.append(
+        f"待搜分池：欠账 {pool_debt}（SKIPPED/ERROR/PENDING，**有限**、要清零）"
+        f" / 常态 {pool_steady}（UNMATCHED，**稳态**、按周期走）  ← 各包之和")
+    m["pool_debt"] = pool_debt
+    m["pool_steady"] = pool_steady
+
     # ★ 那句「可能回落」：说的是**机理**不是判定（它不说"这没事"，它说**什么在动**），
     #   只预先堵**一个**误读，且是括号里的一句 —— 不会被读成一条状态行。
     lines.append("（② 口径分母 = 做种+待搜+跳过+错误+已匹配，**不含未匹配** ⇒ 新站接入或\n"

@@ -2522,6 +2522,47 @@ def pack_seeding_total(store: StateStore, pack: str) -> tuple[int, int]:
 #:   百分比，而那个误差**没有任何东西会报出来**。
 CENSUS_DENOM_STAGES = tuple(s for s in ALL_STAGES if s != STAGE_UNMATCHED)
 
+#: ★★ 两个池（`e404b1ca#6` ②，用户 2026-09-20 拍：**欠账优先、剩余名额给常态**）。
+#:
+#: **为什么分池**：这两类"待搜"的**性质不同**，混在一起读不出东西：
+#:
+#:   · **欠账池**（`SKIPPED` / `ERROR` / `PENDING`）—— 「**还没搜过**」的欠账。
+#:     `SKIPPED` = 上次被站点退避秒跳（`attempts` **不涨**，因为请求根本没发出去）、
+#:     `PENDING` = 从没搜过。★ 实测 frds 232 部 `SKIPPED` **全部 `attempts=0`**。
+#:     ⇒ 它们是**纯欠账**：清一部少一部，**必须在有限轮内清零**。
+#:   · **常态池**（`UNMATCHED`）—— 「**搜过、没命中**」。这是**稳态**，
+#:     只要片子还在、站上还没出单种，它就会一直在 ⇒ **永远清不完**，
+#:     清不完不是故障。它的正常节奏是**按周期重搜**，不是"赶紧消灭"。
+#:
+#: ★ 混在一个数里会**同时误导两头**：报"565 部待搜"让人以为欠了 565 部的债
+#:   （其实稳态 272 部本来就会一直在）；只报欠账又会让人以为"没事了"，
+#:   而稳态池其实一直在按周期消耗额度。
+#:
+#: ★ 取件策略（用户拍）：**欠账池优先，欠账池不足一批时才用常态池补满** ——
+#:   即 `TODO_PRIORITY` 那条全局排序**本来就实现的东西**。分池**不改取件顺序**，
+#:   只是把它**变得可读**（日报能分开报两个数），所以**没有第二位排序键**。
+#:   ★ 为什么不给常态池保底名额（比如 20%）：那会让欠账清完从 5 批变 6 批，
+#:     而欠账是**有限**的（232 部 ≈ 5 批就清零），熬过去就没了；
+#:     保底则**永远**在常态池上花掉 20% 额度 —— 用**无限的**代价换**5 批**的平滑，
+#:     不值。★ 这个取舍要写在这里，否则下次有人会"顺手"加个保底。
+DEBT_STAGES = frozenset({STAGE_SKIPPED, STAGE_ERROR, STAGE_PENDING})
+STEADY_STAGES = frozenset({STAGE_UNMATCHED})
+
+
+def pool_of(stage: str) -> str:
+    """某个 stage 属于哪个池 —— `"debt"` / `"steady"` / `"done"`。
+
+    ★ `DONE_STAGES` 的片子**既不在欠账也不在常态**（它们不该被搜）⇒ 单独一档，
+      **不并进任何池**：把它们算进"待搜"就是 `§26.33` 那个缺陷的形状
+      （把"正在做种的"当成"待搜"）。
+    """
+    if stage in DEBT_STAGES:
+        return "debt"
+    if stage in STEADY_STAGES:
+        return "steady"
+    return "done"
+
+
 
 def pack_stage_census(store: StateStore, pack: str) -> dict[str, int]:
     """每包的逐阶段普查 + ② 口径的 `numerator` / `denom`。
@@ -2543,10 +2584,26 @@ def pack_stage_census(store: StateStore, pack: str) -> dict[str, int]:
       与「除零产生的 0%」含义**完全不同**，**别把两者合并**。
     """
     d = store.summary(pack)
+    # ★★ 两个池（`e404b1ca#6` ②，见 `DEBT_STAGES` 那段注释）：`SKIPPED`/`ERROR`/`PENDING`
+    #   是**欠账**（有限、要清零），`UNMATCHED` 是**常态**（无限、按周期走）。
+    #   ★ 只数**不该被搜的**（`DONE_STAGES`）**不进任何池** —— 把"正在做种的"
+    #     算成"待搜"正是 `§26.33` 那个 30 倍偏差的形状。
+    # ★ 用 `pool_of` **分档**、而不是在这里再写一遍 `DEBT_STAGES`/`STEADY_STAGES` ——
+    #   `DEBT_STAGES` 与 `STEADY_STAGES` 是**两处**可能漂开的集合，`pool_of` 是
+    #   它们**唯一**的判据（`A.11`：同一事实只在一处）。这里若各写一份，改一处
+    #   忘一处 ⇒ 计数与分档打架，而**没有任何东西会报出来**。
+    _pool = {s: pool_of(s) for s in ALL_STAGES}
+    debt = sum(d[s] for s in ALL_STAGES if _pool[s] == "debt")
+    steady = sum(d[s] for s in ALL_STAGES if _pool[s] == "steady")
     return {
         **d,
         "denom": sum(d[s] for s in CENSUS_DENOM_STAGES),
         "numerator": d[STAGE_SEEDING],
+        # ★ 键名带 `pool_` 前缀：`summary()` 里已有阶段名做键，直接叫 `debt`/`steady`
+        #   会和将来可能的阶段名撞车，而**撞车是静默的**（`{**d, ...}` 后面覆盖前面）。
+        "pool_debt": debt,
+        "pool_steady": steady,
+        "pool_total": debt + steady,
     }
 
 
