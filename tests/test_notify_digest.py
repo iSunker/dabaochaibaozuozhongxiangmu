@@ -353,6 +353,60 @@ finally:
     lab.cleanup()
 
 # =====================================================================
+print("\n── ⑥b 试点期建议（`e404b1ca#8`）—— 只建议、只在该出声时出声 ──")
+# ★ 判据本体在 `orchestrator/state.py::pilot_verdict`（有独立的 30 条断言）；
+#   这里钉的是**渲染层**：那四档在邮件里到底长什么样。
+#   ★ `n` 的出处：mbf 实测 8 批 / ok=32 / Found 0 torrents
+#     （`summary/26` §20.9）—— 所以"8 批"是那条建议的**门槛**。
+lab = Lab()
+try:
+    rows = ""
+    # mbf 实测形状：8 批、ok=32（请求真发出去了）、0 产出 ⇒ **该建议移出**
+    for _ in range(8):
+        rows += batch("mbf", ok=4, failed=0, newly_seeding=0,
+                      still_skipped=0, backoff_hits=0)
+    # 试了 2 批的包 ⇒ **还早**，一个字都不该说
+    for _ in range(2):
+        rows += batch("newpack", ok=3, failed=0, newly_seeding=0,
+                      still_skipped=0, backoff_hits=0)
+    # 8 批但 ok=0 ⇒ **观测失败**，是另一档（★ 最容易混同、后果最重）
+    for _ in range(8):
+        rows += batch("failpack", ok=0, failed=0, newly_seeding=0,
+                      still_skipped=0, backoff_hits=0)
+    # 8 批且有产出 ⇒ 不该提示
+    for _ in range(8):
+        rows += batch("goodpack", ok=5, failed=0, newly_seeding=2,
+                      still_skipped=0, backoff_hits=0)
+    lab.tsv("2026-09-21", rows)
+    r = lab.run()
+    out = r.stdout
+
+    # ① 有产出的包**不提示**
+    check("★ goodpack（有产出）不出现试点提示",
+          "goodpack 试了" not in out, out)
+    # ② 样本不够的包**不提示**
+    check("★ newpack（只 2 批）不出现试点提示 —— 别在样本不够时下结论",
+          "newpack 试了" not in out, out)
+    # ③ mbf 形状 ⇒ 建议移出，且**写明不自动改**
+    check("★ mbf 形状（8 批 / ok=32 / 0 产出）⇒ 建议移出名单",
+          "mbf 试了 8 批 / 发出 32 次搜索" in out and "新增做种 0" in out, out)
+    check("★★ 且**明写「不自动改」**（那是产品决定，要人拍）",
+          "不自动改" in out and "产品决定" in out, out)
+    # ④ ok=0 ⇒ 必须是**观测失败**那一档，不是"没产出"
+    check("★★ failpack（8 批但 ok=0）⇒ 报「观测失败」而不是「没产出」",
+          "一次请求都没发出去" in out, out)
+    check("★★ 且明写「**不是**「跑了没产出」」（混同会让人误删好包）",
+          "不是**「跑了没产出」" in out or "不是" in out and "跑了没产出" in out, out)
+    check("★ 观测失败那档**不许**出现「建议考虑把它移出」",
+          not any("建议考虑把它移出" in ln and "failpack" in ln
+                  for ln in out.splitlines()), out)
+    # ⑤ 两档**不许**同时命中同一个包
+    check("★ failpack 只命中一档（没被同时报成 no-yield）",
+          "failpack 试了 8 批 / 发出" not in out, out)
+finally:
+    lab.cleanup()
+
+# =====================================================================
 print("\n── ⑦ --dry-run 不发信（本文件全程靠这一条才敢离线跑）──")
 lab = Lab()
 try:
