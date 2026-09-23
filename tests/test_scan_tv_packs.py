@@ -1,0 +1,226 @@
+# -*- coding: utf-8 -*-
+"""`scan-tv-packs` 的分类判据 —— 钉住「该下钻到哪」+「拿不准要说出来」。
+
+## 为什么这个文件必须存在（`ERR-AI-09`）
+
+本脚本的产物是**建议**，而它的**失败方式**正是本项目最忌的那种：
+**判浅了 ⇒ cross-seed 拿"分类目录名"去搜 ⇒ 搜不到却烧额度**（`§10.2` 那句）；
+**判深了 ⇒ 一个包被拆成互不相干的碎片**；**判不出来却硬猜 ⇒ 静默漏**。
+
+⇒ 三条判据各配一个夹具，**并逐条种变异证明会红**（写在每个 `== N ==` 段的
+  结尾注释里）。★ 变异测试的意义在这里尤其大 —— 第一版就有一个**死代码**：
+  `同名多版本` 检测被写在下钻分支里，而 `Avatar` 那些条目**直接挂片子、
+  走"情形 A"早早 return** ⇒ **检测从未执行**，在真 `TV/` 上跑一遍才发现
+  （9 个条目里该出 6 个，出了 0 个）。**只跑夹具会漏掉这个**，所以本文件的
+  夹具**刻意照真数据的形状搭**（`siblings` 一起传）。
+
+## 本文件钉什么
+
+1. **`Complete` 包 / 单季包 → depth 1** —— 片**直接挂**在包根下（实测三种形状）。
+   ⇒ ★ 变异：把 `has_direct_video` 判据改成"必须有子目录" ⇒ 必红。
+2. **`分类层 → 发布名` → depth 2** —— 子目录里多数像发布名。
+   ⇒ ★ 变异：把 `frac >= 0.8` 改成 `frac >= 0.0` ⇒ `拿不准` 那条必红。
+3. **★★★ 混着分类目录 + 包 ⇒ 拿不准，绝不猜** —— 这是 `§19.1` 的落点。
+   真 `TV/` 下实测混着 `儿童` / `欧美剧` 两个**分类目录**（且是空的）。
+   ⇒ ★ 变异：把"拿不准"分支改成"返回 depth 1" ⇒ 必红。
+4. **★ `同名多版本` 必须在「直接挂片子」那条路上也生效**（第一版的死代码）。
+   ⇒ ★ 变异：把同级检测挪回下钻分支 ⇒ 必红（**这正是当初的真缺陷**）。
+5. **★ 「同名多版本」不算"需要人看"** —— 它占真数据 69/200，
+   算进异常会把 7 个**真**异常淹没（「永远红的闸门 = 没人看的闸门」）。
+   ⇒ ★ 变异：把 `_NEEDS_HUMAN_FLAGS` 里加回 `同名多版本` ⇒ 必红。
+6. **★ 空目录要被报出来**（真数据 7 个；其中一个名字说该有片子）。
+   ⇒ ★ 变异：`subdirs` 空时直接返回 depth 1 ⇒ 必红。
+7. **`中文标签层` 在"名字仍像发布名"时**不该算异常（`[红楼梦]…S01…` 是正常形状）。
+   ⇒ ★ 变异：无条件把它留在 `flags` ⇒ 必红。
+
+★ 行形用既有的 `  ok  ` / ` FAIL `（`tests/README.md` 那个重数器只认三种行形）。
+★ 全部离线：夹具是 `tempfile` 里现造的空目录树，**不碰 NAS、不需要真片子**
+  （判据只看"有没有视频后缀的文件"，空文件即可）。
+"""
+import importlib.util
+import pathlib
+import sys
+import tempfile
+
+REPO = pathlib.Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO))
+
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except Exception:  # noqa: BLE001
+    pass
+
+# ★ 文件名带连字符 ⇒ 只能走 spec_from_file_location（照抄 `test_notify_quota.py`）。
+_spec = importlib.util.spec_from_file_location(
+    "scan_tv_packs", str(REPO / "scripts" / "scan-tv-packs.py"))
+stp = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(stp)
+
+_ok = 0
+_n = 0
+
+
+def check(name, cond, detail=""):
+    global _ok, _n
+    _n += 1
+    _ok += 1 if cond else 0
+    print(("  ok  " if cond else " FAIL ") + "%s: %r" % (name, bool(cond)))
+    if not cond and detail:
+        print("        ← " + detail)
+
+
+def mk(root: pathlib.Path, *parts, files=(), dirs=()):
+    """在 `root` 下造一个目录树：`parts` 是路径段，`files`/`dirs` 是它下面的内容。
+
+    ★ 文件用**空文件 + 真后缀**即可 —— 判据(`has_direct_video`)只看后缀。
+    """
+    d = root.joinpath(*parts)
+    d.mkdir(parents=True, exist_ok=True)
+    for f in files:
+        (d / f).write_text("", encoding="utf-8")
+    for s in dirs:
+        (d / s).mkdir(parents=True, exist_ok=True)
+    return d
+
+
+# --------------------------------------------------------------------------- #
+print("== ① `Complete` 包 / 单季包：片子直接挂在包根 ⇒ depth 1 ==")
+# 实测形状（2026-09-24，真 TV/）：
+#   `[夺爱]…Complete…/` 里直挂 `…Ep01…mp4`；`Arcane…S02…/` 里直挂 `…S02E01…mkv`
+_t = pathlib.Path(tempfile.mkdtemp())
+mk(_t, "[夺爱].Duo.Ai.2011.Complete.WEB-DL.4K.HEVC.AAC-CMCTV",
+   files=["[夺爱].Duo.Ai.2011.Ep01.WEB-DL.4K.HEVC.AAC-CMCTV.mp4",
+          "[夺爱].Duo.Ai.2011.Ep02.WEB-DL.4K.HEVC.AAC-CMCTV.mp4"])
+mk(_t, "Arcane.League.of.Legends.S02.2160p.BluRay.x265.10bit-WiKi",
+   files=["Arcane.League.of.Legends.S02E01.2160p.BluRay-WiKi.mkv"])
+
+v1 = stp.classify("[夺爱].Duo.Ai.2011.Complete.WEB-DL.4K.HEVC.AAC-CMCTV",
+                  _t / "[夺爱].Duo.Ai.2011.Complete.WEB-DL.4K.HEVC.AAC-CMCTV")
+check("★ Complete 包 ⇒ depth 1", v1.ok and v1.picked == 1,
+      "got picked=%r flags=%r" % (v1.picked, v1.flags))
+check("★ Complete 包：不算异常", not stp._needs_human(v1),
+      "flags=%r —— 这是最常见的正常形状" % (v1.flags,))
+
+v2 = stp.classify("Arcane.League.of.Legends.S02.2160p.BluRay.x265.10bit-WiKi",
+                  _t / "Arcane.League.of.Legends.S02.2160p.BluRay.x265.10bit-WiKi")
+check("★ 普通单季 ⇒ depth 1", v2.ok and v2.picked == 1,
+      "got picked=%r" % (v2.picked,))
+# ★★ 变异：把 `classify` 里 `has_direct_video(path)` 那个判据改成
+#    `if kids:`（即"必须有子目录才算发布名层"）⇒ 上面两条必红
+#    （picked 会变成 None/拿不准 —— 而这是真数据里的主流形状，全 200 个都得错）。
+
+# --------------------------------------------------------------------------- #
+print("\n== ② `分类层 → 发布名`（DC 那种）⇒ depth 2 ==")
+_t2 = pathlib.Path(tempfile.mkdtemp())
+mk(_t2, "DC相关剧集全系列大合集", dirs=["Arrow.S01-S08.1080p-BluRay",
+                                        "The.Flash.S01.1080p-BluRay",
+                                        "Superman.2013.1080p-BluRay"])
+v3 = stp.classify("DC相关剧集全系列大合集", _t2 / "DC相关剧集全系列大合集")
+check("★ 子目录多数像发布名 ⇒ depth 2", v3.ok and v3.picked == 2,
+      "got picked=%r note=%r" % (v3.picked, v3.note))
+# ★★ 变异：把 `frac >= 0.8` 改成 `frac >= 0.0` ⇒ 下面 ③ 那条必红
+#    （3 个子目录、0 个像发布名，也会被当成"多数像发布名"）。
+
+# --------------------------------------------------------------------------- #
+print("\n== ③ ★★★ 分类目录混在其中 ⇒ **拿不准**，绝不猜（§19.1 的落点）==")
+# 真 TV/ 下实测：`儿童` / `欧美剧` 两个**分类目录**（且是空的）与 200 个包并列。
+# ⇒ 谁照报告把 TV/ 全注册，它们会被当成"一个包"，而名字是"欧美剧"——
+#   搜不到任何东西却照样烧额度（§10.2 那句话）。
+_t3 = pathlib.Path(tempfile.mkdtemp())
+mk(_t3, "欧美剧", dirs=["Some.Unknown.Thing", "Another.Unknown.Thing",
+                        "Third.Unknown"])
+v4 = stp.classify("欧美剧", _t3 / "欧美剧")
+check("★★★ 全都不像发布名 ⇒ picked=None（不猜）", v4.picked is None,
+      "got picked=%r —— 猜一个数就是 §19.1 说的『静默失败』" % (v4.picked,))
+check("★★★ 标记里必须有 `拿不准`", "拿不准" in v4.flags,
+      "flags=%r" % (v4.flags,))
+check("★★★ 拿不准 ⇒ 算「需要人看」", stp._needs_human(v4))
+# ★★ 变异：把 情形 C 的 `v.flags.append("拿不准"); return _with_extra(v)`
+#    改成 `v.picked = 1; return _with_extra(v)` ⇒ 上面两条必红。
+# ★ 同时这条也是 ② 的**反面哨兵**：② 说"多数像 ⇒ 下钻"，
+#   ③ 说"一个都不像 ⇒ 不猜"，两条一起才说明 `frac` 阈值**真的在起作用**。
+
+# --------------------------------------------------------------------------- #
+print("\n== ④ ★★ `同名多版本` 在「直接挂片子」那条路上也必须生效 ==")
+# ★ 这是**第一版的真缺陷**（死代码）：检测写在下钻分支里，而 Avatar 那些
+#   条目直接挂片子、走情形 A 早早 return ⇒ 检测从未执行。
+#   实测：真 TV/ + `--only Avatar` ⇒ 9 个条目该出 6 个 `同名多版本`，出了 **0** 个。
+_t4 = pathlib.Path(tempfile.mkdtemp())
+AV = ["Avatar.The.Last.Airbender.2024.S01.2160p.NF.WEB-DL.DV.H.265-DepWeb",
+      "Avatar.The.Last.Airbender.2024.S01.2160p.NF.WEB-DL.H.265-DepWeb",
+      "Avatar.The.Last.Airbender.2024.S02.2160p.NF.WEB-DL.DV.H.265-DepWeb"]
+for a in AV:
+    mk(_t4, a, files=[a + ".S01E01.mkv"])
+_sib = AV   # ★★ 同级列表**必须**一起传 —— 这正是第一版漏掉的那一步
+v5 = stp.classify(AV[0], _t4 / AV[0], siblings=_sib)
+check("★★ 直接挂片子 + 有同剧兄弟 ⇒ 标 `同名多版本`",
+      "同名多版本" in v5.flags,
+      "flags=%r —— 第一版这里恒为空（死代码）；变异：把检测挪回下钻分支 ⇒ 必红"
+      % (v5.flags,))
+check("★★ 深度仍是 1（多版本与深度无关）", v5.picked == 1,
+      "got %r —— 多版本是**同级比较**，不该影响下钻层数" % (v5.picked,))
+check("★★ 旁证里说得出是哪些兄弟", "同级另有" in v5.note and "Avatar" in v5.note,
+      "note=%r" % (v5.note,))
+
+# 反向：**没有**兄弟时不许瞎标
+v6 = stp.classify(
+    "Arcane.League.of.Legends.S02.2160p.BluRay.x265.10bit-WiKi",
+    _t / "Arcane.League.of.Legends.S02.2160p.BluRay.x265.10bit-WiKi",
+    siblings=["另外一个完全不相干的包.S01.1080p-WiKi"])
+check("★ 没有同剧兄弟 ⇒ 不标（别瞎标）", "同名多版本" not in v6.flags,
+      "flags=%r" % (v6.flags,))
+
+# --------------------------------------------------------------------------- #
+print("\n== ⑤ ★ `同名多版本` 不算「需要人看」（否则真异常被淹没）==")
+# 真数据：200 个条目里 69 个是这类，而**真异常只有 11 个**。
+# 若把 69 算成异常 ⇒ 一眼看去"80 个要处理"，那 7 个空目录就找不着了。
+hello = stp.classify(AV[0], _t4 / AV[0], siblings=_sib)
+check("★★ 多版本条目**不**算 `_needs_human`", not stp._needs_human(hello),
+      "flags=%r —— 它是**提示**不是缺陷" % (hello.flags,))
+check("★★ `同名多版本` 不在 `_NEEDS_HUMAN_FLAGS` 里",
+      "同名多版本" not in stp._NEEDS_HUMAN_FLAGS,
+      "got %r —— 变异：加回去 ⇒ 上面那条必红；真数据下报告会从 11 行噪音涨到 80 行"
+      % (stp._NEEDS_HUMAN_FLAGS,))
+
+# --------------------------------------------------------------------------- #
+print("\n== ⑥ ★ 空目录必须报出来（真数据 7 个）==")
+_t5 = pathlib.Path(tempfile.mkdtemp())
+mk(_t5, "LOVELY_RUNNER_01-04")            # 真数据里那个空目录
+v7 = stp.classify("LOVELY_RUNNER_01-04", _t5 / "LOVELY_RUNNER_01-04")
+check("★ 空目录 ⇒ 不猜（picked=None）", v7.picked is None, "got %r" % (v7.picked,))
+check("★ 空目录标记 + 算需要人看",
+      "空目录" in v7.flags and stp._needs_human(v7),
+      "flags=%r" % (v7.flags,))
+# ★★ 变异：`if not kids:` 分支改成 `v.picked = 1; return _with_extra(v)`
+#    ⇒ 上面两条必红（空目录会被当成"depth 1 的包"静默注册进去）。
+
+# --------------------------------------------------------------------------- #
+print("\n== ⑦ ★ `中文标签层` 在名字仍像发布名时不算异常 ==")
+_t6 = pathlib.Path(tempfile.mkdtemp())
+mk(_t6, "[红楼梦].Dream.of.the.Red.Chamber.S01.1987.2160p.WEB-DL.H265-OurTV",
+   files=["[红楼梦].Dream.of.the.Red.Chamber.S01E01.1987.2160p.WEB-DL.H265-OurTV.mkv"])
+v8 = stp.classify("[红楼梦].Dream.of.the.Red.Chamber.S01.1987.2160p.WEB-DL.H265-OurTV",
+                  _t6 / "[红楼梦].Dream.of.the.Red.Chamber.S01.1987.2160p.WEB-DL.H265-OurTV")
+check("★ 中文标签 + 直挂片子 ⇒ depth 1", v8.picked == 1, "got %r" % (v8.picked,))
+check("★★ 名字仍像发布名 ⇒ **不**报异常（这是正常形状）",
+      not stp._needs_human(v8),
+      "flags=%r —— 真 TV/ 里十来个这种，全报的话又是噪音" % (v8.flags,))
+# ★★ 变异：把"移除 `中文标签层`"那三行删掉 ⇒ 上面那条必红。
+
+# ---- 附：`looks_like_release` 的分层判据（强弱信号）------------------------ #
+print("\n== ⑧ ★ `looks_like_release`：季集号是强信号，画质/组名单独不够 ==")
+check("★ 有季集号 ⇒ 像（强信号单独就够）",
+      stp.looks_like_release("Show.S02E01.1080p-GRP")[0])
+check("★ 只有画质+组名 ⇒ 也算（两条弱信号同时命中）",
+      stp.looks_like_release("Some.Movie.1080p.BluRay-WiKi")[0])
+check("★★ 只有年份+中文 ⇒ **不算**（弱信号只有一条；避免把分类层当发布名）",
+      not stp.looks_like_release("欧美剧")[0],
+      "got %r" % (stp.looks_like_release("欧美剧"),))
+check("★ 纯中文无名 ⇒ 不算", not stp.looks_like_release("儿童")[0])
+
+# --------------------------------------------------------------------------- #
+print()
+if _ok != _n:
+    print("!!! %d/%d 失败" % (_n - _ok, _n))
+    sys.exit(1)
+print("全部通过（%d 条）" % _n)
