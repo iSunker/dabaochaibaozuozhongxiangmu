@@ -25,6 +25,7 @@
 沙箱（含脚本副本）在 `tempfile.mkdtemp()` —— 副本旁边的 `notify.conf`
 必然是「不存在」，不会被本机残留的配置干扰。**不发信**：跑的是 `--dry-run`。
 """
+import datetime
 import os
 import pathlib
 import shutil
@@ -63,17 +64,26 @@ def row(ts, kind, title, metrics):
     return "%s\t%s\t%s\t%s\n" % (ts, kind, title, metrics)
 
 
-def batch(pack, **kv):
+def batch(pack, first_seeding=None, **kv):
     """一条「本批完成」流水。键序照生产：pack / ok / failed / newly_seeding /
-    still_skipped / backoff_hits。
+    first_seeding / still_skipped / backoff_hits。
 
     ★★ `pack=` 必须**显式拼**进去：本函数第一个形参就叫 `pack`，它被**位置参数**
        吃掉、不会出现在 `**kv` 里 —— 曾经写成 `kv[k] if k in kv` 连 `pack` 一起滤掉，
        于是生成的流水**一个 `pack=` 都没有**，被测脚本忠实地把每一行都判成
        「非本批」。当时红的是**测试自己**（tests/README.md：「测试自己也是判据，
        报红时先怀疑断言本身」）。
+
+    ★★ `first_seeding`（2026-09-23 新增）**默认不发这个键** ——
+       因为它是**真实存在的一种输入**：生产上 09-23 之前的 TSV 行**都没有**它。
+       默认不发 ⇒ 本文件的既有用例**顺便**覆盖了「缺键降级」那条路
+       （脚本必须只印净额、不许把缺键印成 0）。
+       要测新标签的用例**显式传** `first_seeding=N`。
     """
-    parts = ["pack=%s" % pack] + ["%s=%s" % (k, v) for k, v in kv.items()]
+    parts = ["pack=%s" % pack]
+    if first_seeding is not None:
+        parts.append("first_seeding=%s" % first_seeding)
+    parts += ["%s=%s" % (k, v) for k, v in kv.items()]
     return row("2026-09-13 00:00:00", "batch", "%s 本批完成" % pack, " ".join(parts))
 
 
@@ -107,16 +117,40 @@ class Lab:
         shutil.rmtree(self.d, ignore_errors=True)
 
 
+# ── 真实日期（★ 「告警只数今天」这条判据**必须**用真实 today 才测得到）────────
+#   为什么不能继续全用写死的 2026-09-13/14：脚本里的"今天"是 `date '+%Y-%m-%d'`，
+#   是**跑测试那天**。若 TSV 文件名永远写死成 09-13/14，那"今天的 TSV"就永远
+#   不存在 ⇒ `_alerts` 恒为 0 ⇒ **无论脚本对错，⑨ 段都"绿"** ——
+#   典型的假绿（`ERR-AI-09`）。所以这两条辅助按**真实日期**造文件名与行内时间戳。
+def day(offset):
+    """相对今天偏移 `offset` 天的 `YYYY-MM-DD`。"""
+    return (datetime.date.today() + datetime.timedelta(days=offset)).isoformat()
+
+
+def on(day_str, hhmmss="00:00:00"):
+    """把某天的 `YYYY-MM-DD` 加上时间，得到 TSV 第 1 列的形状。"""
+    return "%s %s" % (day_str, hhmmss)
+
+
 # ── 手算基线（★ 期望值写死在这里，**不是**从输出反推） ──────────────────────
 #   真批次 4 条：frds(22/18/2)  dc0816(0/15/1)  mbf(0/0/1)  dc1139(9/0/2)
 #     本批运行 = 4        ok=0 的 = 2（dc0816、mbf）
-#     新增做种 = 18+15+0+0 = 33      退避 = 2+1+1+2 = 6
+#     退避 = 2+1+1+2 = 6
+#   ★★ 净额与增量**故意取不同的数**（2026-09-23，新增 `first_seeding`）：
+#     若两者取同一个数，就**分不清**脚本读的是哪一个 —— 那样的用例等于没测。
+#       做种净额（newly_seeding）= 18+15+0+0 = 33
+#       新增做种（first_seeding）=  7+ 0+0+9 = 16
+#     ⇒ 「新增做种 16」与「做种净额 33」**同时**出现，且**不是同一个数**。
 #   非本批 3 条：两条「每日台账」（无 pack=）+ 一条「全部包已无待搜项」（键是 packs=）
+#
+#   ★★ 日期：DAY13 里那条 alert 落在 09-13，DAY14 里**没有** alert。
+#     这样「告警只数今天」才有可判之处 —— 见 ⑨ 段：跑在 09-14 那天时，
+#     09-13 的告警**不许**被算进「告警 : N」，但仍要在明细里带「(前一日)」出现。
 DAY13 = (
     row("2026-09-13 00:38:28", "alert", "站点退避中：HDtime",
         "indexer=HDtime status=RATE_LIMITED")
     + batch("frds-top250-2024", ok=22, failed=0, newly_seeding=18,
-            still_skipped=0, backoff_hits=2)
+            first_seeding=7, still_skipped=0, backoff_hits=2)
     + row("2026-09-13 00:38:28", "batch", "每日台账",
           "day=2026-09-13 iyuu=100 fa=76 fb=76")
     + batch("dc-collection", ok=0, failed=0, newly_seeding=15,
@@ -126,7 +160,7 @@ DAY14 = (
     row("2026-09-14 01:31:38", "batch", "每日台账", "day=2026-09-14 iyuu=303 fa=0 fb=0")
     + batch("mbf", ok=0, failed=0, newly_seeding=0, still_skipped=0, backoff_hits=1)
     + batch("dc-collection", ok=9, failed=0, newly_seeding=0,
-            still_skipped=0, backoff_hits=2)
+            first_seeding=9, still_skipped=0, backoff_hits=2)
     + row("2026-09-14 12:00:00", "batch", "全部包已无待搜项（3 个包）", "packs=3")
 )
 
@@ -143,11 +177,20 @@ try:
           [ln for ln in out.splitlines() if "本批运行" in ln])
     check("   其中 2 批零产出", "其中 2 批零产出" in out,
           [ln for ln in out.splitlines() if "本批运行" in ln])
-    check("   新增做种 33", "新增做种 33" in out,
+    # ★★ 净额与增量**两个数各自出现、且不相等**（16 vs 33）——
+    #   这条是 2026-09-23 改动的核心判据：只钉一个数**分不清**脚本读的是哪个键。
+    check("★★ 新增做种 16（真增量 = first_seeding：7+0+0+9）",
+          "新增做种 16" in out,
+          [ln for ln in out.splitlines() if "本批运行" in ln])
+    check("★★ 做种净额 33（老字段 = newly_seeding：18+15+0+0）—— 与上面**不是同一个数**",
+          "做种净额 33" in out,
           [ln for ln in out.splitlines() if "本批运行" in ln])
     check("   退避 6 次", "退避 6 次" in out,
           [ln for ln in out.splitlines() if "本批运行" in ln])
-    check("★ 告警 : 1（kind=alert 那一条）", "告警     : 1" in out or "告警 : 1" in out,
+    # ★ 这一段的 TSV 是 09-13/09-14（**不是今天**）⇒ 「告警 : 0 条（今天）」是
+    #   **正确**读数。真正的"只数今天"判据在 ⑨ 段（那里用真实日期造文件）。
+    check("★ 告警只数当天 ⇒ 这两天的 TSV 里没有今天，故为 0",
+          "告警     : 0 条（今天）" in out,
           [ln for ln in out.splitlines() if "告警" in ln][:3])
 
     print("\n── ② ★ 台账与「无待搜」不算批次 ──")
@@ -181,9 +224,10 @@ try:
     check("★ dc-collection 聚合出 **2 批**（不是两行）",
           "2 批  发出请求    9" in out,
           [ln for ln in out.splitlines() if "dc-collection" in ln])
-    check("★ 聚合行仍带「新增做种」（按包分列：frds 18 / dc 15）",
-          "新增做种 18" in out and "新增做种 15" in out,
-          [ln for ln in out.splitlines() if "新增做种" in ln])
+    check("★★ 聚合行**同时**带「新增做种」与「做种净额」，且按包分列",
+          "新增做种 7" in out and "做种净额 18" in out
+          and "新增做种 9" in out and "做种净额 15" in out,
+          [ln for ln in out.splitlines() if "发出请求" in ln])
     check("★★ 退避按包合计（frds 2 / dc 1+2=3）",
           "退避 2" in out and "退避 3" in out,
           [ln for ln in out.splitlines() if "退避" in ln])
@@ -441,8 +485,11 @@ try:
     check("★ newpack（只 2 批）不出现试点提示 —— 别在样本不够时下结论",
           "newpack 试了" not in out, out)
     # ③ mbf 形状 ⇒ 建议移出，且**写明不自动改**
-    check("★ mbf 形状（8 批 / ok=32 / 0 产出）⇒ 建议移出名单",
-          "mbf 试了 8 批 / 发出 32 次搜索" in out and "新增做种 0" in out, out)
+    #   ★ 2026-09-23：这句提示的标签改成「做种净额 0」——它判的本来就是**净额**
+    #     （与 `pilot_verdict` 逐字一致），而「新增做种」一词现在专指**真增量**。
+    #     同一个词指两个数，正是本项目反复踩的那类坑。
+    check("★ mbf 形状（8 批 / ok=32 / 净额 0）⇒ 建议移出名单",
+          "mbf 试了 8 批 / 发出 32 次搜索" in out and "做种净额 0" in out, out)
     check("★★ 且**明写「不自动改」**（那是产品决定，要人拍）",
           "不自动改" in out and "产品决定" in out, out)
     # ④ ok=0 ⇒ 必须是**观测失败**那一档，不是"没产出"
@@ -468,6 +515,83 @@ try:
     r = lab.run()
     check("★ 打的是 [dry-run] 而不是 [已发]", "[dry-run]" in r.stdout and "[已发]" not in r.stdout,
           r.stdout[:200])
+finally:
+    lab.cleanup()
+
+# =====================================================================
+print("\n── ⑨ ★★ 「告警」只数**今天**（2026-09-23）—— 跨日重复计数那个 bug ──")
+#   起因（实测）：窗口是「今天 + 昨天」，原先 `_alerts` 数的是**两窗之和**
+#   ⇒ 每条告警在连续两封摘要里**各出现一次**。生产证据：09-22 与 09-23 两封的
+#   「告警明细」段逐字相同（都是 09-22 那三条），而 09-23 当天**一条新告警都没有**，
+#   却仍打「告警 : 3」。
+#
+#   ★★ 这一段**必须用真实日期**造文件：脚本里的"今天"是 `date '+%Y-%m-%d'`。
+#     若把文件名写死成 09-13/14，「今天的 TSV」就永远不存在 ⇒ `_alerts` 恒 0
+#     ⇒ **脚本对错都是绿的**。所以这里用 `day(0)` / `day(-1)`。
+#   ★ 变异检验：把 `_alerts` 改回数两窗 ⇒ 本段第 1、2 条必红。
+lab = Lab()
+try:
+    # 昨天：1 条告警 + 1 批；今天：0 条告警 + 1 批
+    lab.tsv(day(-1), (
+        row(on(day(-1), "03:39:59"), "alert", "pool 本批异常", "k=1")
+        + batch("frds-top250-2024", ok=10, failed=0, newly_seeding=0,
+                first_seeding=0, still_skipped=0, backoff_hits=0)
+    ))
+    lab.tsv(day(0), batch("frds-top250-2024", ok=10, failed=0, newly_seeding=443,
+                          first_seeding=0, still_skipped=0, backoff_hits=0))
+    out = lab.run().stdout
+
+    check("★★ 「告警 : 0 条（今天）」—— 昨天那条**不许**算进今天的计数",
+          "告警     : 0 条（今天）" in out,
+          [ln for ln in out.splitlines() if "告警" in ln][:3])
+    check("★★ 但要点出「前一日另有 1 条」，否则 0 会被读成「什么都没发生」",
+          "前一日另有 1 条" in out,
+          [ln for ln in out.splitlines() if "告警" in ln][:3])
+    check("★ 昨天那条**仍在明细里**（计数只算今天，但明细不漏昨天）",
+          "pool 本批异常" in out,
+          [ln for ln in out.splitlines() if "异常" in ln])
+    check("★ 且带「(前一日)」标注 —— 读者能分辨它不属于今天",
+          "(前一日)" in out,
+          [ln for ln in out.splitlines() if "异常" in ln])
+    # ★ 批次仍按**两窗**数（那三处没跟着改）
+    check("★ 批次仍按两窗 ⇒ 本批运行 : 2 批（昨天 1 + 今天 1）",
+          "本批运行 : 2 批" in out,
+          [ln for ln in out.splitlines() if "本批运行" in ln])
+finally:
+    lab.cleanup()
+
+# ── ⑨b ★★ 「做种净额 443 / 新增做种 0」这个**正确读数**要能一眼读懂 ──
+#   这正是生产 09-23 那封信的形状：净额满（一直有 443 部在做种）、
+#   增量 0（今天没有新片转正）。改前只有一个数叫「新增做种 443」，
+#   读起来像"今天新加了 443 部"—— 于是用户合理地质疑数据有错。
+lab = Lab()
+try:
+    lab.tsv(day(0), batch("frds-top250-2024", ok=37, failed=3, newly_seeding=443,
+                          first_seeding=0, still_skipped=0, backoff_hits=3))
+    out = lab.run().stdout
+    check("★★ 净额与增量**并排**出现（443 与 0 同时可读）",
+          "做种净额 443" in out and "新增做种 0" in out,
+          [ln for ln in out.splitlines() if "发出请求" in ln])
+    check("★ 失败与退避照旧不为它让路（★失败 3 / 退避 3）",
+          "★失败 3" in out and "退避 3" in out,
+          [ln for ln in out.splitlines() if "发出请求" in ln])
+finally:
+    lab.cleanup()
+
+# ── ⑨c ★★ 缺 `first_seeding` 键 ⇒ **降级**：只印净额，不许把缺键印成 0 ──
+#   这是老 TSV 行（09-23 之前发的）真实存在的样子。
+#   ★ 与 ⑤ 段那条「键在不在 != 值等不等于 0」同一纪律：把"没有这个读数"
+#     印成「新增做种 0」= **伪造读数**（`ERR-AI-03` / `A.12.1`）。
+lab = Lab()
+try:
+    lab.tsv(day(0), batch("oldpack", ok=20, failed=0, newly_seeding=5,
+                          still_skipped=0, backoff_hits=0))
+    out = lab.run().stdout
+    check("★ 有净额（做种净额 5）", "做种净额 5" in out,
+          [ln for ln in out.splitlines() if "发出请求" in ln])
+    check("★★ 缺键 ⇒ **不印**「新增做种」（绝不印成 0）",
+          "新增做种" not in out,
+          [ln for ln in out.splitlines() if "新增做种" in ln] or out[-400:])
 finally:
     lab.cleanup()
 

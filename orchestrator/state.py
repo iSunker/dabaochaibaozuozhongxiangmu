@@ -1866,6 +1866,61 @@ class StateStore:
         rep.sites = sorted({s for (_w, s) in rep.cells})
         return rep
 
+    # -- 真增量：本批**首次**转 SEEDING 的片数 ------------------------------- #
+    def first_seeding_between(self, pack: str, since: str,
+                              until: str | None = None) -> int:
+        """`[since, until)` 窗内**首次**变 SEEDING 的片数（按片去重）。
+
+        ★★ **为什么需要它**（2026-09-23）：批次 metrics 里那个 `newly_seeding`
+           是**净额**（`当前 SEEDING 数 - 批次前 SEEDING 数`，见 `drive-loop.py`），
+           而摘要把它印成「新增做种」⇒ 读起来像「今天新加了 N 部」。
+           实测：`443` 连续两天一模一样（§26.50 三 已记录 `-443/+443` 那对），
+           而同一封信里 `发出请求` 从 162 掉到 37 —— 两个读数**互相矛盾**，
+           于是读者合理地质疑数据有错。**净额答不了「今天干了活没有」。**
+
+        ★ 口径**与 `trend()` 逐字相同**（`MIN(at) GROUP BY movie_id`）：
+          同一部片反复 sync **不会**被重复计数 —— 这是 `trend()` 早就定下的
+          正确口径（`state.py` 里那段注释：「按**每片首次**变 SEEDING 算」）。
+          ★ 本方法是那个口径的**时间窗切面**，不是新发明的算法。
+
+        ★ 为什么**不能**直接 `COUNT(*) WHERE result='seeding' AND at BETWEEN …`：
+          `result='seeding'` 是**状态**不是**增量**（同 `trend()` 的注释）——
+          一部早就是 SEEDING 的片，下一批 sync 时**不会**再写一行，
+          但别的路径（如 inject 之后的 sync）会写 ⇒ 那样数出来的既不是
+          "新转正的"也不是"今天做的"，是个混合口径。
+
+        ★ `since`/`until` 用 **ISO 19 字符**（`%Y-%m-%d %H:%M:%S`）——
+          `attempt.at` 就是这个形状（`_now()`），定长 ⇒ **字典序比较即时间序**，
+          可以直接在 SQL 里比，不必回 Python 解析。
+        ★ `until=None` ⇒ 取**此刻**（`_now()`）。这样调用方**不必碰** `_now`
+          这个私有名 —— 它是本模块的内部约定，跨模块去 import 会把它变成
+          事实上的公开 API（`scripts/drive-loop.py` 只需要传 `since`）。
+
+        ★★ 上界**闭区间**（`<=`），不是半开的（2026-09-23 实测改成这样）：
+          `attempt.at` 只有**秒**精度，而 `sync_pack` 写完 `attempt` 之后
+          我们**立刻**查询 —— 两者常落在**同一秒**。
+          若上界取半开（`first_at < until`），那些"就在这一秒里转正"的片
+          会被**静默漏掉**：数出来偏小，而读数看起来完全正常（`0` 不是
+          "没有"，是"没数到"）。★ 这正是本项目 `ERR-AI-09` 那一族——
+          装置本身给出的答案不可信，而症状是"平静"。
+          ⇒ 用 `<=`：窗是 `[since, until]`，两端口径一致（都含）。
+          ★ 代价是多算了"恰好等于 `until` 那一秒"的非本批行 —— 但 `since`
+            那一端本来就含（`>=`），且 `until` 是本批**回灌刚写完**的时刻，
+            这一秒里不可能混进别的批（同包不会并行跑）。
+        """
+        if until is None:
+            until = _now()
+        row = self.con.execute(
+            "SELECT COUNT(*) FROM ("
+            "  SELECT a.movie_id, MIN(a.at) AS first_at"
+            "    FROM attempt a JOIN movie m ON m.id = a.movie_id"
+            "   WHERE a.result = ? AND m.pack = ?"
+            "   GROUP BY a.movie_id"
+            "  HAVING first_at >= ? AND first_at <= ?)",
+            (STAGE_SEEDING.lower(), pack, since, until),
+        ).fetchone()
+        return int(row[0]) if row else 0
+
     def summary(self, pack: str) -> dict[str, int]:
         rows = self.con.execute(
             "SELECT stage, COUNT(*) c FROM movie WHERE pack=? GROUP BY stage", (pack,)
@@ -2764,7 +2819,13 @@ class DriveStats:
     resync: SyncReport | None = None
     #: 打完还处于 SKIPPED 的片子（= 又被退避了）
     still_skipped: int = 0
+    #: ★ `newly_seeding` 是**净额**（当前 SEEDING − 批次前 SEEDING）。
+    #:   它不是增量 —— 连续两天可以完全一样（实测 443/443，§26.50 三）。
     newly_seeding: int = 0
+    #: ★★ `first_seeding` 是**真增量**：本批**首次**转 SEEDING 的片数。
+    #:   作答「今天到底有没有新片被辅上」—— 净额答不了这个问题。
+    #:   口径与 `trend()` 一致（`MIN(at) GROUP BY movie_id`，按片去重）。
+    first_seeding: int = 0
 
     def render(self) -> str:
         lines = [

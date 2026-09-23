@@ -2442,6 +2442,13 @@ def run_round(pack: str, packs: list[str], args, api_key: str) -> S.DriveStats |
         " 正确做法：`packs_from_arg(args.packs)`。" % (packs[:8],))
 
     st = S.StateStore(args.db)
+    # ★★ 本批的**时间窗起点**（2026-09-23）：给 `first_seeding_between()` 用。
+    #   为什么取在这里：在这一刻之后写的 `attempt` 行都算"本批干的活"。
+    #   ★ 格式必须是 19 字符 ISO（`%Y-%m-%d %H:%M:%S`）—— 与 `attempt.at` 同形，
+    #     定长 ⇒ 字典序即时间序（见 `state.py::first_seeding_between` 的注释）。
+    #   ★ 这里**自己生成**、不去 import `state._now`：那个私有名是 state 模块
+    #     的内部约定，跨模块引用会把它变成事实上的公开 API。
+    batch_t0 = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     try:
         idx = [i.strip() for i in (args.indexers or "").split(",") if i.strip()] or None
         if getattr(args, "pool", False):
@@ -2577,6 +2584,21 @@ def run_round(pack: str, packs: list[str], args, api_key: str) -> S.DriveStats |
                                      if r["stage"] == S.STAGE_SKIPPED),
                 "newly_seeding": (sum(1 for r in st.movies(pk)
                                       if r["stage"] == S.STAGE_SEEDING) - before),
+                # ★★ `first_seeding` = 本批**首次**转 SEEDING 的片数（**真增量**）。
+                #   ★ 与 `newly_seeding` 的区别（别把它们当同一个数）：
+                #     `newly_seeding` 是**净额**（当前 SEEDING − 批次前 SEEDING），
+                #       它答不了「今天干了活没有」—— 实测 `443` 连着两天一模一样
+                #       （§26.50 三 那对 `-443/+443`），而同一封信里 `发出请求`
+                #       从 162 掉到 37 ⇒ 两个读数**互相矛盾**，读者合理质疑数据有错。
+                #     `first_seeding` 是**增量**：`attempt` 表里本窗内 MIN(at) 落在
+                #       本批的片数（口径与 `state.py::trend()` 逐字相同 ⇒ 同一片
+                #       反复 sync **不会**重复计数）。
+                #   ★ `newly_seeding` **原样保留** —— `next_sleep()`（本文件 :339）
+                #     与 `pilot_verdict` 都按**净额**语义读它，改它会波及自适应间隔
+                #     判定与"该不该留这个包"的判据。所以这里只**新增**，不改旧的。
+                #   ★ `until` 传 `None`（由 state 侧取此刻）：本批的**上界**就是
+                #     "回灌写完之后"，不必在这里再取一次时钟。
+                "first_seeding": st.first_seeding_between(pk, batch_t0),
             })
     finally:
         st.con.close()
@@ -2587,6 +2609,8 @@ def run_round(pack: str, packs: list[str], args, api_key: str) -> S.DriveStats |
         stats.resync = segs[0]["rep"]
     stats.still_skipped = sum(s["still_skipped"] for s in segs)
     stats.newly_seeding = sum(s["newly_seeding"] for s in segs)
+    # ★ 真增量（件数，不是净额）—— 合池时是各段之和（各包各算各的首次转正）。
+    stats.first_seeding = sum(s["first_seeding"] for s in segs)
     for s in segs:
         rep = s["rep"]
         LOG.info("[%s] 回灌：搜过 %s / 匹配 %s / 新增做种 %d / 仍 SKIPPED %d",
@@ -2612,7 +2636,8 @@ def run_round(pack: str, packs: list[str], args, api_key: str) -> S.DriveStats |
                       if first else "")
                    + (f"发送: 成功 {stats.ok} / 失败 {stats.failed}\n" if first
                       else "发送: 见本批第一段（合池批不按包拆）\n")
-                   + f"新增做种: {s['newly_seeding']} 部\n"
+                   + f"新增做种: {s['first_seeding']} 部（真增量）\n"
+                   + f"做种净额: {s['newly_seeding']} 部（当前 − 批次前）\n"
                    + f"仍 SKIPPED: {s['still_skipped']}\n"
                    + (f"退避: {stats.backoff_hits} 次"
                       f"（等待 {stats.waited_sec / 60:.1f} 分钟）\n" if first
@@ -2623,6 +2648,7 @@ def run_round(pack: str, packs: list[str], args, api_key: str) -> S.DriveStats |
                       "ok": stats.ok if first else 0,
                       "failed": stats.failed if first else 0,
                       "newly_seeding": s["newly_seeding"],
+                      "first_seeding": s["first_seeding"],
                       "still_skipped": s["still_skipped"],
                       "backoff_hits": stats.backoff_hits if first else 0,
                       "pool_segs": len(segs)})

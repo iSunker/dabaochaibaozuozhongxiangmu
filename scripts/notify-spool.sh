@@ -707,7 +707,26 @@ do_digest() {
     done
 
     _batches=$(printf '%s\n' "$_lines" | grep -c '	batch	' || true)
-    _alerts=$(printf '%s\n' "$_lines" | grep -c '	alert	' || true)
+    # ★★ 「告警 : N」只数**今天**（2026-09-23）。
+    #   起因（实测）：窗口是「今天 + 昨天」，而原先 `_alerts` 数的是**两窗之和**
+    #   ⇒ **每一条告警都会在连续两封摘要里各出现一次**。
+    #   证据：09-22 与 09-23 两封的「告警明细」段**逐字相同**（三条都是 09-22 的
+    #   `03:39:59` / `04:05:32` / `04:06:10`），而 09-23 当天**一条新告警都没有**，
+    #   却仍打「告警 : 3」。
+    #   ★ 与 `ERR-AI-09` 同族：「读数一样、含义相反」—— 读者无法从这封信判断
+    #     那 3 条是不是今天新出的。
+    #   ★ 明细段**仍按两窗**打（昨日的不丢，见下面那段），只对**非今天**的行加
+    #     「(前一日)」标注 ⇒ 「计数只算今天」与「明细不漏昨天」两件事都成立。
+    #   ★ 批次 / 台账 / 心跳三处**继续用两窗** `_lines` —— 它们要的是"最近两窗的
+    #     运行情况"，跨日是对的，别一起改了。
+    _today=$(date '+%Y-%m-%d')
+    _today_lines=$(cat "$LOGDIR/$_today.tsv" 2>/dev/null || true)
+    _alerts=$(printf '%s\n' "$_today_lines" | grep -c '	alert	' || true)
+    # ★ 前一日（窗口里**除今天以外**）的告警条数 —— **只用来决定明细段要不要出现**，
+    #   不参与「告警 : N」那个计数。两个数分开，正是这次修的核心。
+    #   ★ 算式：两窗总数 − 今天数。不去猜文件名（窗口来源可能只有一天）。
+    _alerts_all=$(printf '%s\n' "$_lines" | grep -c '	alert	' || true)
+    _alerts_prev=$(( ${_alerts_all:-0} - ${_alerts:-0} ))
 
     # ★★ 「批次」不能按 kind 数 —— **每日台账与「全部包已无待搜项」也是 kind=batch**
     #   （走 batch 是为了「记账但不发信」，见 drive-loop.py 里那两处 emit）。
@@ -718,7 +737,7 @@ do_digest() {
     # ★ 求和一档的判据是「**键在不在**」，不是「值等不等于 0」—— 与 #63/#64 同一
     #   形状：`ok=0` 是真读数，「这行没有 ok 键」是另一回事，当成 0 就是假读数。
     printf '最近两次运行窗口\n'
-    printf '%s\n' "$_lines" | grep '	batch	' | awk -F'\t' -v n_alert="${_alerts:-0}" '      function kvget(s, k,   n, i, p, a) {
+    printf '%s\n' "$_lines" | grep '	batch	' | awk -F'\t' -v n_alert="${_alerts:-0}" -v n_prev="${_alerts_prev:-0}" '      function kvget(s, k,   n, i, p, a) {
         n = split(s, a, " ")
         for (i = 1; i <= n; i++) {
           p = index(a[i], "=")
@@ -730,16 +749,37 @@ do_digest() {
         if (kvget($4, "pack") == "") { other++; next }   # 台账 / 无待搜：不是一批
         n++
         if (kvget($4, "ok") == "0") zero++
+        v = kvget($4, "first_seeding"); if (v != "") fs += v
         v = kvget($4, "newly_seeding"); if (v != "") ns += v
         v = kvget($4, "backoff_hits");  if (v != "") bh += v
+        if (kvget($4, "first_seeding") != "") n_fs++
       }
       END {
-        printf "  本批运行 : %d 批（其中 %d 批零产出 / 新增做种 %d / 退避 %d 次）\n",
-               n, zero, ns, bh
+        # ★★ 「新增做种」= **真增量**（`first_seeding`），「做种净额」= 老字段
+        #   （`newly_seeding`，当前 SEEDING 减批次前 SEEDING）。
+        #   两个都印、各有名字 —— 因为**净额答不了"今天干了活没有"**：
+        #   实测 443 连续两天一模一样（§26.50 三 那对 -443/+443），而同一封信里
+        #   `发出请求` 从 162 掉到 37 ⇒ 读者合理地质疑数据有错。
+        #   现在两个数并排，`新增做种 0 / 做种净额 443` 一眼就读通：
+        #   **今天没有新片转正，但池里 443 部一直在做种。**
+        # ★★ 降级：`first_seeding` 是 2026-09-23 才加的键，**旧 TSV 行没有它**。
+        #   缺键时**只印净额**，不许把缺键当 0 —— 与上面那条
+        #   「键在不在 != 值等不等于 0」是同一纪律。判据是 `n_fs`（有几行**带**
+        #   这个键），不是 `fs == 0`。
+        if (n_fs > 0)
+          printf "  本批运行 : %d 批（其中 %d 批零产出 / 新增做种 %d / 做种净额 %d / 退避 %d 次）\n",
+                 n, zero, fs, ns, bh
+        else
+          printf "  本批运行 : %d 批（其中 %d 批零产出 / 做种净额 %d / 退避 %d 次）\n",
+                 n, zero, ns, bh
         if (other > 0)
           printf "  未计批次 : %d 条（属台账/无待搜，不是真跑批；故未计入上面的批次数）\n",
                  other
-        printf "  告警     : %s\n\n", n_alert
+        # ★ 「告警」= **今天**的条数（`_alerts` 只数当天那个 TSV）。
+        #   显式写「今天」二字，否则读者会以为它跨两窗 —— 那正是老 bug 的读法。
+        #   ★ 前一日有告警时补一句，免得"今天 0 条"被误读成"什么都没发生"。
+        printf "  告警     : %s 条（今天）%s\n\n", n_alert,
+               (n_prev + 0 > 0 ? sprintf("；前一日另有 %d 条（见下方明细，已标注）", n_prev) : "")
       }'
 
     # ★★ 2026-09-20：明细段从「每批摊 2 行」改成「**按包聚合**」。
@@ -778,7 +818,12 @@ do_digest() {
         n[pack]++
         v = kvget($4, "ok");            if (v != "") ok[pack] += v
         v = kvget($4, "failed");        if (v != "" && v + 0 > 0) fail[pack] += v
-        v = kvget($4, "newly_seeding"); if (v != "" && v + 0 > 0) ns[pack]   += v
+        # ★ `newly_seeding`（净额）与 `first_seeding`（真增量）分开累计。
+        #   ★ 用**两个**存在性计数（`has_ns` / `has_fs`）而不是"只要有一行就行"：
+        #     生产上同一包的多行**都**带这两个键（同一版代码发的），但合成行/旧行
+        #     可能只带一个 —— 那样"这一列该不该打"要按**这一列**自己的存在性判。
+        v = kvget($4, "newly_seeding"); if (v != "") { ns[pack] += v; has_ns[pack] = 1 }
+        v = kvget($4, "first_seeding"); if (v != "") { fs[pack] += v; has_fs[pack] = 1 }
         v = kvget($4, "backoff_hits");  if (v != "" && v + 0 > 0) bh[pack]   += v
       }
       END {
@@ -796,7 +841,17 @@ do_digest() {
           #     一个单引号就会把它**截断**，而症状是 awk 报 "END OF FILE"、
           #     整段明细**静默为空**（`|| true` 把它吞了，rc 仍是 0）。实测踩过一次。
           printf "  %-18s %2d 批  发出请求 %4d", p, n[p], ok[p]
-          if (ns[p]   > 0) printf "  新增做种 %d", ns[p]
+          # ★★ 「新增做种」现在读的是**真增量**（`first_seeding`），后面跟
+          #   「做种净额」（`newly_seeding`）—— 两个数并排，让
+          #   `新增做种 0 / 做种净额 443` 这种**正确读数**一眼能读懂：
+          #   今天没有新片转正，但池里 443 部一直在做种。
+          #   ★ 判据是**键在不在**（`has_fs`），不是"值非零"：
+          #     `新增做种 0` 本身是**有信息**的真读数（今天确实一部没转正），
+          #     藏掉它等于把"没干活"伪装成"没数据"（`ERR-AI-03` 同族）。
+          #   ★ 缺键（旧 TSV 行 / 合成行）⇒ **这一格整个不打**，只留净额 ——
+          #     绝不把缺键印成 0。
+          if (has_fs[p]) printf "  新增做种 %d", fs[p]
+          if (has_ns[p]) printf "  做种净额 %d", ns[p]
           if (fail[p] > 0) printf "  ★失败 %d",  fail[p]
           if (bh[p]   > 0) printf "  退避 %d",      bh[p]
           printf "\n"
@@ -817,7 +872,11 @@ do_digest() {
             printf "     这是**观测失败**（站点全在退避？网络？），**不是**「跑了没产出」。\n"
             printf "     先查那几批的日志，**别**据此判断这个包该不该留。\n"
           } else if (ns[p] + 0 <= 0) {
-            printf "  ↳ ★ 试点提示：%s 试了 %d 批 / 发出 %d 次搜索，**新增做种 0** ——\n", p, n[p], ok[p]
+            # ★ 判据用的是 `ns`（**净额**，与 `state.py::pilot_verdict` 逐字一致），
+            #   所以标签也必须写**净额** —— 2026-09-23 起「新增做种」这个词
+            #   已经专指**真增量**（`first_seeding`）。同一个词指两个数，
+            #   正是本项目反复踩的那类坑（读数一样、含义相反）。
+            printf "  ↳ ★ 试点提示：%s 试了 %d 批 / 发出 %d 次搜索，**做种净额 0** ——\n", p, n[p], ok[p]
             printf "     建议考虑把它移出 PACKS_DEFAULT（名单回到 N-1 个，其余包频率立刻回升）。\n"
             printf "     ★ **不自动改**：那是产品决定，要你拍（见 drive-loop.py 那段注释）。\n"
           }
@@ -926,14 +985,20 @@ do_digest() {
         }' || true
     fi
 
-    if [ "${_alerts:-0}" != "0" ]; then
+    if [ "${_alerts:-0}" != "0" ] || [ "${_alerts_prev:-0}" != "0" ]; then
       printf '\n告警明细\n'
       # ★ 打 `$5`（正文首行，`#68`）—— 2026-09-17 起 `log_event` 才有这一列。
       #   ★ **向后兼容**：旧行只有 4 列，`$5` 为空 ⇒ 用 `NF>=5 && $5!=""` 挡住，
       #     那时行为与以前**一模一样**（只打时间 + 标题），不会打出空行或多一个空格。
       #   ★ `$1`/`$3` 的位置**没动** —— 这是本条改动能安全落地的全部前提。
-      printf '%s\n' "$_lines" | grep '	alert	' | awk -F'\t' '{
-        printf "  %s  %s\n", $1, $3
+      # ★★ 「(前一日)」标注（2026-09-23）：上面的「告警 : N」现在**只数今天**，
+      #   而这一段仍打**两窗** —— 否则昨天那条告警就在信里彻底消失了。
+      #   标注让两件事同时成立：**计数只算今天** + **明细不漏昨天**。
+      #   ★ 判据是**行的日期 != 今天**（取 `$1` 前 10 字符），不是"文件是哪个"
+      #     —— 同一份 TSV 里也可能混日期（跨零点的行），按行判才准。
+      printf '%s\n' "$_lines" | grep '	alert	' | awk -F'\t' -v today="$_today" '{
+        if (substr($1, 1, 10) == today) printf "  %s  %s\n", $1, $3
+        else                             printf "  %s  %s  (前一日)\n", $1, $3
         if (NF >= 5 && $5 != "") printf "      %s\n", $5
       }' || true
     fi
