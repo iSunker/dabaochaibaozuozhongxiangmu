@@ -12,3 +12,10 @@
 #   ★ 别删这两行：删了下次检出 .cmd 就会变回 LF，任务又会静默失败。
 *.cmd text eol=crlf
 *.bat text eol=crlf
+# ★ 例外（2026-09-23）：`summary/` 这棵**纯文档**树允许 CRLF。
+#   为什么：Windows 侧的工具（各编辑器 / `sed` 往返）会把整份文件**整份写回 CRLF**，
+#   而 git 里存的是 LF ⇒ 每次改一格都会让 `git diff` 变成**整文件重写**（§28 那个坑的镜像：
+#   那次是 CRLF 让 `cmp` 报**假差异**，这次是让 `diff` 报**假改动**）。
+#   ★ 只放开这一棵：**可执行的**（`*.sh` / `*.py` / `Dockerfile` / `.env*`）**一律仍必须 LF** ——
+#     CRLF 会真的把 shell/python 解析搞坏，那才是本文件开头那条规则存在的理由。
+summary/*.md text eol=crlf
