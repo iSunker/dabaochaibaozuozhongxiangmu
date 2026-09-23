@@ -272,6 +272,52 @@ def emit(kind: str, title: str, body: str = "", *,
     return _NOTIFIER.emit(kind, title, body=body, key=key, metrics=metrics)
 
 
+def reset_notify_count() -> None:
+    """回收**告警**配额 —— 在**批与批之间**调用（见 `run_round` 底部）。
+
+    ★★★ 2026-09-23 修的那个 bug 就在这里：`MAX_PER_RUN` 是「**一次喷发**最多几条」
+      的闸门，可它的计数器（`Notifier._count`）在**常驻**进程里**没有任何人回收** ——
+      进程活几周，涨到 12 就再也不降。而 `run_round` 每轮至少发一条 `batch`，
+      ⇒ 第 11 轮之后**所有**通知（含**真告警**）全被静默丢弃，唯一痕迹是日志里
+      一行 WARNING。形状正是本项目最忌的那种：**该响的时候没响，而看起来一切正常**。
+
+    ★ 位置必须在这里（`run_round` **底部**、`after_batch_reports()` **之后**），
+      不能挪到 `emit` 之前：`run_round` 内部是**先** `emit("batch")`、**后**
+      `after_batch_reports()`（台账 +「有站点在退避」的即时告警）。若在 `emit`
+      之前回收，重置后的第一条立刻被这一轮的 batch 自己吃掉，告警又轮空。
+
+    ★ 未启用通知时是空操作（`_NOTIFIER is None`）—— 与 `emit` 同一套降级形状。
+    """
+    if _NOTIFIER is None:
+        return
+    try:
+        _NOTIFIER.reset_count()
+    except Exception as e:  # noqa: BLE001 —— 通知是旁路，绝不能让跑批失败
+        LOG.debug("回收通知配额失败（忽略）: %s", e)
+
+
+def notify_delivered() -> int:
+    """**自上次回收以来**投出去的通知条数（未启用 → -1）。
+
+    ★ 在 `run_round` 的用法下就是「**本批**投出去几条」—— `reset_count()` 挂在
+      `run_round` 底部（批与批之间），所以这个数与告警配额计数器**同尺度**。
+      ★ 与 `_count` 同生共死是刻意的：留一个「生命周期累计」的不同步计数器，
+        就多一个**同词不同义**的字段（本项目反复栽在这上面）。
+
+    ★ 这是**「该响没响」专配的计数器**：本项目的失败方式常常是「**想都没想到要发**」——
+      那时 spool 里什么也没有，而唯一带这个数的 `batch` 行**自己也不发了**。
+      把它挂进批次 metrics，「**其实什么都没发出去**」就变成一个**能看见**的读数。
+    ★ `-1` 表示「通知没启用」，与 `0`（启用了、但本批一条没发）**必须分开** ——
+      合成一个数就又变成「`n/a` ≠ `0` ≠ 没事」那个坑（`ERR-AI-03`）。
+    """
+    if _NOTIFIER is None:
+        return -1
+    try:
+        return int(_NOTIFIER.delivered)
+    except Exception:  # noqa: BLE001
+        return -1
+
+
 def describe_notifier() -> str:
     """给启动日志用的一句话，让人一眼看出通知到底通没通。"""
     if _notify is None:
@@ -2651,11 +2697,26 @@ def run_round(pack: str, packs: list[str], args, api_key: str) -> S.DriveStats |
                       "first_seeding": s["first_seeding"],
                       "still_skipped": s["still_skipped"],
                       "backoff_hits": stats.backoff_hits if first else 0,
-                      "pool_segs": len(segs)})
+                      "pool_segs": len(segs),
+                      # ★★ 「该响没响」专配的读数：**本批**投出去几条通知
+                      #   （`reset_notify_count` 挂在 run_round 底部 ⇒ 与配额同尺度）。
+                      #   意义在于**批次自己也不发的时候**（通知链路断了），
+                      #   唯一带这个数的那行会一起消失 ⇒ 必须让它在**每一批**都出现。
+                      #   ★ `-1` = 通知未启用，与 `0`（启用了、本批一条没发）
+                      #     **必须分开**：合成一个数就又是「`n/a` = 0 = 没事」（`ERR-AI-03`）。
+                      "notify_delivered": notify_delivered()})
 
     # 每天一次的台账（额度 + 趋势）+「有站点此刻在退避」的即时告警。
     # ★ 放在批次自己的 batch 事件**之后** —— 台账要反映刚回灌完的最新状态。
     after_batch_reports(args)
+
+    # ★★★ 本批到此结束 ⇒ **回收告警配额**（2026-09-23）。
+    #   为什么必须在这一行、而不是 run_round 开头：上面 `emit("batch")` 与本行的
+    #   `after_batch_reports()`（台账 + 即时告警）都**属于本批**，归零要等它们发完；
+    #   若提到开头，重置后的第一条立刻被本批的 batch 吃掉，告警又轮空。
+    #   ★ 不回收的后果见 `reset_notify_count` 的注释：常驻模式下第 11 轮之后
+    #     连真告警都发不出去，而日志看着一切正常。
+    reset_notify_count()
     return stats
 
 
