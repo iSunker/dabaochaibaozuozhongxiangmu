@@ -70,7 +70,29 @@ DEFAULT_MAX_PROBE = 4
 
 #: 视频文件后缀（与 `orchestrator.state.VIDEO_EXTENSIONS` 同源，这里只用于判定
 #: 「这个目录直接挂着片子吗」）。
-VIDEO_EXT = S.VIDEO_EXTENSIONS
+#:
+#: ★★ 2026-09-24 加 `.iso` / `.img` 等**光盘镜像** —— 实测踩到的洞：
+#:   `LOVELY_RUNNER_01-04/` 里躺着 **4 个 `.iso`、一共 156 GB**，而本脚本
+#:   第一版报它「**空目录**」；`Les Misérables 2018…` 里是 `LES_MISERABLES_…ISO`
+#:   （**大写**）同样被漏。
+#: ★ 这是一个**误报**（false positive），而误报的代价在这儿很大：
+#:   它把一个"有 156 GB 片子的正常包"标成"异常" ⇒ 人去查那个目录 ⇒ **白白花时间**，
+#:   而且**真异常（`儿童`/`欧美剧` 两个分类目录）反而被这些噪音淹掉**。
+#:   ★ 注意 `orchestrator.state.VIDEO_EXTENSIONS` 是**照抄 cross-seed 源码**的，
+#:     那份清单里**没有** `.iso`（cross-seed 自己也不把 iso 当视频）——
+#:     所以这里**不能直接改 `S.VIDEO_EXTENSIONS`**（那会改掉"扫 searchee"的语义、
+#:     影响 `scan_pack` 与状态机）。**只在本脚本的"这里有没有片子"这个判据上扩。**
+VIDEO_EXT = set(S.VIDEO_EXTENSIONS) | {
+    ".iso", ".img", ".m2ts", ".ts", ".vob",  # 光盘镜像 / 原盘主视频流
+}
+
+#: 原盘结构目录名。★ 它们**不在** `IGNORED_DIRS` 的意义上"该被忽略" ——
+#: 恰恰相反：**看到它们说明这里有片子**。第一版把它们（连同 `bdmv`/`certificate`）
+#: 一律当"忽略"，于是「里面全是原盘」看起来和「空的」一模一样 ⇒ **又一个误报**
+#: （`Robot Chicken S05…` / `Shorts from Golestan Studio` 都是这样）。
+#: ⇒ 保留 `S.IGNORED_FOLDER_SUBSTRINGS` 作为"不下钻进这些目录"的规则（那是对的，
+#:   原盘里几万个碎文件不该被当成 searchee），**但"这里有没有内容"要单独判**。
+_DISC_STRUCT_DIRS = ("bdmv", "video_ts", "certificate", "bdrom")
 
 # ---- 「发布名」的形状判据 -------------------------------------------------- #
 #: 季集号：`S01` / `S01E05` / `s1` / `第01季` / `Ep01` / `EP.05`。
@@ -141,11 +163,38 @@ def looks_like_release(name: str) -> tuple[bool, list[str]]:
 
 
 def has_direct_video(path: Path) -> bool:
-    """这个目录里**直接挂着**视频文件吗？（不递归）"""
+    """这个目录里**直接挂着**视频文件吗？（不递归）
+
+    ★ `VIDEO_EXT` 已含 `.iso` 等光盘镜像（见那里的注释）。
+    ★ 后缀比较**不分大小写** —— `.ISO` 与 `.iso` 都要认（实测 `LES_MISERABLES_…ISO`）。
+    """
     try:
         with os.scandir(path) as it:
             for e in it:
                 if e.is_file() and os.path.splitext(e.name)[1].lower() in VIDEO_EXT:
+                    return True
+    except OSError:
+        return False
+    return False
+
+
+def has_disc_structure(path: Path) -> bool:
+    """这个目录里是**原盘结构**吗（`BDMV/` / `VIDEO_TS/` / `CERTIFICATE/`）？
+
+    ★★ 为什么必须单独判（2026-09-24 实测的第二个误报）：
+      `IGNORED_DIRS` 里有 `bdmv`/`certificate` —— 那是**对的**（原盘里几万个碎文件
+      不该被当成 searchee，`cross-seed` 自己也忽略它们）。但第一版的
+      `subdirs()` **只返回"没被忽略的"子目录**，于是「一个只有 `BDMV/` 的目录」
+      返回空列表 ⇒ 走到 `if not kids:` ⇒ 报「**空目录**」。
+      实测：`Robot Chicken S05…` 与 `Shorts from Golestan Studio` 都是这样 ——
+      **里面有原盘、被报成空的**。
+
+    ★ 判据：看**真实**子目录里有没有原盘结构名（这一步**故意绕过** `IGNORED_DIRS`）。
+    """
+    try:
+        with os.scandir(path) as it:
+            for e in it:
+                if e.is_dir() and e.name.lower() in _DISC_STRUCT_DIRS:
                     return True
     except OSError:
         return False
@@ -232,8 +281,9 @@ def classify(name: str, path: Path, *,
     if _RE_CN_TAG.match(name):
         v.flags.append("中文标签层")
 
-    # ---- 情形 A：条目自己直接挂着视频文件 --------------------------------- #
+    # ---- 情形 A：条目自己直接挂着视频文件（含 `.iso`）--------------------- #
     #   ① `Complete` 包（Ep 文件直挂）② 单季包（SxxExx 文件直挂）③ 中文单季
+    #   ④ **光盘镜像**（`.iso` 直挂，如 `LOVELY_RUNNER_01-04`）
     #   ⇒ 都是"发布名层 = 条目本身" ⇒ depth 1
     if has_direct_video(path):
         v.release_depth, v.picked = 1, 1
@@ -251,6 +301,16 @@ def classify(name: str, path: Path, *,
                 and "同名多版本" not in _merged.flags:
             _merged.flags.remove("中文标签层")   # 名称里含标签但仍像发布名 ⇒ 正常
         return _merged
+
+    # ---- 情形 A2：原盘结构（`BDMV/` 等）⇒ 也是"片子在这一层" ------------- #
+    #   ★ 与情形 A 同样给 depth 1，但**单独一条分支**、且**带标记** ——
+    #     因为原盘的"发布名"往往就是那个**光盘/分卷名**（`…D1` / `…_DIY_3201`），
+    #     未必像标准发布名。这是**提醒**，不是异常。
+    if has_disc_structure(path):
+        v.release_depth, v.picked = 1, 1
+        v.flags.append("原盘结构")
+        v.note = "含 BDMV/VIDEO_TS ⇒ 片子就在这一层（depth 1）；★ 原盘通常按光盘分卷"
+        return _with_extra(v)
 
     # ---- 情形 B：下面全是目录 ⇒ 可能要下钻 ------------------------------- #
     kids = subdirs(path)
@@ -339,17 +399,29 @@ def _multi_version_siblings(kids: list[str]) -> bool:
 #:   **满屏的"需要你看" = 没人看**（`CLAUDE.md` 说 `06_sources` 不做自动判是同理：
 #:   「永远红的闸门 = 没人看的闸门」）。
 #:   ⇒ 它单列一节（"同剧多版本（提示，非异常）"），异常表里不出现。
+#:
+#: ★★ `原盘结构` 也**不在这里**（2026-09-24 加）—— 它是**正常的**（片子是原盘而已），
+#:   与 `同名多版本` 一样归"提示"。★ 加它之前，`Robot Chicken S05…` 这类
+#:   **被误报成"空目录"**（见 `has_disc_structure` 的注释）。
 _NEEDS_HUMAN_FLAGS = ("拿不准", "太深", "空目录", "名字不像发布名")
+
+#: ★ 提示类标记（**不是**异常，报告里单列）。
+_HINT_FLAGS = ("同名多版本", "原盘结构")
 
 
 def _needs_human(v: Verdict) -> bool:
-    """这个条目**真的**要人看吗？（`同名多版本` 不算 —— 见 `_NEEDS_HUMAN_FLAGS`）"""
+    """这个条目**真的**要人看吗？（提示类标记不算 —— 见 `_NEEDS_HUMAN_FLAGS`）"""
     return (not v.ok) or any(f in _NEEDS_HUMAN_FLAGS for f in v.flags)
+
+
+def _is_hint(v: Verdict) -> bool:
+    """只是**提示**（不是异常）吗？—— `同名多版本` / `原盘结构` 两种。"""
+    return (not _needs_human(v)) and any(f in _HINT_FLAGS for f in v.flags)
 
 
 def _render(verdicts: list[Verdict], tv: str, *, show_all: bool) -> str:
     bad = [v for v in verdicts if _needs_human(v)]
-    hint = [v for v in verdicts if not _needs_human(v) and "同名多版本" in v.flags]
+    hint = [v for v in verdicts if _is_hint(v)]
     good = [v for v in verdicts if not _needs_human(v) and v not in hint]
 
     L: list[str] = []
@@ -481,8 +553,7 @@ def main(argv: list[str] | None = None) -> int:
     # ★ 判据复用 `_needs_human()`，**不在这里重写一份** ——
     #   两处各写一份就是"同一事实散在多处"（`03_terms` 那条闸门要防的正是它）。
     n_bad = sum(1 for v in verdicts if _needs_human(v))
-    n_hint = sum(1 for v in verdicts
-                 if not _needs_human(v) and "同名多版本" in v.flags)
+    n_hint = sum(1 for v in verdicts if _is_hint(v))
     _say("扫了 %d 个条目：判得出 %d，需要你看 %d（另有 %d 个同剧多版本提示）"
          % (len(verdicts), len(verdicts) - n_bad, n_bad, n_hint))
     if not args.out:

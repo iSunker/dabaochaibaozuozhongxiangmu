@@ -218,8 +218,58 @@ check("★★ 只有年份+中文 ⇒ **不算**（弱信号只有一条；避�
       "got %r" % (stp.looks_like_release("欧美剧"),))
 check("★ 纯中文无名 ⇒ 不算", not stp.looks_like_release("儿童")[0])
 
+
+# --------------------------------------------------------------------------- #
+print("\n== 9 ★★ `.iso` 是片子（第一版把它当空目录 —— 误报）==")
+# 真数据：`LOVELY_RUNNER_01-04/` 里躺着 **4 个 `.iso`、156 GB**，第一版报「空目录」。
+_t7 = pathlib.Path(tempfile.mkdtemp())
+mk(_t7, "LOVELY_RUNNER_01-04", files=["LOVELY_RUNNER_01.iso",
+                                      "LOVELY_RUNNER_02.iso"])
+v9 = stp.classify("LOVELY_RUNNER_01-04", _t7 / "LOVELY_RUNNER_01-04")
+check("★★ `.iso` 直挂 ⇒ depth 1（不是空目录）", v9.picked == 1,
+      "got %r —— 第一版这里报『空目录』：156 GB 的片子被当成空" % (v9.picked,))
+check("★★ 不许标 `空目录`", "空目录" not in v9.flags, "flags=%r" % (v9.flags,))
+# 大小写：真数据里是 `LES_MISERABLES_...ISO`（大写）
+_t7b = pathlib.Path(tempfile.mkdtemp())
+mk(_t7b, "Les Mis 2018", files=["LES_MISERABLES_2018_S01D1_DIY_3201.ISO"])
+check("★ 大写 `.ISO` 也认",
+      stp.classify("Les Mis 2018", _t7b / "Les Mis 2018").picked == 1)
+# ★★ 变异：把 `VIDEO_EXT` 里的 `.iso` 去掉 ⇒ 上面三条必红。
+
+# --------------------------------------------------------------------------- #
+print("\n== 10 ★★ 原盘结构（`BDMV/`）不是空目录（第二个误报）==")
+# 真数据：`Robot Chicken S05...` / `Shorts from Golestan Studio` 都只有
+# `BDMV/` + `CERTIFICATE/`，第一版报「空目录」—— 因为 `subdirs()` 把它们滤掉了。
+_t8 = pathlib.Path(tempfile.mkdtemp())
+mk(_t8, "Robot Chicken S05 1080i Blu-ray VC-1 TrueHD 5.1-Fluffy",
+   dirs=["BDMV", "CERTIFICATE"])
+v10 = stp.classify("Robot Chicken S05 1080i Blu-ray VC-1 TrueHD 5.1-Fluffy",
+                   _t8 / "Robot Chicken S05 1080i Blu-ray VC-1 TrueHD 5.1-Fluffy")
+check("★★ 只有 BDMV/ ⇒ depth 1（不是空目录）", v10.picked == 1,
+      "got %r —— 第一版报『空目录』，因为 subdirs() 把 bdmv 滤掉了" % (v10.picked,))
+check("★★ 标 `原盘结构`", "原盘结构" in v10.flags, "flags=%r" % (v10.flags,))
+check("★★ `原盘结构` 只是提示，不算异常", not stp._needs_human(v10),
+      "flags=%r —— 原盘是正常形态，不该混进『需要你看』" % (v10.flags,))
+# ★★ 变异：把 情形 A2（`has_disc_structure` 那段）删掉 ⇒ picked 变 None ⇒ 必红。
+
+# --------------------------------------------------------------------------- #
+print("\n== 11 ★ 真·空目录仍然必须报（别把上面两条修成什么都不报）==")
+_t9 = pathlib.Path(tempfile.mkdtemp())
+mk(_t9, "儿童")
+mk(_t9, "欧美剧")
+for _nm in ("儿童", "欧美剧"):
+    _vv = stp.classify(_nm, _t9 / _nm)
+    check("★ 真·空目录 `%s` ⇒ 不猜 + 算异常" % _nm,
+          _vv.picked is None and "空目录" in _vv.flags and stp._needs_human(_vv),
+          "got picked=%r flags=%r" % (_vv.picked, _vv.flags))
+# ★ ⑨⑩⑪ 是**一对反面哨兵**：⑨⑩ 说"有片子别报空"，⑪ 说"真空的必须报" ——
+#   三条一起才说明判据**分得清**这两件事（若为了修误报把 `空目录` 判据整个删掉，⑪ 必红）。
+
+
 # --------------------------------------------------------------------------- #
 print()
+
+
 if _ok != _n:
     print("!!! %d/%d 失败" % (_n - _ok, _n))
     sys.exit(1)
