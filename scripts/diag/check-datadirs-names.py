@@ -26,6 +26,12 @@
 （`ERR-AI-09`）。本仓的 `check-deploy-drift.py` 已经把「两份手写清单」这个
 形状踩过一遍了（`§26.60` 三：「**常红的闸门 = 没有闸门**」），这里是同一族。
 
+★★ 清单在 `datadirs_rules.py`（**唯一出处**，`§26.64` 起）
+------------------------------------------------------------
+生成侧 `gen-datadirs.py` 和本脚本 `import` **同一份**清单 ⇒ **没有第二份可漂**
+（`§26.60` 三 那一族）。★ 而且生成侧**在吐出来之前**就拒绝（`rc=3`），
+不必等到事后跑本脚本 —— 这才是"护栏"而不是"事后验尸"（`§26.63` A 格①）。
+
 ★★ 它**故意不读 NAS**（2026-09-24 实测 `//iSunker-DS423/...` 本机不可达）
 ---------------------------------------------------------------
 要挡的东西是「**有人把一个分类目录名写进了 `DATA_DIRS`**」——
@@ -58,6 +64,17 @@ import argparse
 import sys
 from pathlib import Path
 
+# ★★ 清单本身在 `datadirs-rules.py`（**唯一出处**）—— 生成侧 `gen-datadirs.py`
+#   引用同一份 ⇒ 不存在"两份清单漂移"这个形状（`§26.60` 三 那一族）。
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from datadirs_rules import (  # noqa: E402
+    CATEGORY_DIR_NAMES,
+    NOT_CATEGORY_SAMPLES,
+    basename,
+    check_paths,
+    split_dirs,
+)
+
 # ★★ 强制 stdout/stderr 用 UTF-8 —— Windows 控制台默认 GBK，
 #   一旦打印非 GBK 字符（`…`/`→`/`✗`）就 UnicodeEncodeError。
 #   ★ 那个异常**会污染退出码**（崩成 rc≠0），而本脚本的 rc **是有语义的**
@@ -71,49 +88,6 @@ except Exception:  # noqa: BLE001
     pass
 
 # --------------------------------------------------------------------------- #
-# ★★★ 分类目录名清单（**手写** —— 加一条必须写清"它为什么不是发布名"）
-# --------------------------------------------------------------------------- #
-# 判据：一个名字**进 DATA_DIRS 会导致 cross-seed 拿它去搜站点**，而它
-#       **不是发布名**（是分类习惯 / 语言标签 / 占位目录）。
-#
-# ★ 为什么用"整名比对"而不是正则：分类目录名**就是一个名字**（`儿童`），
-#   不是"名字里含某个词"。用 `if "儿童" in name` 会把
-#   `儿童医院.S01.2026...` 这种**真发布名**误杀 —— 那正是本仓最忌的
-#   "量错了对象"（`A.11`）。⇒ **比的是基名是否恰好等于清单项**。
-#
-# ★ 每条都必须是"**真的会在 TV/ 里出现**"的名字（死规则比缺规则更坏，
-#   见 `tests/test_drift_lists.py` ② 段）。闸门会核这一条。
-CATEGORY_DIR_NAMES: list[tuple[str, str]] = [
-    ("儿童", "★ 分类习惯（不是发布名）。实测真空（2026-05-05）；`§26.58` 三 标为『真·分类目录』。"
-             "拿它去搜站点 ⇒ 搜不到 + 静默失败"),
-    ("欧美剧", "★ 同上（真空，2026-05-08）。`§26.58` 三 同一条"),
-]
-
-# ★ 反面哨兵：这些名字**看着像**分类目录，但**其实是真发布名**，不许加进清单。
-#   闸门会拿它们跑一遍，**若被命中 ⇒ 说明判据写宽了**（把真发布名杀了）。
-NOT_CATEGORY_SAMPLES: list[tuple[str, str]] = [
-    ("儿童医院.S01.2026.1080p.WEB-DL.H.264", "真发布名里含『儿童』二字 —— 整名比对必须放过它"),
-    ("The.First.Jasmine.2026.S01.1080p.Disney+.WEB-DL.AVC-QHstudIo", "`[莫离]` 那种（§26.61）"),
-    ("Outlast.The.Jungle.2026.S01.2160p.NF.WEB-DL.DDP5.1.H.265-DepWeb", "同一部剧的三个版本之一（§26.62）"),
-]
-
-
-def basename(p: str) -> str:
-    """取路径的**基名**（去掉尾斜杠）。
-
-    ★ 不用 `os.path.basename`：它按**宿主机**的分隔符走，而这里的路径是
-      **NAS 视角的 POSIX 路径**（`/volume1/video/...`），在 Windows 上
-      `ntpath.basename("/a/b/儿童")` 也能对，但一旦有人写成 `//NAS/share/…`
-      就会多出歧义 ⇒ **自己按 `/` 切**，语义单一。
-    """
-    return p.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
-
-
-def split_dirs(raw: str) -> list[str]:
-    """把 `DATA_DIRS` 的值切成**逐条路径**（逗号分隔；忽略空项、去空白）。"""
-    return [p.strip() for p in (raw or "").split(",") if p.strip()]
-
-
 def read_datadirs(env_path: Path) -> tuple[str | None, str]:
     """从 env 文件里读 `DATA_DIRS=` 那一行。
 
@@ -127,19 +101,8 @@ def read_datadirs(env_path: Path) -> tuple[str | None, str]:
     return None, "%s 里没有 DATA_DIRS= 行" % env_path.name
 
 
-# ★ 清单的**基名集合**（整名比对用）
+# ★ 清单的**基名集合**（整名比对用）—— 从共享模块取，**不在本文件里**（唯一出处）
 _NAMES = {n for n, _why in CATEGORY_DIR_NAMES}
-
-
-def check_paths(paths: list[str]) -> list[tuple[str, str, str]]:
-    """逐条检查；返回 `[(原路径, 基名, 理由)]`（**命中的**）。"""
-    hits: list[tuple[str, str, str]] = []
-    reasons = {n: why for n, why in CATEGORY_DIR_NAMES}
-    for p in paths:
-        b = basename(p)
-        if b in _NAMES:
-            hits.append((p, b, reasons[b]))
-    return hits
 
 
 def main(argv: list[str] | None = None) -> int:

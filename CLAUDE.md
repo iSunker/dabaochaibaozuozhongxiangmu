@@ -32,6 +32,7 @@ python tools/doc-audit/04_probes.py
 | **为什么这么做 / 当时踩了什么** | `summary/` 各章（`§N`） | —— |
 | **怎么做**（命令、步骤） | `README.md` | —— |
 | **测试与断言条数** | `tests/COUNTS.json`（机器写） | 别处的数字 —— **人也不许手改** |
+| **`DATA_DIRS` 该指到哪一层 / 哪些名字不许进** | `README.md`「★★ 往 `DATA_DIRS` 里加路径」+ `scripts/diag/datadirs_rules.py`（清单**唯一出处**）| 别处复述的清单 —— **就一份** |
 | **当前读数**（磁盘/种子数/版本） | `python tools/doc-audit/04_probes.py` | **文档里印的任何数字**（那是"当时"，不是"现在"） |
 | **文档结构本身**（有几份、谁引用谁） | `tools/doc-audit/INDEX-USAGE.md` | —— |
 

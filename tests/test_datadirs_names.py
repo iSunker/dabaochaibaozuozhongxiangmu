@@ -16,7 +16,7 @@
   所以挡板必须是**代码**，而代码必须有**门禁**，否则它自己也会腐（清单里混进
   一条死规则、或者判据被写宽到杀真发布名，都没人会发现）。
 
-## 本文件钉什么（五段）
+## 本文件钉什么（八段）
 
 | 段 | 钉什么 | 为什么 |
 |---|---|---|
@@ -25,22 +25,30 @@
 | ③ | **反面哨兵**（真发布名必须放过） | `儿童医院.S01.2026…` 这种含"儿童"二字的**真发布名**不许被杀 —— 那是本仓最忌的"量错对象"（`A.11`） |
 | ④ | **正例：跑校验器本体** | `rc` 必须**分别**是 `0`（真 `.env`）/ `1`（含 `儿童` 的候选）。★ 只断言"清单里有 `儿童`"是不够的 —— 那证明不了**挡板真的会红** |
 | ⑤ | **空清单 ⇒ `rc=2`** | 清单被清空 ⇒ 这道门**恒绿**。必须**当场拒跑**，不许静默通过 |
+| ⑥ | **本文件在 `COUNTS.json` 里** | 新测试忘了登记 ⇒ 计数闸门看不见它（下一个 `q2.py`）|
+| ⑦ | ★★★ **生成侧也挡** | `gen-datadirs.py` 在**吐出来之前**拒绝（`rc=3`），不只在事后靠校验器抓 —— 治「**一半的护栏 = 没有护栏**」（`§26.63` A 格①）|
+| ⑧ | ★ **清单只有一份** | 生成侧与校验侧 `import` 同一份 `datadirs_rules.py`，防止两份手写清单漂移（`§26.60` 三）|
 
-## ★ 三条容易写错的地方（都写在代码注释里了）
+## ★ 四条容易写错的地方（都写在代码注释里了）
 
 1. **④ 段必须跑子进程**，不能 `import` 后调 `check_paths()` ——
    要钉的是**退出码**（那是调用方唯一看得见的东西）。`check_paths()` 返回列表，
    `main()` 才把"有命中"翻译成 `rc=1`；★ 变异 ③（让 `main()` 永远 `return 0`）
    在 `check_paths()` 层面**完全看不见** ⇒ 只调函数会把那条变异**放过去**。
-2. **⑤ 段必须用 `runpy` 跑一个临时副本**（把清单字面量替空），
-   不能在测试里改模块全局 —— 那样改的是**同一个进程里的 `M._NAMES`**，
+2. **⑤ 段必须跑一个临时副本**（把清单字面量替空），
+   不能在测试里改模块全局 —— 那样改的是**同一个进程里的清单**，
    而 `main()` 读的就是它 ⇒ 被测的根本不是"空清单"这个场景（`A.11`）。
-3. **子进程一律带 `MSYS_NO_PATHCONV=1`**（本仓 2026-09-24 实测）：Git Bash 会把
+   ★★ 2026-09-24 清单搬到 `datadirs_rules.py` 后，**替空的落点也跟着搬** ——
+   否则本段会 `ValueError` 崩掉，而**崩掉的 `rc=1` 看起来和"该红的红了"一样**
+   （`ERR-AI-03` 的形状）。所以本段先断言"替换真的生效"。
+3. **⑦ 段必须真造目录树**再跑生成器 —— 判据是"它**看着盘上的东西**会不会吐"。
+   拿 `--dirs` 直接喂候选是**绕过生成逻辑**的（`A.11`：量的对象要对）。
+4. **子进程一律带 `MSYS_NO_PATHCONV=1`**（本仓 2026-09-24 实测）：Git Bash 会把
    **以 `/` 开头的参数**改写成 Windows 路径（`/volume1/…` → `C:/Program Files/Git/volume1/…`），
    ⇒ 校验器打印的**不是输入路径**。判据（`rc`）不受影响，但会让变异诊断**看错对象**。
 
 ★ 行形只用 `  ok  ` / ` FAIL `（`tests/README.md` 那个重数器只认这三种）。
-★ 全部离线：只读仓库里的 2 个文本文件 + 跑本仓脚本，不碰 NAS、不碰网络。
+★ 全部离线：只读仓库里的文本文件 + 跑本仓脚本 + 自己造临时目录树，不碰 NAS、不碰网络。
 """
 from __future__ import annotations
 
@@ -61,6 +69,8 @@ except Exception:  # noqa: BLE001
     pass
 
 VALIDATOR = REPO / "scripts" / "diag" / "check-datadirs-names.py"
+GEN = REPO / "scripts" / "diag" / "gen-datadirs.py"
+RULES = REPO / "scripts" / "diag" / "datadirs_rules.py"
 ENV = REPO / ".env"
 
 _ok = 0
@@ -180,23 +190,34 @@ check("★ 报红时打印的**就是输入的那条路径**（没被 MSYS 改�
 
 # --------------------------------------------------------------------------- #
 print("\n== ⑤ ★ 空清单 ⇒ rc=2（**恒绿闸门必须当场拒跑**）==")
-#   ★★ 为什么用 `runpy` 跑**临时副本**：在测试进程里改 `M._NAMES` 改的是
-#      **同一个对象**，而 `main()` 读的就是它 —— 那样"空清单"与"清单非空"
-#      两种场景会在**同一个进程里**互相污染（本文件 ⑤ 段会假红/假绿）。
-#      于是把源码里的清单字面量替空，落一个临时文件，**另起进程**跑它。
-_SRC = VALIDATOR.read_text(encoding="utf-8")
+#   ★★ 为什么用临时副本：在测试进程里改清单改的是**同一个对象**，
+#      而 `main()` 读的就是它 —— 那样"空清单"与"清单非空"两种场景会在
+#      **同一个进程里**互相污染（本段会假红/假绿）。于是把源码里的清单字面量
+#      替空，落一个临时文件，**另起进程**跑它。
+#   ★★ 2026-09-24（`§26.64`）清单搬到了 `datadirs_rules.py` ⇒ 要替空的是**它**，
+#      而**不是**校验器（校验器现在只是 `import`）。★ 这正是"清单只有一份"的
+#      代价与收益：搬了之后，**变异体的落点必须跟着搬**，否则本段会像刚才那样
+#      `ValueError` 崩掉 —— 崩掉时 `rc=1`，**看起来**跟"该红的红了"一样危险
+#      （`ERR-AI-03` 的形状：非零 rc 不等于命中）。所以下面先断言替换**真的生效**。
+_RULES_SRC = RULES.read_text(encoding="utf-8")
 _MARK_A = "CATEGORY_DIR_NAMES: list[tuple[str, str]] = ["
-_MUTATED = _SRC.replace(_MARK_A, _MARK_A + "\n    # ★ 门禁 ⑤ 段临时替空（仅内存，不落仓库）\n")
+_MUTATED = _RULES_SRC.replace(_MARK_A, _MARK_A + "\n    # ★ 门禁 ⑤ 段临时替空（仅内存，不落仓库）\n")
 _i = _MUTATED.index(_MARK_A) + len(_MARK_A)
 _j = _MUTATED.index("\n]", _i)
 _MUTATED = _MUTATED[:_i] + "\n] # ★ 替空占位" + _MUTATED[_j + 2:]
 
 check("前提：变异体真的把清单替空了（否则 ⑤ 段是假测试）",
-      _MUTATED != _SRC and "_NAMES" in _MUTATED, "替换没生效 ⇒ 别在这儿报绿")
+      _MUTATED != _RULES_SRC and "CATEGORY_DIR_NAMES" in _MUTATED,
+      "替换没生效 ⇒ 别在这儿报绿")
 
 with tempfile.TemporaryDirectory() as _td:
-    _tmp = pathlib.Path(_td) / "check-datadirs-names-emptied.py"
-    _tmp.write_text(_MUTATED, encoding="utf-8")
+    # ★ 把校验器**原样复制**到临时目录，旁边放替空后的 `datadirs_rules.py`
+    #   —— 这样 `import datadirs_rules` 拿到的是**替空那一份**（同目录优先），
+    #   而仓库里那份**一字不动**。
+    _tdp = pathlib.Path(_td)
+    (_tdp / "datadirs_rules.py").write_text(_MUTATED, encoding="utf-8")
+    _tmp = _tdp / "check-datadirs-names-emptied.py"
+    _tmp.write_text(VALIDATOR.read_text(encoding="utf-8"), encoding="utf-8")
     r = subprocess.run([sys.executable, str(_tmp)], cwd=str(REPO),
                        capture_output=True, text=True, encoding="utf-8",
                        errors="replace", timeout=120)
@@ -207,7 +228,77 @@ check("★ 空清单 ⇒ rc=2（不许静默通过 —— 那样这道门恒绿�
       "rc=%d（期望 2）:\n%s" % (_rc_c, _out_c.strip()[:600]))
 
 # --------------------------------------------------------------------------- #
-print("\n== ⑥ ★★ 本文件自己也得在 `COUNTS.json` 里（它是今天第 N 个 q2.py 的候选）==")
+print("\n== ⑦ ★★★ **生成侧**也挡（不只事后校验）—— 治「一半的护栏 = 没有护栏」==")
+#   ★★ 起因（`§26.63` A 格①）：挡板原先**只在校验器里**，而校验器是**事后**跑的
+#      ⇒ 正确顺序「先 `gen-datadirs.py --list` 看一眼、再粘进 `.env`」里，
+#        那个看一眼的**工具本身**不挡 ⇒ 没人跑校验器就照样进 `.env`。
+#   ★ 现在生成侧引用**同一份清单**（`scripts/diag/datadirs_rules.py`），
+#     在**吐出来之前**拒绝（`rc=3`）。
+#   ★ 这段必须**真造目录树**再跑生成器：判据是"它**看着盘上的东西**会不会吐"，
+#     拿 `--dirs` 直接喂候选是**绕过生成逻辑**的（`A.11`：量的对象要对）。
+
+
+check("前提：生成器脚本在", GEN.is_file(), str(GEN))
+
+
+def run_gen(*extra: str) -> tuple[int, str]:
+    """跑**生成器本体**（子进程），返回 `(rc, stdout+stderr)`。"""
+    env = dict(os.environ)
+    env["MSYS_NO_PATHCONV"] = "1"
+    r = subprocess.run([sys.executable, str(GEN), *extra],
+                       cwd=str(REPO), capture_output=True, text=True,
+                       encoding="utf-8", errors="replace", timeout=120, env=env)
+    return r.returncode, (r.stdout or "") + (r.stderr or "")
+
+
+with tempfile.TemporaryDirectory() as _gd:
+    _root = pathlib.Path(_gd)
+    # A) 一层里同时有【分类目录】和【真发布名】—— 分类目录在中间那层的样子
+    (_root / "TV" / "儿童").mkdir(parents=True)
+    (_root / "TV" / "欧美剧").mkdir(parents=True)
+    (_root / "TV" / "儿童医院.S01.2026.1080p.WEB-DL.H.264").mkdir(parents=True)
+    _rc_g1, _out_g1 = run_gen(str(_root / "TV"), "--level", "1", "--list")
+    check("★★ 层里含 `儿童` ⇒ 生成器**拒绝生成**（rc=3，不是 0）", _rc_g1 == 3,
+          "rc=%d（期望 3）\n        ← 生成侧没挡 ⇒ 『先 --list 看一眼』这条路绕过了挡板：\n%s"
+          % (_rc_g1, _out_g1.strip()[:600]))
+    check("★ 拒绝时点名那两条分类目录（人要知道改哪层）",
+          "儿童" in _out_g1 and "欧美剧" in _out_g1, _out_g1.strip()[:400])
+    check("★ 拒绝时给**修法**（--level 换层 / 清空改名）—— 只报错不指路是半个护栏",
+          "--level" in _out_g1 and "换层" in _out_g1, _out_g1.strip()[:400])
+
+    # ★ 同一棵树，`--level 2` 指到**发布名那一层** ⇒ 必须放行
+    #   （分类目录下是空的，所以第 2 层只有真发布名的下一层；这里直接给一条）
+    (_root / "OK" / "Some.Show.S01.1080p.WEB-DL").mkdir(parents=True)
+    (_root / "OK" / "儿童医院.S01.2026.1080p.WEB-DL.H.264").mkdir(parents=True)
+    _rc_g2, _out_g2 = run_gen(str(_root / "OK"), "--level", "1", "--list")
+    check("★ 反过来：只含**真发布名**的层 ⇒ 放行（rc=0）—— 别一刀切把真包挡了",
+          _rc_g2 == 0,
+          "rc=%d（期望 0）\n%s" % (_rc_g2, _out_g2.strip()[:600]))
+    check("★ 且 `儿童医院…` 真的被列出来了（说明放行不是『空集通过』）",
+          "儿童医院.S01.2026.1080p.WEB-DL.H.264" in _out_g2, _out_g2.strip()[:400])
+
+    # B) `--append-to` 也必须被挡（否则"直接追加进 .env"这条路绕过挡板）
+    _env = _root / "fake.env"
+    _env.write_text("DATA_DIRS=/volume1/video/existing\n", encoding="utf-8")
+    _rc_g3, _out_g3 = run_gen(str(_root / "TV"), "--level", "1", "--append-to", str(_env))
+    check("★★ `--append-to` 同样被挡（rc=3）且**没写文件**（这是最危险的一条路）",
+          _rc_g3 == 3 and _env.read_text(encoding="utf-8") == "DATA_DIRS=/volume1/video/existing\n",
+          "rc=%d；文件内容=%r\n%s"
+          % (_rc_g3, _env.read_text(encoding="utf-8"), _out_g3.strip()[:400]))
+
+# --------------------------------------------------------------------------- #
+print("\n== ⑧ ★ 清单**只有一份**（生成侧与校验侧共引用 —— 防两份漂移）==")
+#   ★★ `§26.60` 三：本仓踩过「两份手写清单互相漂移」。这里改成**单一份**，
+#      所以本段钉的是"没有人把它复制回各自文件里"。
+
+check("前提：共享清单元模块在", RULES.is_file(), str(RULES))
+for _f in (VALIDATOR, GEN):
+    _t = _f.read_text(encoding="utf-8")
+    check("★ %s **不自己定义** CATEGORY_DIR_NAMES（只 import）" % _f.name,
+          "CATEGORY_DIR_NAMES" not in _t or "import" in _t,
+          "又出现了第二份清单 ⇒ 两份会漂移（`§26.60` 三）")
+
+
 #   ★ 同 `tests/test_drift_lists.py` ⑤ 段：新测试忘了登记 ⇒ 计数闸门
 #     （`test_readme_counts.py`）看不见它 ⇒ 它会成为下一个"提交了三天没人知道"的文件。
 _counts = REPO / "tests" / "COUNTS.json"

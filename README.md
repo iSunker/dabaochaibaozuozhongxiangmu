@@ -170,7 +170,10 @@ prowlarr_cross-seed_autohardlink/   # NAS 部署目录（compose 就放这里，
 > 直读 NAS 的 `info.current.log` 与 `state.db`〔后者 `query_only` 硬闸〕，见 SUMMARY §18.18）、
 > `sa-volume-usage.py` **只读**群晖 Storage Analyzer 的报告
 > 〔内存里解 zip、不落盘、无凭据；它留着的是**一句否定结论的证据** ——
-> 报告里**没有可用空间**，见 SUMMARY §22 与「🔴 下一步」第 14 条〕。
+> 报告里**没有可用空间**，见 SUMMARY §22 与「🔴 下一步」第 14 条〕、
+> `check-datadirs-names.py` **只读**的**「名字挡板」**（查 `DATA_DIRS` 里有没有
+> **分类目录名** —— `儿童` / `欧美剧` 这种**不是发布名**的目录，见下节
+> 「★★ 往 `DATA_DIRS` 里加路径」；清单在 `scripts/diag/datadirs_rules.py`）。
 > 其余工具要么跑在 NAS 上，要么是**手动**用的（不必进容器）。
 > ★ 2026-09-12 起电脑端只留 **`deploy.sh`**（推代码）、**`check-deploy-drift.py`**（查漂移）、
 > **`scan-secrets.py`**（推前扫凭据）、**`audit-found-*.py`**（对账）、
@@ -233,6 +236,55 @@ prowlarr_cross-seed_autohardlink/   # NAS 部署目录（compose 就放这里，
 
 ★ 最后一格有**凭据版**：脱敏要按**值形状**兜底 —— `apikey=` 会出现在 URL 的**值**里，
 按**键名**兜不住；`cut -c1-N` **不是**脱敏。
+
+---
+
+## ★★ 往 `DATA_DIRS` 里加路径（**先读这节**）
+
+> `cross-seed` 把 `dataDirs` 的**直接子目录**当作 searchee，并**拿子目录名**去站点搜索。
+> ⇒ 你指到哪一层，**那一层的目录名就会被当成发布名拿去搜**。
+
+★★ **有一条实测过的静默失败**（`§26.58` 三 / `§10.2`）：`TV/` 里混着 `儿童` /
+`欧美剧` 两个**分类目录**（不是发布名）。一旦它们进了 `DATA_DIRS`：
+
+- **搜不到任何东西** —— 白耗站点查询额度；
+- ★★ **日志一切正常** —— 那个"包"**永远不被搜**，你不会收到任何报错（`§19.1`）。
+
+### 规矩：**分类目录名不许进 `DATA_DIRS`**
+
+现存的**排除清单**（`scripts/diag/datadirs_rules.py`，想加一条先读那个文件）：
+
+| 不许用的名字 | 为什么 |
+|---|---|
+| `儿童` | 分类习惯，不是发布名（实测真空，`§26.58` 三）|
+| `欧美剧` | 同上 |
+
+★ 判据是**整名比对**（`基名 == 清单项`），**不是子串包含** —— 所以
+**`儿童医院.S01.2026.1080p.WEB-DL.H.264` 这种真发布名会被放过**，别怕误杀。
+
+### 怎么加（三道挡板，**别绕**）
+
+```bash
+# ① 先看某一层有哪些目录（★ 对着盘上的真东西看，别凭记忆）
+python scripts/diag/gen-datadirs.py "//<NAS>/video/download/TV" --level 2 --list
+
+# ② 生成片段 —— ★ 若这一层含分类目录名，会**直接拒绝**（rc=3）并告诉你换哪层
+python scripts/diag/gen-datadirs.py "//<NAS>/video/download/TV" --level 2 \
+    --nas-prefix /volume1/video
+
+# ③ 事后兜底校验（改完 .env 随时可跑；只读）
+MSYS_NO_PATHCONV=1 python scripts/diag/check-datadirs-names.py
+```
+
+★ 退出码：`gen-datadirs.py` 拒生成 = **`3`**；`check-datadirs-names.py` 命中 = **`1`**。
+★ **两个工具引用同一份清单**（`datadirs_rules.py`）⇒ 不会出现"生成器放行、校验器报红"。
+★ 本机（Git Bash）跑校验器**必须带 `MSYS_NO_PATHCONV=1`** —— 否则以 `/` 开头的参数
+会被改写成 `C:/Program Files/Git/…`，**打印出来的路径不是你的输入**。
+
+> ★ **为什么这条"生成侧也挡"很重要**：原先挡板只在**事后**的校验器里
+> ⇒ 正确顺序「先 `--list` 看一眼、再粘进 `.env`」中，那个**看一眼的工具本身不挡**，
+> 而校验器**没人保证会跑** ⇒ 等于**一半的护栏**（`§26.63` A 格①）。
+> 现在生成侧在**吐出来之前**就拒绝。
 
 ---
 

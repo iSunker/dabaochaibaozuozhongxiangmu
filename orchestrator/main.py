@@ -220,8 +220,29 @@ def cmd_state(pack: str | None, db: str, indexers: str | None, include_cooldown:
                                   include_cooldown=include_cooldown,
                                   cadence_days=cadence_days,
                                   cadence_by_indexer=cad_by_idx)
-            print(f"    → 待搜索: {len(pairs)} 部"
-                  f"（周期 每站 {cadence_days} 天）")
+            # ★★★ 口径必须**写在读数旁边**（`§26.65`；起因 `ERR-SVC-19` / 表 3 #5）。
+            #   同一个系统有**两个"待搜数"**，实测差 **13 倍**（`state` 报 3 部，
+            #   而下一批实际发了 40 条 webhook）—— ★ **两个数都对，量的是两件事**：
+            #     · 本行（带 `--indexers`）  = **发信口径**：下一批会发几条
+            #     · 不带 `--indexers`（库视角）= 「这个包还有几部没走完流程」
+            #   ⇒ 只印一个数、不说它是什么口径，就会被拿去解释"批批 40 条"
+            #     并推出「**在重复搜**」这个**错结论**（2026-09-19 真实发生）。
+            if idx:
+                print(f"    → 待搜索: {len(pairs)} 部"
+                      f"（★ **发信口径**：按 `--indexers` = {','.join(idx)} 算；"
+                      f"周期 每站 {cadence_days} 天）")
+            else:
+                print(f"    → 待搜索: {len(pairs)} 部"
+                      f"（★ **库视角，不是发信口径** —— 没传 `--indexers`；"
+                      f"周期 每站 {cadence_days} 天）")
+                # ★ 这条**警告不能省**：库视角会漏掉「**从没搜过**的站」这一整格
+                #   （`pool` 是 `sorted(indexer_seen)`，**没有时间戳的站根本不在池里**
+                #   ⇒ 连"缺失"都看不见）。长期退避的站 / 刚加的站**只在这里隐身**。
+                print("       ⚠ 这个数**不能**用来判「下一批会发几条 webhook」——")
+                print("         想判发信口径：① 传 `--indexers <站名,站名>`；")
+                print("         ② 或去读 `drive-loop.log` 里 `[第 N 轮] 计划 M 条`。")
+                print("         ★ 两个数可以差很多（实测差过 13 倍），而**两个都对**：")
+                print("           它们量的不是同一件事，别拿这个去推「在重复搜」。")
             if verbose:
                 for r, due in pairs:
                     print(f"       [{r['stage']:<10}] 该搜: {','.join(due) or '-':<18}"
@@ -275,7 +296,10 @@ def build_parser() -> argparse.ArgumentParser:
     pst.add_argument("--pack", help="只看这一个包（默认列出全部）")
     pst.add_argument("--db", default=DEFAULT_STATE_DB,
                      help=f"sidecar 状态库路径（默认 {DEFAULT_STATE_DB}）")
-    pst.add_argument("--indexers", help="当前生效的索引器名，逗号分隔（覆盖库里的推断）")
+    pst.add_argument("--indexers",
+                     help="★ 当前生效的索引器名，逗号分隔 —— 传了才是**发信口径**"
+                          "（= 下一批会发几条 webhook）。不传则报**库视角**"
+                          "（= 这包还有几部没走完流程），两者实测差过 13 倍，别混")
     pst.add_argument("--include-cooldown", action="store_true",
                      help="把还在周期内的也算作待搜")
     pst.add_argument("--cadence-days", type=int, default=S.DEFAULT_CADENCE_DAYS,

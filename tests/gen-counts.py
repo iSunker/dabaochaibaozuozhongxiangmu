@@ -26,6 +26,25 @@ r"""`tests/COUNTS.json` 的**唯一生产者** —— 断言条数的真源。
     python tests/gen-counts.py            # 扫描 → 写 COUNTS.json → 重渲染 README 生成区
     python tests/gen-counts.py --check    # 只校验（不写）；不一致则**退出码 1**（可当闸门）
 
+★★ `failures` 是**读数**，不是**判据**（2026-09-24 `§26.65` 结案 `§26.55`）
+--------------------------------------------------------------------------
+`failures` / `failed_files` 是**当次扫描**的读数。它们**只作展示**，
+**不参与任何断言** —— 曾经 `test_readme_counts.py` ① 段断言
+「生成区的失败数 == `COUNTS.json` 的 `failures`」，而它**自己就在 `_files` 里**
+⇒ **自指**：`COUNTS` 说谁红了，它就必须红，而它自己在 `failed_files` 里。
+⇒ 那条读数**永远分不出「有一个真缺陷」和「计数链自己在打架」**（`§26.55` 三）。
+
+★ **"有没有失败"这个问题，由本脚本的真跑回答**（`--check` 会重扫），
+  **不是**靠回头读自己写下的那一行。判据改成**内部自洽**：
+  `failures == len(failed_files)`（见 `test_readme_counts.py` ①′ 段）。
+
+★ **洗白入口已堵**（`§26.55` 四 / 方案 ③）：原先 `--check` **只比
+  `scripts`/`total`/`by_file` 三个键、不重扫**，而写盘版会把 `failures`
+  按当次读数**覆盖** ⇒ 谁先跑一次写盘版，`failures` 就被**洗成 0**，
+  缺陷"消失"而**没有任何东西被修过**。现在 `--check` **也重扫 `failures`/`failed_files`**，
+  ⇒ "洗过"的状态**会被 `--check` 抓回来**（写盘版不再是洗白入口）。
+  ★ 代价：`--check` 本来就要真跑全套（下面那条设计约束），所以**不额外花时间**。
+
 ★ **必须真跑**（2026-09-20 实测，这是本文件最重要的一条设计约束）：
   断言是**运行时打印**出来的（`print(("  ok  " if ok else " FAIL ") + …)`），
   **源码里根本没有那些行** ⇒ 「扫描源码来数断言」这条路**不成立**：
@@ -168,7 +187,13 @@ def main() -> int:
             bad.append("COUNTS.json 不存在 —— 跑一次 `python tests/gen-counts.py`")
         else:
             old = json.loads(COUNTS.read_text(encoding="utf-8"))
-            for k in ("scripts", "total", "by_file"):
+            # ★★ 2026-09-24（`§26.65`）：这里**多比两个键** `failures` / `failed_files`。
+            #   原先只比三个键 ⇒ **写盘版是"洗白入口"**：它把 `failures` 按当次读数
+            #   覆盖，于是"谁先跑一次写盘版，`failures` 就变 0，缺陷消失而没人修过"
+            #   （`§26.55` 四 已实测复现）。
+            #   ★ 这两个键的"重扫"本来就在 `scan()` 里做了（下面那行 `fresh = scan(...)`），
+            #     所以**不额外花时间**；此前只是"算了却不比"。
+            for k in ("scripts", "total", "by_file", "failures", "failed_files"):
                 if old.get(k) != fresh.get(k):
                     bad.append(f"COUNTS.json 的 {k} 与实扫不符：{old.get(k)!r} → {fresh.get(k)!r}")
         want_block = render(prev if COUNTS.exists() else fresh)

@@ -222,6 +222,33 @@ for _u in ("http://192.168.0.7:3060", "http://qbittorrent-reseed:3060", None):
     ck(f"  正确的 {_u} → **不出声**", _guard_says(_u), False)
 ck("  ★ 阴性对照：`:12468` 不被 `2468` 子串误伤", _guard_says("http://192.168.0.7:12468"), False)
 
+print("\n== ⑤ ★★★ 「待搜数」必须写明口径（`ERR-SVC-19` / 表 3 #5 —— 2026-09-24 `§26.65`）==")
+#   背景（真实发生过）：`state` 报「待搜 3 部」，而下一批**实际发了 40 条** webhook。
+#   ★ 两个数**都对** —— 量的不是同一件事：
+#     · 带 `--indexers` = **发信口径**（下一批发几条）
+#     · 不带（库视角）  = 「这包还有几部没走完流程」
+#   ⇒ 只印一个数、不说口径 ⇒ 人会拿它去解释"批批 40 条"，
+#     并推出「**在重复搜**」这个**错结论**（2026-09-19）。
+#   ★ 本段钉两件事：① 带 `--indexers` 时**点明是发信口径**；
+#                    ② 不带时**必须给警告**（库视角会漏掉"从没搜过的站"那一整格）。
+
+rc, out = run(["state", "--db", str(DB), "--pack", "aaa-pack"])
+ck("  ⑤a 不带 `--indexers` → 明说这是**库视角**", "库视角" in out, True)
+ck("  ⑤b ★ 且**必须警告**「不能用来判下一批发几条」",
+   "不能" in out and ("发几条" in out or "发信" in out), True)
+ck("  ⑤c ★ 且给出**两条**正确读法（传 --indexers / 读日志）",
+   "--indexers" in out and "drive-loop.log" in out, True)
+ck("  ⑤d ★ 点明「两个都对、别推『在重复搜』」（那句错结论的预防）",
+   "重复搜" in out, True)
+
+rc, out = run(["state", "--db", str(DB), "--pack", "aaa-pack",
+               "--indexers", "HDFans,HDtime"])
+ck("  ⑤e 带 `--indexers` → 明说这是**发信口径**", "发信口径" in out, True)
+ck("  ⑤f ★ 且把那几个站名列出来（读数要能对到输入上）",
+   "HDFans" in out and "HDtime" in out, True)
+ck("  ⑤g ★ 带口径时**不再**出现『库视角』那句警告（别自相矛盾）",
+   "库视角" not in out, True)
+
 print()
 if fails:
     print(f"!!! {len(fails)} 个失败")

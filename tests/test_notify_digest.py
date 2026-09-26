@@ -377,7 +377,7 @@ LEDGER = (
         "packpct:frds-top250-2024=100 packnum:frds-top250-2024=443 "
         "packden:frds-top250-2024=444 seeding:frds-top250-2024=443 "
         "total:frds-top250-2024=486 packpct:mbf=n/a packnum:mbf=0 packden:mbf=0 "
-        "seeding:mbf=0 total:mbf=4")
+        "packwhy:mbf=den0_no_searched_yet seeding:mbf=0 total:mbf=4")
 )
 lab = Lab()
 try:
@@ -413,6 +413,21 @@ try:
     check("★ 反过来：分母非 0 的包**仍印分数**（`74/78`）—— 别一刀切成都印 n/a",
           "95% (74/78)" in r.stdout,
           [ln for ln in r.stdout.splitlines() if "dc-collection" in ln])
+    # ★★★ 2026-09-24（`§26.67`）：**"为什么是 n/a"要印在那一行下面**。
+    #   起因：这一行**被用户报了三次**（09-21 改渲染 / `§26.29` 记注释 / 09-24 又问）。
+    #   ★ 前两次治的都是**形状**，而**读数旁边始终没有解释** ⇒
+    #     `n/a (n/a)` 与 `总 4` 并排**仍然第一眼像矛盾**。
+    #   ⇒ 判据：`packwhy` 存在且是 `n/a` 时，**必须**多打一行因果说明。
+    check("★★★ `n/a` 那行下面印出『为什么 n/a』（`§26.67` —— 别让用户问第三次）",
+          "为什么 n/a" in r.stdout and "还没搜过" in r.stdout,
+          [ln for ln in r.stdout.splitlines() if "↳" in ln or "为什么" in ln])
+    check("★★ 且那句**明说『不是完成度为零』**（那正是会被误读成的意思）",
+          "不是" in r.stdout and "完成度为零" in r.stdout,
+          [ln for ln in r.stdout.splitlines() if "完成度" in ln])
+    # ★ 阴性对照：**分母非 0 的包不许出现这句**（否则它就成了恒挂的噪音 —— 没人会再读）
+    _dc_lines = [ln for ln in r.stdout.splitlines() if "↳" in ln]
+    check("★ 阴性对照：只有 `mbf` 那行带说明，`frds`/`dc` 不带（否则成噪音）",
+          len(_dc_lines) == 1 and "还没搜过" in _dc_lines[0], _dc_lines)
 finally:
     lab.cleanup()
 

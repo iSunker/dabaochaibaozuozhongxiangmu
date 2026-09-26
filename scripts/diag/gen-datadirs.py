@@ -27,6 +27,13 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from pathlib import Path
+
+# ★★ 名字挡板（**唯一出处**，与 `check-datadirs-names.py` 共用同一份清单）
+#   为什么生成侧也要挡：校验器是**事后**跑的 —— 先生成错的、再靠校验器抓
+#   ⇒ 没跑校验器就没人拦（`§26.63` A 格①「一半的护栏 = 没有护栏」）。
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from datadirs_rules import check_paths  # noqa: E402
 
 
 def dirs_at_level(root: str, level: int) -> list[str]:
@@ -96,6 +103,25 @@ def main() -> int:
         return 2
 
     paths = [to_nas_path(args.root, r, args.nas_prefix) for r in rels]
+
+    # ★★★ 名字挡板（事前）—— 在**吐出来之前**拦，不是等事后校验。
+    #   命中「分类目录名」（`儿童` / `欧美剧`）⇒ 拒绝生成，并给出修法。
+    #   ★ 判据是**整名比对**（见 `datadirs_rules.py`）⇒ `儿童医院.S01…` 放过。
+    #   ★ 这条**对所有输出模式**生效（`--list` / 直接吐 / `--append-to`），
+    #     否则"先 `--list` 看一眼再粘"这条最常用的路径就绕过去了。
+    hits = check_paths(paths)
+    if hits:
+        print("!! 拒绝生成：这一层里含 **分类目录名**（它们不是发布名）。", file=sys.stderr)
+        print("   ★ 拿它们进 DATA_DIRS 会：① 白耗查询额度；② ★★ **静默失败**"
+              "（日志正常，只是那个『包』永远不被搜）。", file=sys.stderr)
+        for p, b, why in hits:
+            print("\n   FAIL %s\n        basename=`%s`\n        %s" % (p, b, why), file=sys.stderr)
+        print("\n   ⇒ 修法二选一：", file=sys.stderr)
+        print("      · ★ 换层：分类目录在**中间** ⇒ 用 `--level N` 指到**发布名那一层**", file=sys.stderr)
+        print("        （先 `--list` 逐层核对，别猜层数）", file=sys.stderr)
+        print("      · 若这一层本来就该是发布名层 ⇒ **先把那个分类目录清空/改名**", file=sys.stderr)
+        print("   ★ 判据与理由：`python scripts/diag/check-datadirs-names.py --list`", file=sys.stderr)
+        return 3
 
     if args.list:
         print(f"第 {args.level} 层共 {len(rels)} 个目录：")
